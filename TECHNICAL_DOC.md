@@ -23,7 +23,7 @@
 - [8. 噪声层模块 (noise_layers/)](#8-噪声层模块-noise_layers)
   - [8.1 噪声组合器 (Noiser)](#81-噪声组合器-noiser)
   - [8.2 Identity恒等映射](#82-identity恒等映射)
-  - [8.3 随机裁剪 (Crop)]#83-随机裁剪-crop)
+  - [8.3 随机裁剪 (Crop)](#83-随机裁剪-crop)
   - [8.4 裁剪填充 (Cropout)](#84-裁剪填充-cropout)
   - [8.5 像素丢弃 (Dropout)](#85-像素丢弃-dropout)
   - [8.6 缩放变换 (Resize)](#86-缩放变换-resize)
@@ -34,7 +34,7 @@
   - [9.1 Trainer类详解](#91-trainer类详解)
   - [9.2 三阶段训练策略](#92-三阶段训练策略)
   - [9.3 训练流程 (train.py)](#93-训练流程-trainpy)
-  - [9.4 隐私预热与渐进式margin机制](#94-隐私预热与渐进式margin机制)
+  - [9.4 记忆库预热与检索攻击者训练](#94-记忆库预热与检索攻击者训练)
 - [10. 验证脚本 (validation_script.py)](#10-验证脚本-validation_scriptpy)
 - [11. CLIP视觉模型](#11-clip视觉模型)
 - [12. 核心算法原理深度剖析](#12-核心算法原理深度剖析)
@@ -156,12 +156,7 @@ PrivSteg/
 │   ├── quantization.py           # 傅里叶四舍五入量化
 │   └── dct_filters.py            # DCT/IDCT滤波器生成工具
 │
-└── CLIP/                         # OpenAI CLIP模型源码（子模块）
-    ├── clip/
-    │   ├── model.py              # CLIP完整模型定义（ViT/ResNet）
-    │   ├── clip.py               # CLIP加载接口
-    │   └── simple_tokenizer.py   # 文本分词器
-    └── ...
+└── output/                       # 验证输出目录（示例图像）
 ```
 
 ---
@@ -183,7 +178,7 @@ class Config:
 |------|-------|------|
 | `image_size` | `256` | 输入图像分辨率（正方形，256×256） |
 | `message_length` | `30` | 秘密消息比特长度（每个bit为0或1的浮点数） |
-| `batch_size` | `4` | 训练批次大小 |
+| `batch_size` | `8` | 训练批次大小 |
 
 **设计考量**：
 - `image_size=256`：平衡计算资源消耗与特征表达能力。UNet编码器的消息扩展操作需要将1×30的消息张量扩展到256×256的空间维度。
@@ -205,12 +200,12 @@ class Config:
 
 | 参数 | 默认值 | 说明 |
 |------|-------|------|
-| `num_epochs_phase1` | `100` | Phase 1: 基础隐写训练 |
+| `num_epochs_phase1` | `200` | Phase 1: 基础隐写训练 |
 | `num_epochs_phase2` | `100` | Phase 2: 对抗训练 |
 | `num_epochs_phase3` | `100` | Phase 3: 隐私保护训练 |
-| `scheduler_T_max` | `300` | 余弦退火调度器总周期 |
+| `scheduler_T_max` | `400` | 余弦退火调度器总周期 |
 
-总计 **300 epochs** 的训练过程。
+总计 **400 epochs** 的训练过程。
 
 ### 4.5 视觉损失权重
 
@@ -240,13 +235,13 @@ $$L_{visual} = 0.3 \cdot L_{MSE} + 0.3 \cdot L_{SSIM} + 0.3 \cdot L_{VGG}$$
 
 | 参数 | 默认值 | 说明 |
 |------|-------|------|
-| `privacy_margin` | `0.3` | 隐私余量边界 |
+| `privacy_margin` | `0.7` | 隐私余量边界 |
 | `use_advanced_privacy` | `True` | 是否启用高级隐私保护 |
 | `privacy_mode` | `'retrieval_escape'` | 隐私模式（检索逃逸） |
 | `clip_weight` | `1.0` | CLIP特征逃逸损失权重 |
-| `dino_weight` | `0.0` | DINOv2特征逃逸损失权重（当前禁用） |
+| `dino_weight` | `0.5` | DINOv2特征逃逸损失权重 |
 | `triplet_weight` | `0.15` | 三元组损失权重 |
-| `triplet_margin` | `0.3` | 三元组margin |
+| `triplet_margin` | `0.5` | 三元组margin |
 
 ### 4.7 检索攻击者参数
 
@@ -255,7 +250,7 @@ $$L_{visual} = 0.3 \cdot L_{MSE} + 0.3 \cdot L_{SSIM} + 0.3 \cdot L_{VGG}$$
 | `use_retrieval_attacker` | `True` | 是否启用检索攻击者 |
 | `attacker_feature_dim` | `512` | 攻击者输出特征维度 |
 | `attacker_memory_size` | `1000` | 记忆库容量 |
-| `attacker_temperature` | `0.05` | 相似度温度系数 |
+| `attacker_temperature` | `0.05` | 相似度温度系数（用于InfoNCE/对比损失的温度缩放） |
 | `attacker_weight` | `0.5` | 攻击者逃逸损失权重 |
 | `use_hard_negatives` | `True` | 是否使用硬负样本 |
 | `hard_negative_k` | `5` | 硬负样本数量 |
@@ -265,7 +260,7 @@ $$L_{visual} = 0.3 \cdot L_{MSE} + 0.3 \cdot L_{SSIM} + 0.3 \cdot L_{VGG}$$
 
 这是整个系统的**核心调度逻辑**，决定了不同训练阶段的损失权重分配：
 
-#### Phase 1 — 基础隐写训练（Epochs 1-100）
+#### Phase 1 — 基础隐写训练（200 epochs）
 
 ```python
 {
@@ -273,14 +268,14 @@ $$L_{visual} = 0.3 \cdot L_{MSE} + 0.3 \cdot L_{SSIM} + 0.3 \cdot L_{VGG}$$
     'message': 10.0,       # 高权重：优先学习消息编解码
     'adv': 0.0,            # 关闭：不进行对抗训练
     'privacy': 0.0,        # 关闭：不进行隐私保护
-    'noised': 1.0,         # 低权重：基础噪声鲁棒性
+    'noised': 1.0,         # 含噪声图像的视觉损失权重
     'residual_penalty': 0.5 # 中等：限制修改幅度
 }
 ```
 
 **目标**：让编码器学会将消息嵌入图像且保持视觉质量，解码器学会准确提取消息。
 
-#### Phase 2 — 对抗训练（Epochs 101-200）
+#### Phase 2 — 对抗训练（100 epochs）
 
 ```python
 {
@@ -295,20 +290,20 @@ $$L_{visual} = 0.3 \cdot L_{MSE} + 0.3 \cdot L_{SSIM} + 0.3 \cdot L_{VGG}$$
 
 **目标**：引入隐写分析器（Steganalyzer），通过对抗训练让编码后的图像能够欺骗检测器。
 
-#### Phase 3 — 隐私保护训练（Epochs 201-300）
+#### Phase 3 — 隐私保护训练（100 epochs）
 
 ```python
 {
     'visual': 10.0,
     'message': 10.0,
-    'adv': 5.0,             # 保持对抗训练
-    'privacy': 5.0,         # 开启：引入隐私保护约束
-    'noised': 1.0,
-    'residual_penalty': 0.5
+    'adv': 3.0,             # 降低对抗权重
+    'privacy': 10.0,        # 开启：大幅提高隐私保护权重
+    'noised': 0.5,          # 降低含噪声损失权重
+    'residual_penalty': 0.3  # 降低残差惩罚
 }
 ```
 
-**目标**：在保证隐写能力和对抗性的基础上，加入隐私保护约束，使编码图像在语义特征空间中远离原始图像。
+**目标**：在保证隐写能力和对抗性的基础上，大幅引入隐私保护约束，使编码图像在语义特征空间中远离原始图像。
 
 ---
 
@@ -964,7 +959,7 @@ $$L_{total} = w_{clip} \cdot L_{escape}^{CLIP}(f_{cover}^{CLIP}, f_{encoded}^{CL
 | CLIP | ViT-B/32 | 512 | 语义理解、图文对齐 |
 | DINOv2 | ViT-S/14 | 384 | 自监督视觉特征、细粒度纹理 |
 
-当前配置 `dino_weight=0.0`，DINOv2处于禁用状态，但架构已预留。
+默认配置 `dino_weight=0.5`，与CLIP联合使用提供多模态隐私保护。
 
 ---
 
@@ -1007,7 +1002,7 @@ $$L_{retrieval\_escape} = \underbrace{L_{multi\_feature}}_{\text{CLIP/DINO逃逸
 
 | 组件 | 权重 | 来源 | 作用 |
 |------|------|------|------|
-| `multi_feature_loss` | `clip=1.0, dino=0.0` | FeatureRedirectionLoss | 在CLIP/DINO语义空间中拉开距离 |
+| `multi_feature_loss` | `clip=1.0, dino=0.5` | FeatureRedirectionLoss | 在CLIP/DINO语义空间中拉开距离 |
 | `triplet_loss` | `0.5` (attacker_weight) | RedirectionTripletLoss | 在攻击者特征空间中执行逃逸+重定向 |
 
 **关键设计决策**：
@@ -1321,7 +1316,7 @@ def extract_dino_features(self, image):
     return features  # shape: [B, 384]
 ```
 
-DINOv2 (`vit_small_patch14_dinov2.lvd142m`) 通过timm库加载，输出 **384维** 特征向量。当前配置 `dino_weight=0.0` 使其在损失计算中被忽略。
+DINOv2 (`vit_small_patch14_dinov2.lvd142m`) 通过timm库加载，输出 **384维** 特征向量。默认配置 `dino_weight=0.5`，与CLIP联合使用提供多模态隐私保护。
 
 ### 9.2 三阶段训练策略
 
@@ -1391,7 +1386,7 @@ L_adv = self.bce_with_logits_loss(stego_pred, torch.ones_like(stego_pred))
 | 子损失 | 权重 | 含义 |
 |--------|------|------|
 | CLIP逃逸损失 | 1.0 | CLIP特征空间中的hinge loss |
-| DINO逃逸损失 | 0.0 | DINO特征空间中的hinge loss（禁用） |
+| DINO逃逸损失 | 0.5 | DINO特征空间中的hinge loss |
 | 攻击者空间三元组损失 | 0.5 (attacker_weight) | 攻击者特征空间中的逃逸+重定向（统一计算） |
 
 #### 9.2.5 残差惩罚
@@ -1412,8 +1407,8 @@ $$L_{residual} = MSE(I_{enc}, I_{cov})$$
 
 ```bash
 python train.py new --data-dir ./dataset --name experiment1 \
-    --batch-size 4 --size 256 --message 30 \
-    --epochs-phase1 100 --epochs-phase2 100 --epochs-phase3 100 \
+    --batch-size 8 --size 256 --message 30 \
+    --epochs-phase1 200 --epochs-phase2 100 --epochs-phase3 100 \
     --noise "identity"
 ```
 
@@ -1423,6 +1418,15 @@ python train.py new --data-dir ./dataset --name experiment1 \
 python train.py continue --folder ./experiments/experiment1
 ```
 
+**模式3：从指定检查点恢复为新实验 (`new` + `--continue-from-folder`)**
+
+```bash
+python train.py new --data-dir ./dataset --name experiment2 \
+    --continue-from-folder ./experiments/experiment1
+```
+
+这允许从已有实验的检查点继续训练，但保存到新的实验目录中（保留原始实验不变）。
+
 #### 9.3.2 实验目录结构
 
 ```
@@ -1430,9 +1434,10 @@ experiments/{experiment_name}/
 ├── config.json              # 配置快照
 ├── train.log                # 训练日志
 ├── checkpoints/
-│   ├── checkpoint.pth        # 最新检查点
-│   ├── checkpoint_phase1_epoch10.pth
-│   ├── best_phase1.pth       # 最佳检查点
+│   ├── checkpoint.pth        # 最新检查点（含所有模块和优化器状态）
+│   ├── best_phase1.pth       # Phase 1 最佳检查点
+│   ├── best_phase2.pth       # Phase 2 最佳检查点
+│   ├── best_phase3.pth       # Phase 3 最佳检查点（最终最佳）
 │   └── visualizations/
 │       ├── phase1_epoch10.png
 │       └── ...
@@ -1472,7 +1477,7 @@ def save_checkpoint(self, epoch, phase, is_best=False):
     # 自动删除最旧的检查点
 ```
 
-### 9.4 记忆库预热
+### 9.4 记忆库预热与检索攻击者训练
 
 ```python
 def warmup_memory_bank(self, train_loader, num_batches=50):
@@ -1486,13 +1491,19 @@ def warmup_memory_bank(self, train_loader, num_batches=50):
 
 在Phase 1开始前，用50个batch的封面图像特征**预填**记忆库。这确保在正式训练开始时，记忆库已有足够的样本可供硬负样本挖掘。
 
+**检索攻击者训练**：检索攻击者（RetrievalAttackerWithMemory）在Phase 1即参与训练，其损失函数包含两部分：
+- **检索损失**（InfoNCE）：使攻击者能更好地区分封面图像和无关图像
+- **逃逸损失**（attacker_weight）：编码图像在攻击者特征空间中的偏移
+
+通过在对抗中训练攻击者，可以更真实地模拟CBIR系统的检索能力，从而提升隐私保护的鲁棒性。
+
 ---
 
 ## 10. 验证脚本 (`validation_script.py`)
 
 **文件位置**: [validation_script.py](validation_script.py)
 
-验证脚本提供了三种工作模式：
+验证脚本提供了四种工作模式：
 
 ### 10.1 完整验证模式 (`--mode full`)
 
@@ -1537,86 +1548,42 @@ python validation_script.py -c checkpoint.pth -i image.png --mode discriminator
 python validation_script.py -c checkpoint.pth -i stego.png --mode decode
 ```
 
+### 10.4 相似度判断模式 (`--mode similarity`)
+
+仅计算两张图像之间的特征相似度（无需检查点）：
+
+```bash
+python validation_script.py -i encoded_image.png --cover cover_image.png --mode similarity
+```
+
 ---
 
 ## 11. CLIP视觉模型
 
-**目录**: [CLIP/clip/model.py](CLIP/clip/model.py)
+本项目的CLIP模型通过 `pip install git+https://github.com/openai/CLIP.git` 安装，不依赖本地子模块。CLIP (Contrastive Language-Image Pre-Training) 由OpenAI开发，通过大规模图文对比学习训练。
 
-本项目使用的CLIP模型来自OpenAI官方实现的fork版本。以下是核心组件的技术说明。
+### 11.1 CLIP模型简介
 
-### 11.1 Vision Transformer (ViT) 视觉编码器
+CLIP的核心思想是通过对比学习，让图像编码器和文本编码器在统一的特征空间中产生对齐的表示：
 
-当使用ViT架构时（本项目使用的 `ViT-B/32`）：
+- **预训练规模**：约4亿图文对
+- **架构**：图像端使用ViT-B/32（Transformer）或ResNet，文本端使用Transformer
+- **特征维度**：512维L2归一化特征向量
+- **使用方式**：本项目仅使用图像编码器（`clip.load` + `encode_image`），文本编码器不使用
 
-```python
-class VisionTransformer(nn.Module):
-    def __init__(self, input_resolution, patch_size, width, layers, heads, output_dim):
-        self.conv1 = nn.Conv2d(3, width, kernel_size=patch_size, stride=patch_size)
-        # Patch embedding: 将图像分割为(patch_size×patch_size)的patches
-        # 对于224×224图像，patch_size=32 → 8×8=64个patches
-        
-        self.class_embedding = nn.Parameter(scale * torch.randn(width))
-        # 可学习的[class] token，聚合全局信息
-        
-        self.positional_embedding = nn.Parameter(scale * torch.randn(65, width))
-        # 64个patch位置 + 1个class位置 = 65个位置编码
-        
-        self.transformer = Transformer(width, layers, heads)
-        # 12层Transformer编码器
-        
-        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
-        # 线性投影到输出维度（512）
-```
+### 11.2 在本项目中的作用
 
-**ViT-B/32具体参数**：
-- `width=768`（隐藏维度）
-- `layers=12`（Transformer层数）
-- `heads=12`（注意力头数）
-- `patch_size=32`（每个patch 32×32像素）
-- `output_dim=512`（最终特征维度）
+内容识别器（ContentRecognizer）使用冻结的CLIP ViT-B/32作为特征提取器：
+- 将原始封面图像和编码图像分别通过CLIP编码，得到512维语义特征
+- 计算两者的余弦相似度，用于隐私损失计算
+- CLIP的语义理解能力使得即使像素级差异很小，语义级的"相似性泄露"也能被检测
 
-**前向传播**：
+### 11.3 为什么选择CLIP？
 
-```
-Image [B, 3, 224, 224]
-    │
-    ▼
-Patch Embedding (Conv2d 3→768, k=32, s=32)
-    │
-    ▼
-[B, 768, 7, 7] → reshape → [B, 49, 768]  (49个patch tokens)
-    │
-    ▼
-Prepend [class] token → [B, 50, 768]
-    │
-    ▼
-Add Positional Embedding → [B, 50, 768]
-    │
-    ▼
-LayerNorm (pre-norm)
-    │
-    ▼
-Transformer Encoder (12层 × Multi-head Self-Attention + MLP)
-    │
-    ▼
-LayerNorm (post-norm)，取第0个token ([class] token)
-    │
-    ▼
-Linear Projection → [B, 512]
-```
-
-### 11.2 ModifiedResNet 视觉编码器（备选）
-
-CLIP还支持ResNet风格的视觉编码器，与标准ResNet的关键区别：
-
-1. **3层stem卷积**（替代原来的1层大核卷积），使用Average Pool替代Max Pool
-2. **抗混叠步长卷积**：在stride>1的卷积前插入Average Pool，减少混叠伪影
-3. **注意力池化**（AttentionPool2d）替代最后的Global Average Pool，使用多头注意力聚合空间特征
-
-### 11.3 文本编码器
-
-标准的Transformer decoder架构（causal attention mask），用于文本特征提取。在本项目中**仅使用图像编码器**（`encode_image`方法）。
+相比纯视觉特征提取器（如VGG、ResNet）：
+- CLIP特征具有更强的**语义泛化能力**，不受特定数据集限制
+- 训练过程中见过的图文对齐关系使其对场景、物体、属性的理解更加全面
+- 冻结使用无需梯度计算，开销可控
 
 ---
 
@@ -1832,8 +1799,8 @@ L_triplet = hinge(margin - cos(f_encoded, f_hard_negative))
 │  │  └────────────────────────────────────────────────────────────────┘    │
 │  │                                                                        │
 │  │  ┌─ Total Loss ────────────────────────────────────────────────────┐    │
-│  │  │ L_total = 10*(L_visual + 1*L_visual_noised)                    │    │
-│  │  │        + 10*L_message + 5*L_adv + 5*L_privacy + 0.5*L_residual│    │
+│  │  │ L_total = 10*(L_visual + 0.5*L_visual_noised)                   │    │
+│  │  │        + 10*L_message + 3*L_adv + 10*L_privacy + 0.3*L_residual│    │
 │  │  └────────────────────────────────────────────────────────────────┘    │
 │  │                                                                        │
 │  ├───────────────────────────────────────────────────────────────────────┤
@@ -1941,21 +1908,26 @@ TensorBoard中可查看的标量：
 |------|------|--------|------|
 | 图像 | image_size | 256 | 输入分辨率 |
 | 消息 | message_length | 30 | 隐藏比特数 |
-| 训练 | batch_size | 4 | 批次大小 |
+| 训练 | batch_size | 8 | 批次大小 |
 | LR | lr_encoder/decoder | 8e-4 | 生成器学习率 |
 | LR | lr_steganalyzer | 5e-4 | 判别器学习率 |
-| 调度 | scheduler_T_max | 300 | 余弦退火周期 |
+| 调度 | scheduler_T_max | 400 | 余弦退火周期 |
 | λ | lambda_pixel | 0.3 | MSE权重 |
 | λ | lambda_ssim | 0.3 | SSIM权重 |
 | λ | lambda_perceptual | 0.3 | VGG感知权重 |
 | λ | lambda_message | 1.0 | 消息损失权重 |
-| λ | lambda_adv | 0.3 | 对抗损失权重 |
-| λ | lambda_privacy | 1.0 | 隐私损失权重 |
-| 隐私 | privacy_margin | 0.3 | 最大相似度阈值 |
+| λ | lambda_adv | 0.3 | 对抗损失权重（基础） |
+| λ | lambda_privacy | 1.0 | 隐私损失权重（基础） |
+| 隐私 | privacy_margin | 0.7 | 隐私安全边界 |
+| 隐私 | clip_weight | 1.0 | CLIP特征逃逸权重 |
+| 隐私 | dino_weight | 0.5 | DINOv2特征逃逸权重 |
+| 隐私 | triplet_weight | 0.15 | 三元组损失权重 |
+| 隐私 | triplet_margin | 0.5 | 三元组margin |
 | 攻击 | attacker_feature_dim | 512 | 攻击特征维度 |
 | 攻击 | attacker_memory_size | 1000 | 记忆库容量 |
+| 攻击 | attacker_temperature | 0.05 | 温度系数 |
 | 攻击 | hard_negative_k | 5 | 硬负样本数 |
-| 阶段 | P1 epochs | 100 | 基础训练 |
+| 阶段 | P1 epochs | 200 | 基础训练 |
 | 阶段 | P2 epochs | 100 | 对抗训练 |
 | 阶段 | P3 epochs | 100 | 隐私训练 |
 
