@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import timm
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
@@ -36,13 +35,6 @@ class Trainer:
             {"params": self.decoder.parameters(), "lr": cfg.lr_decoder},
         ])
         self.optimizer_steganalyzer = optim.Adam(self.steganalyzer.parameters(), lr=cfg.lr_steganalyzer)
-        
-        self.scheduler_encoder_decoder = CosineAnnealingLR(
-            self.optimizer_encoder_decoder, T_max=cfg.scheduler_T_max, eta_min=1e-5
-        )
-        self.scheduler_steganalyzer = CosineAnnealingLR(
-            self.optimizer_steganalyzer, T_max=cfg.scheduler_T_max, eta_min=1e-6
-        )
         #定义损失函数
         self.ssim_loss = SSIMLoss().to(self.device)
         self.perceptual_loss = PerceptualLoss().to(self.device)
@@ -190,8 +182,6 @@ class Trainer:
         message = batch['message'].to(self.device)
 
         weights = self.cfg.get_phase_weights(phase)
-
-        self.steganalyzer_scheduler_active = weights.get('adv', 0.0) > 0
 
         #编码器编码图像
         encoded_image, residual_penalty = self.encoder(cover_image, message)
@@ -520,19 +510,6 @@ class Trainer:
         
         return total_losses
 
-    def step_schedulers(self):
-        self.scheduler_encoder_decoder.step()
-        if hasattr(self, 'steganalyzer_scheduler_active') and self.steganalyzer_scheduler_active:
-            self.scheduler_steganalyzer.step()
-    
-    def reset_schedulers(self, num_epochs):
-        self.scheduler_encoder_decoder = CosineAnnealingLR(
-            self.optimizer_encoder_decoder, T_max=num_epochs, eta_min=1e-5
-        )
-        self.scheduler_steganalyzer = CosineAnnealingLR(
-            self.optimizer_steganalyzer, T_max=num_epochs, eta_min=1e-6
-        )
-
     def warmup_memory_bank(self, train_loader, num_batches=50):
         if self.retrieval_attacker is None:
             return
@@ -560,8 +537,6 @@ class Trainer:
             'steganalyzer_state_dict': self.steganalyzer.state_dict(),
             'optimizer_encoder_decoder': self.optimizer_encoder_decoder.state_dict(),
             'optimizer_steganalyzer': self.optimizer_steganalyzer.state_dict(),
-            'scheduler_encoder_decoder': self.scheduler_encoder_decoder.state_dict(),
-            'scheduler_steganalyzer': self.scheduler_steganalyzer.state_dict(),
             'best_loss': self.best_loss
         }
         

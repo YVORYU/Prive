@@ -49,47 +49,52 @@ PrivSteg/
 ## 网络架构
 
 ### 编码器（Encoder）
+
 - 8 层 ConvBNRelu 特征提取 → 消息空间扩展拼接 → 1×1 卷积输出
 - 输入：载体图像 (B, 3, H, W) + 消息 (B, L)
 - 输出：编码图像 (B, 3, H, W) + 残差惩罚项
 
 ### 解码器（Decoder）
+
 - 8 层 ConvBNRelu + AdaptiveAvgPool + 全连接层
 - 输入：编码图像（可含噪声）
 - 输出：消息 logits (B, L)
 
 ### 隐写分析器（Steganalyzer）
+
 - 8 层卷积（SpectralNorm）+ 全连接判别头
 - 输出：图像是否为隐写图像的 logits
 
 ### 内容识别器（ContentRecognizer）
+
 - 冻结的 CLIP ViT-B/32 图像编码器
 - 提取 L2 归一化的 512 维图像特征
 
 ### 检索攻击模型（RetrievalAttackerWithMemory）
+
 - 4 层卷积 + 注意力机制 + 记忆库
 - 记忆库存储历史特征，支持硬负样本挖掘
 - 模拟 CBIR 检索攻击，增强隐私训练的对抗性
 
 ## 损失函数
 
-| 损失 | 说明 |
-|------|------|
-| L_pixel | 像素级 MSE 损失 |
-| L_ssim | 结构相似性损失 |
-| L_perceptual | VGG19 感知损失（L1） |
-| L_message | 消息提取 BCEWithLogits 损失 |
-| L_adv | GAN 对抗损失 |
-| L_privacy | 隐私保护损失（CLIP + DINOv2 特征偏移 + Triplet + 攻击损失） |
-| L_residual | 残差惩罚项 |
+| 损失            | 说明                                          |
+| ------------- | ------------------------------------------- |
+| L\_pixel      | 像素级 MSE 损失                                  |
+| L\_ssim       | 结构相似性损失                                     |
+| L\_perceptual | VGG19 感知损失（L1）                              |
+| L\_message    | 消息提取 BCEWithLogits 损失                       |
+| L\_adv        | GAN 对抗损失                                    |
+| L\_privacy    | 隐私保护损失（CLIP + DINOv2 特征偏移 + Triplet + 攻击损失） |
+| L\_residual   | 残差惩罚项                                       |
 
 ## 三阶段训练
 
-| 阶段 | Epoch | 目标 | 关键权重 |
-|------|-------|------|----------|
-| Phase 1 | 200 | 基础训练：视觉质量 + 消息提取 | visual=10, message=10, adv=0, privacy=0 |
-| Phase 2 | 100 | 对抗训练：加入隐写分析器对抗 | visual=10, message=10, adv=5, privacy=0 |
-| Phase 3 | 100 | 隐私训练：加入隐私保护损失 | visual=10, message=10, adv=3, privacy=10 |
+| 阶段      | Epoch | 目标               | 关键权重                                     |
+| ------- | ----- | ---------------- | ---------------------------------------- |
+| Phase 1 | 200   | 基础训练：视觉质量 + 消息提取 | visual=10, message=10, adv=0, privacy=0  |
+| Phase 2 | 100   | 对抗训练：加入隐写分析器对抗   | visual=10, message=10, adv=5, privacy=0  |
+| Phase 3 | 100   | 隐私训练：加入隐私保护损失    | visual=10, message=10, adv=3, privacy=10 |
 
 ## 环境要求
 
@@ -208,21 +213,21 @@ python validation_script.py \
 
 ## 关键配置参数
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `image_size` | 256 | 图像尺寸 |
-| `message_length` | 30 | 嵌入消息长度（bit） |
-| `batch_size` | 8 | 批大小 |
-| `use_advanced_privacy` | True | 是否启用高级隐私损失（CLIP + DINOv2 + Triplet） |
-| `privacy_mode` | retrieval_escape | 隐私模式 |
-| `clip_weight` | 1.0 | CLIP 特征偏移损失权重 |
-| `dino_weight` | 0.5 | DINOv2 特征偏移损失权重 |
-| `triplet_weight` | 0.15 | Triplet 损失权重 |
-| `use_retrieval_attacker` | True | 是否启用检索攻击模型 |
-| `attacker_feature_dim` | 512 | 攻击模型特征维度 |
-| `attacker_memory_size` | 1000 | 记忆库大小 |
-| `privacy_margin` | 0.7 | 隐私损失间隔 |
-| `noise_config` | identity | 噪声层配置 |
+| 参数                       | 默认值               | 说明                                  |
+| ------------------------ | ----------------- | ----------------------------------- |
+| `image_size`             | 256               | 图像尺寸                                |
+| `message_length`         | 30                | 嵌入消息长度（bit）                         |
+| `batch_size`             | 8                 | 批大小                                 |
+| `use_advanced_privacy`   | True              | 是否启用高级隐私损失（CLIP + DINOv2 + Triplet） |
+| `privacy_mode`           | retrieval\_escape | 隐私模式                                |
+| `clip_weight`            | 1.0               | CLIP 特征偏移损失权重                       |
+| `dino_weight`            | 0.5               | DINOv2 特征偏移损失权重                     |
+| `triplet_weight`         | 0.15              | Triplet 损失权重                        |
+| `use_retrieval_attacker` | True              | 是否启用检索攻击模型                          |
+| `attacker_feature_dim`   | 512               | 攻击模型特征维度                            |
+| `attacker_memory_size`   | 1000              | 记忆库大小                               |
+| `privacy_margin`         | 0.7               | 隐私损失间隔                              |
+| `noise_config`           | identity          | 噪声层配置                               |
 
 ## 输出说明
 

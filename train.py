@@ -59,8 +59,7 @@ def save_config(config_path, cfg):
         'attacker_weight': cfg.attacker_weight,
         'use_hard_negatives': cfg.use_hard_negatives,
         'hard_negative_k': cfg.hard_negative_k,
-        'memory_warmup_batches': cfg.memory_warmup_batches,
-        'scheduler_T_max': cfg.scheduler_T_max
+        'memory_warmup_batches': cfg.memory_warmup_batches
     }
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config_dict, f, indent=4)
@@ -117,8 +116,7 @@ def setup_logger(log_file, cfg, append=False):
             'attacker_weight': cfg.attacker_weight,
             'use_hard_negatives': cfg.use_hard_negatives,
             'hard_negative_k': cfg.hard_negative_k,
-            'memory_warmup_batches': cfg.memory_warmup_batches,
-            'scheduler_T_max': cfg.scheduler_T_max
+            'memory_warmup_batches': cfg.memory_warmup_batches
         }
         for key, value in config_dict.items():
             f.write(f"  {key}: {value}\n")
@@ -175,8 +173,6 @@ def run_training_loop(trainer, train_loader, val_loader, cfg, start_phase, start
         
         print(f'Starting Phase {phase}')
         
-        trainer.reset_schedulers(num_epochs)
-        
         if phase == 1 and phase_start_epoch == 1:
             trainer.warmup_memory_bank(train_loader, num_batches=getattr(cfg, 'memory_warmup_batches', 50))
         
@@ -227,8 +223,6 @@ def run_training_loop(trainer, train_loader, val_loader, cfg, start_phase, start
                 trainer.best_loss = val_losses['L_total']
             if epoch % cfg.save_interval == 0:
                 trainer.save_checkpoint(epoch, phase, is_best)
-            
-            trainer.step_schedulers()
     
     print('Training completed!')
     trainer.writer.close()
@@ -375,10 +369,6 @@ def main():
                     trainer.optimizer_attacker.load_state_dict(checkpoint['optimizer_attacker'])
                 if hasattr(trainer, 'retrieval_attacker') and 'retrieval_attacker_state_dict' in checkpoint:
                     trainer.retrieval_attacker.load_state_dict(checkpoint['retrieval_attacker_state_dict'])
-                if hasattr(trainer, 'scheduler_encoder_decoder') and 'scheduler_encoder_decoder' in checkpoint:
-                    trainer.scheduler_encoder_decoder.load_state_dict(checkpoint['scheduler_encoder_decoder'])
-                if hasattr(trainer, 'scheduler_steganalyzer') and 'scheduler_steganalyzer' in checkpoint:
-                    trainer.scheduler_steganalyzer.load_state_dict(checkpoint['scheduler_steganalyzer'])
                 #找到最佳损失
                 trainer.best_loss = checkpoint.get('best_loss', float('inf'))
                 start_epoch = checkpoint['epoch'] + 1
@@ -427,10 +417,6 @@ def main():
                 trainer.optimizer_attacker.load_state_dict(checkpoint['optimizer_attacker'])
             if hasattr(trainer, 'retrieval_attacker') and 'retrieval_attacker_state_dict' in checkpoint:
                 trainer.retrieval_attacker.load_state_dict(checkpoint['retrieval_attacker_state_dict'])
-            if hasattr(trainer, 'scheduler_encoder_decoder') and 'scheduler_encoder_decoder' in checkpoint:
-                trainer.scheduler_encoder_decoder.load_state_dict(checkpoint['scheduler_encoder_decoder'])
-            if hasattr(trainer, 'scheduler_steganalyzer') and 'scheduler_steganalyzer' in checkpoint:
-                trainer.scheduler_steganalyzer.load_state_dict(checkpoint['scheduler_steganalyzer'])
             #找到最佳损失
             trainer.best_loss = checkpoint.get('best_loss', float('inf'))
             start_epoch = checkpoint['epoch'] + 1

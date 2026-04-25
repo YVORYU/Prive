@@ -7,15 +7,13 @@ class Config:
     message_length = 30
     batch_size = 8
 
-    lr_encoder = 8e-4
-    lr_decoder = 8e-4
-    lr_steganalyzer = 5e-4
+    lr_encoder = 1e-3
+    lr_decoder = 1e-3
+    lr_steganalyzer = 1e-3
 
     num_epochs_phase1 = 200
     num_epochs_phase2 = 100
     num_epochs_phase3 = 100
-
-    scheduler_T_max = num_epochs_phase1 + num_epochs_phase2 + num_epochs_phase3
 
     lambda_pixel = 0.3
     lambda_ssim = 0.3
@@ -71,7 +69,7 @@ class Config:
             return {
                 'visual': 10.0,
                 'message': 10.0,
-                'adv': 5.0,
+                'adv': 3.0,
                 'privacy': 0.0,
                 'noised': 1.0,
                 'residual_penalty': 0.5
