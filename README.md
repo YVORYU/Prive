@@ -5,10 +5,11 @@
 ## 核心特性
 
 - **消息嵌入与提取**：在图像中嵌入二进制消息（默认 30 bit），解码端可准确提取
-- **视觉不可感知性**：编码图像与原图在像素级、结构级（SSIM）、感知级（VGG19 感知损失）上保持高度一致
-- **隐写分析对抗**：通过 GAN 对抗训练使隐写图像能逃逸隐写分析器的检测
+- **视觉不可感知性**：编码图像与原图在像素级（MSE）、结构级（SSIM）、感知级（VGG19 感知损失）上保持高度一致
+- **隐写分析对抗**：通过 GAN 对抗训练 + SpectralNorm 使隐写图像能逃逸隐写分析器的检测
 - **检索逃逸隐私保护**：利用 CLIP + DINOv2 多特征空间使隐写图像在语义特征层面与原图产生偏移，防止被 CBIR 系统检索关联
-- **检索攻击模拟**：内置带记忆库的检索攻击模型（RetrievalAttackerWithMemory），通过硬负样本挖掘增强隐私鲁棒性
+- **检索攻击模拟**：内置带记忆库的检索攻击模型（RetrievalAttackerWithMemory），通过 InfoNCE 损失 + 硬负样本挖掘增强隐私鲁棒性
+- **统一特征空间三元组损失**：三元组损失在攻击者特征空间内统一计算（逃逸 + 重定向 + 排斥控制），避免跨空间梯度噪声
 - **噪声鲁棒性**：支持多种噪声层（裁剪、JPEG 压缩、量化等），保证消息在信道干扰下仍可提取
 
 ## 项目结构
@@ -22,26 +23,26 @@ PrivSteg/
 ├── noise_argparser.py         # 噪声层命令行参数解析
 ├── requirements.txt           # Python 依赖
 ├── models/
-│   ├── encoder.py             # 编码器（消息融合 + 残差学习）
+│   ├── encoder.py             # 编码器（消息空间扩展 + 残差学习）
 │   ├── decoder.py             # 解码器（CNN + 全连接消息提取）
 │   ├── steganalyzer.py        # 隐写分析器（判别器，SpectralNorm）
 │   ├── content_recognizer.py  # 内容识别器（冻结 CLIP ViT-B/32）
-│   └── retrieval_attacker.py  # 检索攻击模型（带记忆库 + 硬负样本挖掘）
+│   └── retrieval_attacker.py  # 检索攻击模型（CNN+注意力+记忆库+硬负样本挖掘）
 ├── losses/
 │   ├── ssim_loss.py           # SSIM 损失
-│   ├── perceptual_loss.py     # VGG19 感知损失
-│   ├── privacy_loss.py        # 基础隐私损失（CLIP 余弦相似度偏移）
-│   └── advanced_privacy_loss.py  # 高级隐私损失（CLIP + DINOv2 + Triplet + 攻击损失）
+│   ├── perceptual_loss.py     # VGG19 感知损失（ImageNet 归一化 + 空间/通道归一化）
+│   ├── privacy_loss.py        # 基础隐私损失（Softplus: log1p(exp(sim - target))）
+│   └── advanced_privacy_loss.py  # 高级隐私损失（CLIP + DINOv2 + 统一空间三元组 + 攻击者逃逸）
 ├── noise_layers/
-│   ├── noiser.py              # 噪声层组合器
+│   ├── noiser.py              # 噪声层组合器（随机选择激活）
 │   ├── identity.py            # 恒等层（无噪声）
 │   ├── crop.py                # 裁剪噪声
-│   ├── cropout.py             # 中心裁剪噪声
+│   ├── cropout.py             # 裁剪替换噪声
 │   ├── dropout.py             # 随机丢弃噪声
 │   ├── resize.py              # 缩放噪声
-│   ├── jpeg_compression.py    # JPEG 压缩噪声
-│   ├── quantization.py        # 量化噪声
-│   └── dct_filters.py         # DCT 滤波噪声
+│   ├── jpeg_compression.py    # JPEG 压缩噪声（DCT 域量化）
+│   ├── quantization.py        # 傅里叶近似量化噪声
+│   └── dct_filters.py         # DCT 滤波器生成工具
 └── data/
     └── dataset.py             # 隐写数据集（图像加载 + 随机消息生成）
 ```
@@ -52,49 +53,69 @@ PrivSteg/
 
 - 8 层 ConvBNRelu 特征提取 → 消息空间扩展拼接 → 1×1 卷积输出
 - 输入：载体图像 (B, 3, H, W) + 消息 (B, L)
+- 拼接通道：30(message) + 64(features) + 3(cover) = 97
 - 输出：编码图像 (B, 3, H, W) + 残差惩罚项
 
 ### 解码器（Decoder）
 
-- 8 层 ConvBNRelu + AdaptiveAvgPool + 全连接层
+- 8 层 ConvBNRelu + ConvBNRelu(64→30) + AdaptiveAvgPool + 全连接层
 - 输入：编码图像（可含噪声）
-- 输出：消息 logits (B, L)
+- 输出：消息 logits (B, L)（配合 BCEWithLogitsLoss）
 
 ### 隐写分析器（Steganalyzer）
 
 - 8 层卷积（SpectralNorm）+ 全连接判别头
+- 渐进式下采样：256 → 128 → 64 → 32 → 1
+- LeakyReLU(0.2) + Dropout(0.3)
 - 输出：图像是否为隐写图像的 logits
 
 ### 内容识别器（ContentRecognizer）
 
 - 冻结的 CLIP ViT-B/32 图像编码器
+- 输入预处理：Resize(224) → [-1,1]→[0,1] → ImageNet 归一化
 - 提取 L2 归一化的 512 维图像特征
 
 ### 检索攻击模型（RetrievalAttackerWithMemory）
 
-- 4 层卷积 + 注意力机制 + 记忆库
-- 记忆库存储历史特征，支持硬负样本挖掘
-- 模拟 CBIR 检索攻击，增强隐私训练的对抗性
+- 4 层卷积（stride=2 下采样）+ SE-Net 风格通道注意力 + 记忆库
+- 记忆库：循环缓冲区（容量 1000），存储历史特征
+- 硬负样本挖掘：top-k 最相似 → 选最难的 1 个
+- 支持返回与记忆库的相似度矩阵（用于 InfoNCE 损失）
+- 温度系数控制相似度分布锐利程度
 
 ## 损失函数
 
 | 损失            | 说明                                          |
 | ------------- | ------------------------------------------- |
 | L\_pixel      | 像素级 MSE 损失                                  |
-| L\_ssim       | 结构相似性损失                                     |
-| L\_perceptual | VGG19 感知损失（L1）                              |
+| L\_ssim       | 结构相似性损失（11×11 高斯窗口）                        |
+| L\_perceptual | VGG19 感知损失（前18层，L1，ImageNet 归一化 + 空间/通道归一化） |
 | L\_message    | 消息提取 BCEWithLogits 损失                       |
-| L\_adv        | GAN 对抗损失                                    |
-| L\_privacy    | 隐私保护损失（CLIP + DINOv2 特征偏移 + Triplet + 攻击损失） |
-| L\_residual   | 残差惩罚项                                       |
+| L\_adv        | GAN 对抗损失（非饱和 + SpectralNorm）               |
+| L\_privacy    | 隐私保护损失（CLIP + DINOv2 Softplus 逃逸 + 攻击者空间三元组） |
+| L\_residual   | 残差惩罚项（编码图与原图 MSE）                          |
+
+### 隐私损失详解
+
+隐私损失由 `RetrievalEscapeLoss` 聚合：
+
+- **多模态特征逃逸**：CLIP (512d) + DINOv2 (384d) 各自的 Softplus Loss（`log1p(exp(sim - target))`）
+- **攻击者空间三元组损失**：统一在攻击者特征空间内计算
+  - 逃逸项：Softplus Loss 推动编码特征远离封面特征
+  - 吸引项：Hinge Loss 推动编码特征靠近硬负样本
+  - 排斥控制项：Hinge Loss 防止过度接近导致特征坍塌
 
 ## 三阶段训练
 
-| 阶段      | Epoch | 目标               | 关键权重                                     |
-| ------- | ----- | ---------------- | ---------------------------------------- |
-| Phase 1 | 200   | 基础训练：视觉质量 + 消息提取 | visual=10, message=10, adv=0, privacy=0  |
-| Phase 2 | 100   | 对抗训练：加入隐写分析器对抗   | visual=10, message=10, adv=5, privacy=0  |
-| Phase 3 | 100   | 隐私训练：加入隐私保护损失    | visual=10, message=10, adv=3, privacy=10 |
+| 阶段      | Epoch | 目标               | 关键权重                                          |
+| ------- | ----- | ---------------- | --------------------------------------------- |
+| Phase 1 | 200   | 基础训练：视觉质量 + 消息提取 | visual=10, message=10, adv=0, privacy=0       |
+| Phase 2 | 100   | 对抗训练：加入隐写分析器对抗   | visual=10, message=10, adv=3, privacy=0       |
+| Phase 3 | 100   | 隐私训练：加入隐私保护损失    | visual=10, message=10, adv=3, privacy=10      |
+
+**记忆库预热**：Phase 1 开始前用 50 个 batch 的封面图像特征预填记忆库。
+
+**检索攻击者训练**：Phase 2 及之后使用 InfoNCE 损失训练攻击者（记忆库不足时退化为 MSE 损失）。
 
 ## 环境要求
 
@@ -110,7 +131,7 @@ cd PrivSteg
 pip install -r requirements.txt
 ```
 
-> 注意：CLIP 需要从 GitHub 安装，`requirements.txt` 中已包含 `git+https://github.com/openai/CLIP.git`。DINOv2 模型权重需单独下载并放置到 `./models/` 目录。
+> 注意：CLIP 需要从 GitHub 安装，`requirements.txt` 中已包含 `git+https://github.com/openai/CLIP.git`。DINOv2 模型权重需单独下载并放置到 `./models/` 目录（支持位置编码插值适配不同图像尺寸）。
 
 ## 数据准备
 
@@ -152,9 +173,9 @@ python train.py new \
     --epochs-phase1 200 \
     --epochs-phase2 100 \
     --epochs-phase3 100 \
-    --lr-encoder 8e-4 \
-    --lr-decoder 8e-4 \
-    --lr-steganalyzer 5e-4 \
+    --lr-encoder 1e-3 \
+    --lr-decoder 1e-3 \
+    --lr-steganalyzer 1e-3 \
     --noise "cropout((0.55, 0.6), (0.55, 0.6))+jpeg" \
     --seed 42
 ```
@@ -218,14 +239,22 @@ python validation_script.py \
 | `image_size`             | 256               | 图像尺寸                                |
 | `message_length`         | 30                | 嵌入消息长度（bit）                         |
 | `batch_size`             | 8                 | 批大小                                 |
-| `use_advanced_privacy`   | True              | 是否启用高级隐私损失（CLIP + DINOv2 + Triplet） |
+| `lr_encoder`             | 1e-3              | 编码器学习率                              |
+| `lr_decoder`             | 1e-3              | 解码器学习率                              |
+| `lr_steganalyzer`        | 1e-3              | 隐写分析器学习率                            |
+| `use_advanced_privacy`   | True              | 是否启用高级隐私损失（CLIP + DINOv2 + 三元组）    |
 | `privacy_mode`           | retrieval\_escape | 隐私模式                                |
 | `clip_weight`            | 1.0               | CLIP 特征偏移损失权重                       |
-| `dino_weight`            | 0.5               | DINOv2 特征偏移损失权重                     |
-| `triplet_weight`         | 0.15              | Triplet 损失权重                        |
+| `dino_weight`            | 0.5               | DINOv2 特征偏移损失权重（Config 默认值，Trainer 中实际使用 0.8） |
+| `triplet_weight`         | 0.15              | 三元组损失权重（Config 默认值，Trainer 中实际传入 0.5） |
+| `triplet_margin`         | 0.5               | 三元组 margin（Config 默认值，Trainer 中实际传入 0.3） |
 | `use_retrieval_attacker` | True              | 是否启用检索攻击模型                          |
 | `attacker_feature_dim`   | 512               | 攻击模型特征维度                            |
 | `attacker_memory_size`   | 1000              | 记忆库大小                               |
+| `attacker_temperature`   | 0.05              | 攻击者温度系数                             |
+| `attacker_weight`        | 0.5               | 攻击者逃逸损失权重                           |
+| `hard_negative_k`        | 5                 | 硬负样本候选数                             |
+| `memory_warmup_batches`  | 50                | 记忆库预热批次数                            |
 | `privacy_margin`         | 0.7               | 隐私损失间隔                              |
 | `noise_config`           | identity          | 噪声层配置                               |
 
@@ -239,8 +268,10 @@ experiments/my_experiment/
 ├── train.log                # 训练日志
 ├── checkpoints/
 │   ├── checkpoint.pth       # 最新检查点
+│   ├── checkpoint_phase{N}_epoch{M}.pth  # 阶段性检查点
 │   ├── best_phase1.pth      # Phase 1 最佳模型
 │   ├── best_phase2.pth      # Phase 2 最佳模型
+│   ├── best_phase3.pth      # Phase 3 最佳模型
 │   └── visualizations/      # 验证可视化图像
 └── tensorboard/             # TensorBoard 日志
 ```
@@ -257,10 +288,22 @@ tensorboard --logdir ./experiments/my_experiment/tensorboard
 
 传统隐写方法仅关注视觉不可感知性和消息鲁棒性，但忽略了基于内容的图像检索（CBIR）威胁——攻击者可通过特征相似度检索将隐写图像关联到原始载体。PrivSteg 通过以下机制解决此问题：
 
-1. **多特征空间偏移**：同时在 CLIP 和 DINOv2 特征空间中推动隐写图像特征远离原图特征，使余弦相似度低于安全阈值
-2. **Triplet 损失引导**：利用硬负样本（记忆库中最相似的无关图像特征）引导隐写特征向无关方向偏移，避免特征坍缩
+1. **多特征空间偏移**：同时在 CLIP（512d，语义理解）和 DINOv2（384d，细粒度纹理）特征空间中使用 Softplus Loss 推动隐写图像特征远离原图特征
+2. **统一空间三元组损失**：在攻击者特征空间内统一计算逃逸项（Softplus）+ 吸引项（Hinge）+ 排斥控制项（Hinge），避免跨特征空间梯度噪声
 3. **对抗检索攻击**：训练检索攻击模型模拟 CBIR 攻击者，通过 InfoNCE 损失增强攻击者的检索能力，从而在对抗中提升隐私保护强度
+4. **硬负样本挖掘**：从记忆库（MoCo 风格循环缓冲区）中动态选取 top-k 最相似样本，再选最难的 1 个作为三元组目标，增强判别能力
 
 ### 噪声鲁棒性
 
 Noiser 模块在训练时随机选择一种噪声层施加于编码图像，模拟实际信道中的各种干扰，确保解码器在噪声环境下仍能准确提取消息。支持组合噪声配置，如 `cropout+jpeg`。
+
+### Softplus Loss vs Hinge Loss
+
+隐私损失使用 `log1p(exp(x))`（Softplus）而非 `max(0, x)`（Hinge），优势在于：
+- 处处可导，梯度更平滑
+- 对已满足约束的样本仍有微小梯度，避免过早停止优化
+- 数值稳定性更好
+
+## 详细技术文档
+
+完整的技术实现细节、算法原理、数据流图和参数说明请参阅 [TECHNICAL_DOC.md](TECHNICAL_DOC.md)。

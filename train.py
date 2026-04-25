@@ -137,6 +137,8 @@ def log_batch_losses(log_file, batch_idx, losses, phase):
         f.write(f"L_visual={losses['L_visual']:.6f}, ")
         f.write(f"L_message={losses['L_message']:.6f}, ")
         f.write(f"L_adv={losses['L_adv']:.6f}, ")
+        f.write(f"discr_cover_bce={losses['discr_cover_bce']:.6f}, ")
+        f.write(f"discr_encod_bce={losses['discr_encod_bce']:.6f}, ")
         f.write(f"L_privacy={losses['L_privacy']:.6f}\n")
 
 #写每个epoch的loss到日志文件

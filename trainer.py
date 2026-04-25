@@ -214,8 +214,9 @@ class Trainer:
         cover_pred = self.steganalyzer(noised_cover_image)
 
         #判别器损失：cover=1, stego=0
-        L_D = (self.bce_with_logits_loss(cover_pred, torch.ones_like(cover_pred)) +
-               self.bce_with_logits_loss(stego_pred, torch.zeros_like(stego_pred)))
+        discr_cover_bce = self.bce_with_logits_loss(cover_pred, torch.ones_like(cover_pred))
+        discr_encod_bce = self.bce_with_logits_loss(stego_pred, torch.zeros_like(stego_pred))
+        L_D = discr_cover_bce + discr_encod_bce
         
         if weights.get('adv', 0.0) > 0:
             self.optimizer_steganalyzer.zero_grad()
@@ -331,6 +332,8 @@ class Trainer:
             'L_visual_noised': L_visual_noised.item(),
             'L_message': L_message.item(),
             'L_adv': L_adv.item(),
+            'discr_cover_bce': discr_cover_bce.item(),
+            'discr_encod_bce': discr_encod_bce.item(),
             'L_privacy': L_privacy.item(),
             'L_residual_penalty': residual_penalty.item(),
             'L_total': L_total.item(),
@@ -401,6 +404,8 @@ class Trainer:
                 stego_pred = self.steganalyzer(noised_encoded_image)
                 cover_pred = self.steganalyzer(noised_cover_image)
                 L_adv = self.bce_with_logits_loss(stego_pred, torch.ones_like(stego_pred))
+                discr_cover_bce = self.bce_with_logits_loss(cover_pred, torch.ones_like(cover_pred))
+                discr_encod_bce = self.bce_with_logits_loss(stego_pred, torch.zeros_like(stego_pred))
                 
                 feat_cover = self.content_recognizer(cover_image)
                 feat_encoded = self.content_recognizer(encoded_image)
@@ -461,7 +466,8 @@ class Trainer:
                     ('L_perceptual', L_perceptual), ('L_visual', L_visual),
                     ('L_pixel_noised', L_pixel_noised), ('L_ssim_noised', L_ssim_noised),
                     ('L_perceptual_noised', L_perceptual_noised), ('L_visual_noised', L_visual_noised),
-                    ('L_message', L_message), ('L_adv', L_adv), 
+                    ('L_message', L_message), ('L_adv', L_adv),
+                    ('discr_cover_bce', discr_cover_bce), ('discr_encod_bce', discr_encod_bce),
                     ('L_privacy', L_privacy), ('L_residual_penalty', residual_penalty),
                     ('L_total', L_total), ('bit_accuracy', bit_accuracy)
                 ]:
