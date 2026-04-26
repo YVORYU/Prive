@@ -49,14 +49,24 @@ class ValidationScript:
     
     def load_checkpoint(self, checkpoint_path):
         print(f"加载检查点: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
         if 'encoder_state_dict' in checkpoint:
             self.encoder.load_state_dict(checkpoint['encoder_state_dict'])
         if 'decoder_state_dict' in checkpoint:
             self.decoder.load_state_dict(checkpoint['decoder_state_dict'])
         if 'steganalyzer_state_dict' in checkpoint:
-            self.steganalyzer.load_state_dict(checkpoint['steganalyzer_state_dict'])
+            steganalyzer_state_dict = checkpoint['steganalyzer_state_dict'].copy()
+            
+            old_keys = ['fc_layers.3.weight', 'fc_layers.3.bias']
+            new_keys = ['fc_layers.2.weight', 'fc_layers.2.bias']
+            
+            for old_key, new_key in zip(old_keys, new_keys):
+                if old_key in steganalyzer_state_dict:
+                    steganalyzer_state_dict[new_key] = steganalyzer_state_dict.pop(old_key)
+                    print(f"映射键: {old_key} -> {new_key}")
+            
+            self.steganalyzer.load_state_dict(steganalyzer_state_dict, strict=False)
         
         self.encoder.eval()
         self.decoder.eval()

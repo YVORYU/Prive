@@ -18,13 +18,13 @@ class Config:
 
     lambda_pixel = 0.3
     lambda_ssim = 0.3
-    lambda_perceptual = 0.3
-    use_perceptual_loss = False
+    lambda_perceptual = 0.5
+    use_perceptual_loss = True
     lambda_message = 1.0
     lambda_adv = 0.3
     lambda_privacy = 1.0
 
-    privacy_margin = 0.7
+    privacy_margin = 0.5
 
     use_advanced_privacy = True
     privacy_mode = 'retrieval_escape'
@@ -76,11 +76,19 @@ class Config:
                 'residual_penalty': 0.5
             }
         elif phase == 2:
+            total = self.num_epochs_phase2
+            third = total // 3
+            if epoch <= third:
+                privacy = 1.0
+            elif epoch <= 2 * third:
+                privacy = 3.0
+            else:
+                privacy = 10.0
             return {
-                'visual': 10.0,
+                'visual': 15.0,
                 'message': 10.0,
                 'adv': 3.0,
-                'privacy': 10.0,
+                'privacy': privacy,
                 'noised': 0.5,
                 'residual_penalty': 0.3
             }
