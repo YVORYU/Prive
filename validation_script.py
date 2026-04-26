@@ -95,7 +95,7 @@ class ValidationScript:
         print(f"消息内容: {message_str}")
         
         message_tensor = torch.tensor([float(c) for c in message_str], dtype=torch.float32).unsqueeze(0).to(self.device)
-        return message_tensor, message_str
+        return message_tensor, message_str, original_length
     
     def encode_image(self, cover_image, message):
         print("\n" + "="*60)
@@ -119,12 +119,17 @@ class ValidationScript:
         
         return message_pred_binary, message_pred_sigmoid
     
-    def verify_message_extraction(self, original_message, decoded_message):
+    def verify_message_extraction(self, original_message, decoded_message, original_length=None):
         print("\n" + "="*60)
         print("消息提取验证:")
         
         original_binary = original_message.squeeze().cpu().numpy()
         decoded_binary = decoded_message.squeeze().cpu().numpy()
+        
+        if original_length is not None and original_length < len(original_binary):
+            original_binary = original_binary[:original_length]
+            decoded_binary = decoded_binary[:original_length]
+            print(f"(仅计算原始输入的 {original_length} 位，不包括补位0)")
         
         correct_bits = np.sum(original_binary == decoded_binary)
         total_bits = len(original_binary)
@@ -206,14 +211,14 @@ class ValidationScript:
         print("#"*60)
         
         cover_image = self.load_image(image_path)
-        message_tensor, message_str = self.process_message(message)
+        message_tensor, message_str, original_length = self.process_message(message)
         
         encoded_image, residual_penalty = self.encode_image(cover_image, message_tensor)
         
         decoded_message, decoded_prob = self.decode_message(encoded_image)
         
         bit_accuracy, correct_bits, total_bits = self.verify_message_extraction(
-            message_tensor, decoded_message
+            message_tensor, decoded_message, original_length
         )
         
         cover_prob, cover_logit = self.discriminator_predict(cover_image, "原始图像")

@@ -18,6 +18,7 @@ class Config:
     lambda_pixel = 0.3
     lambda_ssim = 0.3
     lambda_perceptual = 0.3
+    use_perceptual_loss = False
     lambda_message = 1.0
     lambda_adv = 0.3
     lambda_privacy = 1.0

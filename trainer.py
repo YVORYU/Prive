@@ -37,7 +37,9 @@ class Trainer:
         self.optimizer_steganalyzer = optim.Adam(self.steganalyzer.parameters(), lr=cfg.lr_steganalyzer)
         #定义损失函数
         self.ssim_loss = SSIMLoss().to(self.device)
-        self.perceptual_loss = PerceptualLoss().to(self.device)
+        self.use_perceptual_loss = getattr(cfg, 'use_perceptual_loss', False)
+        if self.use_perceptual_loss:
+            self.perceptual_loss = PerceptualLoss().to(self.device)
         self.privacy_loss = PrivacyLoss(margin=cfg.privacy_margin).to(self.device)
         self.mse_loss = nn.MSELoss()
         self.bce_loss = nn.BCELoss()
@@ -195,17 +197,25 @@ class Trainer:
         #计算损失
         L_pixel = self.mse_loss(encoded_image, cover_image)
         L_ssim = self.ssim_loss(encoded_image, cover_image)
-        L_perceptual = self.perceptual_loss(encoded_image, cover_image)
-        L_visual = (self.cfg.lambda_pixel * L_pixel +
-                   self.cfg.lambda_ssim * L_ssim +
-                   self.cfg.lambda_perceptual * L_perceptual)
+        if self.use_perceptual_loss:
+            L_perceptual = self.perceptual_loss(encoded_image, cover_image)
+            L_visual = (self.cfg.lambda_pixel * L_pixel +
+                       self.cfg.lambda_ssim * L_ssim +
+                       self.cfg.lambda_perceptual * L_perceptual)
+        else:
+            L_perceptual = torch.tensor(0.0, device=self.device)
+            L_visual = self.cfg.lambda_pixel * L_pixel + self.cfg.lambda_ssim * L_ssim
         #计算噪声图像损失
         L_pixel_noised = self.mse_loss(noised_encoded_image, cover_image)
         L_ssim_noised = self.ssim_loss(noised_encoded_image, cover_image)
-        L_perceptual_noised = self.perceptual_loss(noised_encoded_image, cover_image)
-        L_visual_noised = (self.cfg.lambda_pixel * L_pixel_noised +
-                           self.cfg.lambda_ssim * L_ssim_noised +
-                           self.cfg.lambda_perceptual * L_perceptual_noised)
+        if self.use_perceptual_loss:
+            L_perceptual_noised = self.perceptual_loss(noised_encoded_image, cover_image)
+            L_visual_noised = (self.cfg.lambda_pixel * L_pixel_noised +
+                               self.cfg.lambda_ssim * L_ssim_noised +
+                               self.cfg.lambda_perceptual * L_perceptual_noised)
+        else:
+            L_perceptual_noised = torch.tensor(0.0, device=self.device)
+            L_visual_noised = self.cfg.lambda_pixel * L_pixel_noised + self.cfg.lambda_ssim * L_ssim_noised
         #计算消息损失
         L_message = self.bce_with_logits_loss(message_pred, message)
         
@@ -384,18 +394,26 @@ class Trainer:
                 #计算视觉损失
                 L_pixel = self.mse_loss(encoded_image, cover_image)
                 L_ssim = self.ssim_loss(encoded_image, cover_image)
-                L_perceptual = self.perceptual_loss(encoded_image, cover_image)
-                L_visual = (self.cfg.lambda_pixel * L_pixel + 
-                           self.cfg.lambda_ssim * L_ssim + 
-                           self.cfg.lambda_perceptual * L_perceptual)
+                if self.use_perceptual_loss:
+                    L_perceptual = self.perceptual_loss(encoded_image, cover_image)
+                    L_visual = (self.cfg.lambda_pixel * L_pixel + 
+                               self.cfg.lambda_ssim * L_ssim + 
+                               self.cfg.lambda_perceptual * L_perceptual)
+                else:
+                    L_perceptual = torch.tensor(0.0, device=self.device)
+                    L_visual = self.cfg.lambda_pixel * L_pixel + self.cfg.lambda_ssim * L_ssim
                 
                 #计算含噪声的视觉损失
                 L_pixel_noised = self.mse_loss(noised_encoded_image, cover_image)
                 L_ssim_noised = self.ssim_loss(noised_encoded_image, cover_image)
-                L_perceptual_noised = self.perceptual_loss(noised_encoded_image, cover_image)
-                L_visual_noised = (self.cfg.lambda_pixel * L_pixel_noised +
-                                   self.cfg.lambda_ssim * L_ssim_noised +
-                                   self.cfg.lambda_perceptual * L_perceptual_noised)
+                if self.use_perceptual_loss:
+                    L_perceptual_noised = self.perceptual_loss(noised_encoded_image, cover_image)
+                    L_visual_noised = (self.cfg.lambda_pixel * L_pixel_noised +
+                                       self.cfg.lambda_ssim * L_ssim_noised +
+                                       self.cfg.lambda_perceptual * L_perceptual_noised)
+                else:
+                    L_perceptual_noised = torch.tensor(0.0, device=self.device)
+                    L_visual_noised = self.cfg.lambda_pixel * L_pixel_noised + self.cfg.lambda_ssim * L_ssim_noised
                 
                 #计算消息损失
                 L_message = self.bce_with_logits_loss(message_pred, message)

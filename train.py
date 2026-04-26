@@ -38,6 +38,7 @@ def save_config(config_path, cfg):
         'lambda_pixel': cfg.lambda_pixel,
         'lambda_ssim': cfg.lambda_ssim,
         'lambda_perceptual': cfg.lambda_perceptual,
+        'use_perceptual_loss': cfg.use_perceptual_loss,
         'lambda_message': cfg.lambda_message,
         'lambda_adv': cfg.lambda_adv,
         'lambda_privacy': cfg.lambda_privacy,
@@ -95,6 +96,7 @@ def setup_logger(log_file, cfg, append=False):
             'lambda_pixel': cfg.lambda_pixel,
             'lambda_ssim': cfg.lambda_ssim,
             'lambda_perceptual': cfg.lambda_perceptual,
+            'use_perceptual_loss': cfg.use_perceptual_loss,
             'lambda_message': cfg.lambda_message,
             'lambda_adv': cfg.lambda_adv,
             'lambda_privacy': cfg.lambda_privacy,
@@ -278,6 +280,9 @@ def main():
                                 help='Weight for SSIM loss.')
     new_run_parser.add_argument('--lambda-perceptual', type=float, default=config.Config.lambda_perceptual,
                                 help='Weight for perceptual loss.')
+    new_run_parser.add_argument('--use-perceptual-loss', dest='use_perceptual_loss', action='store_true',
+                                default=False,
+                                help='Enable VGG perceptual loss (disabled by default).')
     new_run_parser.add_argument('--lambda-message', type=float, default=config.Config.lambda_message,
                                 help='Weight for message loss.')
     new_run_parser.add_argument('--lambda-adv', type=float, default=config.Config.lambda_adv,
@@ -324,6 +329,7 @@ def main():
         cfg.lambda_pixel = args.lambda_pixel
         cfg.lambda_ssim = args.lambda_ssim
         cfg.lambda_perceptual = args.lambda_perceptual
+        cfg.use_perceptual_loss = args.use_perceptual_loss
         cfg.lambda_message = args.lambda_message
         cfg.lambda_adv = args.lambda_adv
         cfg.lambda_privacy = args.lambda_privacy

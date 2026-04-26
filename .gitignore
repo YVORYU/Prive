@@ -34,6 +34,7 @@ env/
 # Experiments & Outputs
 experiments/
 outputs/
+output/
 logs/
 checkpoints/
 visualizations/
