@@ -31,7 +31,7 @@ def save_config(config_path, cfg):
         'batch_size': cfg.batch_size,
         'num_epochs_phase1': cfg.num_epochs_phase1,
         'num_epochs_phase2': cfg.num_epochs_phase2,
-        'num_epochs_phase3': cfg.num_epochs_phase3,
+        'discriminator_steps': cfg.discriminator_steps,
         'lr_encoder': cfg.lr_encoder,
         'lr_decoder': cfg.lr_decoder,
         'lr_steganalyzer': cfg.lr_steganalyzer,
@@ -89,7 +89,7 @@ def setup_logger(log_file, cfg, append=False):
             'batch_size': cfg.batch_size,
             'num_epochs_phase1': cfg.num_epochs_phase1,
             'num_epochs_phase2': cfg.num_epochs_phase2,
-            'num_epochs_phase3': cfg.num_epochs_phase3,
+            'discriminator_steps': cfg.discriminator_steps,
             'lr_encoder': cfg.lr_encoder,
             'lr_decoder': cfg.lr_decoder,
             'lr_steganalyzer': cfg.lr_steganalyzer,
@@ -171,8 +171,11 @@ def log_epoch_losses(log_file, epoch, train_losses, val_losses, phase):
     日志文件路径
 """
 def run_training_loop(trainer, train_loader, val_loader, cfg, start_phase, start_epoch, log_file):
-    for phase in range(start_phase, 4):
+    for phase in range(start_phase, 3):
         num_epochs = getattr(cfg, f'num_epochs_phase{phase}')
+        if num_epochs <= 0:
+            print(f'Skipping Phase {phase} (num_epochs={num_epochs})')
+            continue
         phase_start_epoch = start_epoch if phase == start_phase else 1
         
         print(f'Starting Phase {phase}')
@@ -261,11 +264,11 @@ def main():
     new_run_parser.add_argument('--seed', type=int, default=42, help='Random seed')
     
     new_run_parser.add_argument('--epochs-phase1', type=int, default=config.Config.num_epochs_phase1,
-                                help='Number of epochs for phase 1 (basic training).')
+                                help='Number of epochs for phase 1 (basic+adversarial training).')
     new_run_parser.add_argument('--epochs-phase2', type=int, default=config.Config.num_epochs_phase2,
-                                help='Number of epochs for phase 2 (adversarial training).')
-    new_run_parser.add_argument('--epochs-phase3', type=int, default=config.Config.num_epochs_phase3,
-                                help='Number of epochs for phase 3 (privacy training).')
+                                help='Number of epochs for phase 2 (privacy training).')
+    new_run_parser.add_argument('--discriminator-steps', type=int, default=config.Config.discriminator_steps,
+                                help='Number of discriminator training steps per batch.')
     
     new_run_parser.add_argument('--lr-encoder', type=float, default=config.Config.lr_encoder,
                                 help='Learning rate for encoder')
@@ -320,7 +323,7 @@ def main():
         
         cfg.num_epochs_phase1 = args.epochs_phase1
         cfg.num_epochs_phase2 = args.epochs_phase2
-        cfg.num_epochs_phase3 = args.epochs_phase3
+        cfg.discriminator_steps = args.discriminator_steps
         
         cfg.lr_encoder = args.lr_encoder
         cfg.lr_decoder = args.lr_decoder

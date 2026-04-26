@@ -131,6 +131,7 @@ class Trainer:
                     noise_layers.append(Quantization(self.device))
         
         self.noiser = Noiser(noise_layers, self.device).to(self.device)
+        self.has_noise = not (len(self.noiser._layer_names) == 1 and self.noiser._layer_names[0] == 'identity')
         
         self.best_loss = float('inf')
         
@@ -183,7 +184,7 @@ class Trainer:
         cover_image = batch['cover_image'].to(self.device)
         message = batch['message'].to(self.device)
 
-        weights = self.cfg.get_phase_weights(phase)
+        weights = self.cfg.get_phase_weights(phase, epoch)
 
         #编码器编码图像
         encoded_image, residual_penalty = self.encoder(cover_image, message)
@@ -219,9 +220,11 @@ class Trainer:
         #计算消息损失
         L_message = self.bce_with_logits_loss(message_pred, message)
         
+        #判别器输入动态选择: 有噪声用noised, 无噪声用encoded_image
+        disc_stego_input = noised_encoded_image if self.has_noise else encoded_image
         #判别器进行预测
-        stego_pred = self.steganalyzer(noised_encoded_image.detach())
-        cover_pred = self.steganalyzer(noised_cover_image)
+        stego_pred = self.steganalyzer(disc_stego_input.detach())
+        cover_pred = self.steganalyzer(cover_image)
 
         #判别器损失：cover=1, stego=0
         discr_cover_bce = self.bce_with_logits_loss(cover_pred, torch.ones_like(cover_pred))
@@ -229,12 +232,20 @@ class Trainer:
         L_D = discr_cover_bce + discr_encod_bce
         
         if weights.get('adv', 0.0) > 0:
-            self.optimizer_steganalyzer.zero_grad()
-            L_D.backward()
-            torch.nn.utils.clip_grad_norm_(self.steganalyzer.parameters(), max_norm=1.0)
-            self.optimizer_steganalyzer.step()
+            disc_steps = getattr(self.cfg, 'discriminator_steps', 1)
+            for _ in range(disc_steps):
+                self.optimizer_steganalyzer.zero_grad()
+                L_D.backward(retain_graph=(_ < disc_steps - 1))
+                torch.nn.utils.clip_grad_norm_(self.steganalyzer.parameters(), max_norm=1.0)
+                self.optimizer_steganalyzer.step()
+                if _ < disc_steps - 1:
+                    stego_pred = self.steganalyzer(disc_stego_input.detach())
+                    cover_pred = self.steganalyzer(cover_image)
+                    discr_cover_bce = self.bce_with_logits_loss(cover_pred, torch.ones_like(cover_pred))
+                    discr_encod_bce = self.bce_with_logits_loss(stego_pred, torch.zeros_like(stego_pred))
+                    L_D = discr_cover_bce + discr_encod_bce
         
-        stego_pred = self.steganalyzer(noised_encoded_image)
+        stego_pred = self.steganalyzer(disc_stego_input)
         #对抗损失：生成器希望stego被判别为cover(标签1)
         L_adv = self.bce_with_logits_loss(stego_pred, torch.ones_like(stego_pred))
 
@@ -384,7 +395,7 @@ class Trainer:
                 cover_image = batch['cover_image'].to(self.device)
                 message = batch['message'].to(self.device)
                 
-                weights = self.cfg.get_phase_weights(phase)
+                weights = self.cfg.get_phase_weights(phase, epoch)
                 
                 #编码，加噪声，解码
                 encoded_image, residual_penalty = self.encoder(cover_image, message)
@@ -419,8 +430,9 @@ class Trainer:
                 L_message = self.bce_with_logits_loss(message_pred, message)
                 
                 #判别器预测
-                stego_pred = self.steganalyzer(noised_encoded_image)
-                cover_pred = self.steganalyzer(noised_cover_image)
+                disc_stego_input = noised_encoded_image if self.has_noise else encoded_image
+                stego_pred = self.steganalyzer(disc_stego_input)
+                cover_pred = self.steganalyzer(cover_image)
                 L_adv = self.bce_with_logits_loss(stego_pred, torch.ones_like(stego_pred))
                 discr_cover_bce = self.bce_with_logits_loss(cover_pred, torch.ones_like(cover_pred))
                 discr_encod_bce = self.bce_with_logits_loss(stego_pred, torch.zeros_like(stego_pred))

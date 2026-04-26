@@ -11,9 +11,10 @@ class Config:
     lr_decoder = 1e-3
     lr_steganalyzer = 1e-3
 
-    num_epochs_phase1 = 200
+    num_epochs_phase1 = 300
     num_epochs_phase2 = 100
-    num_epochs_phase3 = 100
+
+    discriminator_steps = 2
 
     lambda_pixel = 0.3
     lambda_ssim = 0.3
@@ -56,26 +57,25 @@ class Config:
 
     noise_config = 'identity'
 
-    def get_phase_weights(self, phase):
+    def get_phase_weights(self, phase, epoch=1):
         if phase == 1:
+            total = self.num_epochs_phase1
+            third = total // 3
+            if epoch <= third:
+                adv = 0.1
+            elif epoch <= 2 * third:
+                adv = 1.0
+            else:
+                adv = 3.0
             return {
                 'visual': 10.0,
                 'message': 10.0,
-                'adv': 0.0,
+                'adv': adv,
                 'privacy': 0.0,
                 'noised': 1.0,
                 'residual_penalty': 0.5
             }
         elif phase == 2:
-            return {
-                'visual': 10.0,
-                'message': 10.0,
-                'adv': 3.0,
-                'privacy': 0.0,
-                'noised': 1.0,
-                'residual_penalty': 0.5
-            }
-        elif phase == 3:
             return {
                 'visual': 10.0,
                 'message': 10.0,

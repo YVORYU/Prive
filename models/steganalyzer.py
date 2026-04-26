@@ -56,12 +56,11 @@ class Steganalyzer(nn.Module):
         )
         
         #全连接层架构
-        # 第一个全连接层后跟一个批量归一化层和一个LeakyReLU激活函数，dropout层防止过拟合
+        # 第一个全连接层后跟一个批量归一化层和一个LeakyReLU激活函数
         # 第二个全连接层sigmoid激活函数
         self.fc_layers = nn.Sequential(
             nn.Linear(512, 256),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout(0.3),
             nn.Linear(256, 1)
         )
 
