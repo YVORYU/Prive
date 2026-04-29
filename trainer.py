@@ -232,18 +232,13 @@ class Trainer:
         L_D = discr_cover_bce + discr_encod_bce
         
         if weights.get('adv', 0.0) > 0:
-            disc_steps = getattr(self.cfg, 'discriminator_steps', 1)
-            for _ in range(disc_steps):
+            disc_threshold = getattr(self.cfg, 'discriminator_loss_threshold', None)
+            skip_disc = (disc_threshold is not None and L_D.item() < disc_threshold)
+            if not skip_disc:
                 self.optimizer_steganalyzer.zero_grad()
-                L_D.backward(retain_graph=(_ < disc_steps - 1))
+                L_D.backward()
                 torch.nn.utils.clip_grad_norm_(self.steganalyzer.parameters(), max_norm=1.0)
                 self.optimizer_steganalyzer.step()
-                if _ < disc_steps - 1:
-                    stego_pred = self.steganalyzer(disc_stego_input.detach())
-                    cover_pred = self.steganalyzer(cover_image)
-                    discr_cover_bce = self.bce_with_logits_loss(cover_pred, torch.ones_like(cover_pred))
-                    discr_encod_bce = self.bce_with_logits_loss(stego_pred, torch.zeros_like(stego_pred))
-                    L_D = discr_cover_bce + discr_encod_bce
         
         stego_pred = self.steganalyzer(disc_stego_input)
         #对抗损失：生成器希望stego被判别为cover(标签1)

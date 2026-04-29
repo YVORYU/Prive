@@ -31,7 +31,7 @@ def save_config(config_path, cfg):
         'batch_size': cfg.batch_size,
         'num_epochs_phase1': cfg.num_epochs_phase1,
         'num_epochs_phase2': cfg.num_epochs_phase2,
-        'discriminator_steps': cfg.discriminator_steps,
+        'discriminator_loss_threshold': cfg.discriminator_loss_threshold,
         'lr_encoder': cfg.lr_encoder,
         'lr_decoder': cfg.lr_decoder,
         'lr_steganalyzer': cfg.lr_steganalyzer,
@@ -89,7 +89,7 @@ def setup_logger(log_file, cfg, append=False):
             'batch_size': cfg.batch_size,
             'num_epochs_phase1': cfg.num_epochs_phase1,
             'num_epochs_phase2': cfg.num_epochs_phase2,
-            'discriminator_steps': cfg.discriminator_steps,
+            'discriminator_loss_threshold': cfg.discriminator_loss_threshold,
             'lr_encoder': cfg.lr_encoder,
             'lr_decoder': cfg.lr_decoder,
             'lr_steganalyzer': cfg.lr_steganalyzer,
@@ -267,9 +267,9 @@ def main():
                                 help='Number of epochs for phase 1 (basic+adversarial training).')
     new_run_parser.add_argument('--epochs-phase2', type=int, default=config.Config.num_epochs_phase2,
                                 help='Number of epochs for phase 2 (privacy training).')
-    new_run_parser.add_argument('--discriminator-steps', type=int, default=config.Config.discriminator_steps,
-                                help='Number of discriminator training steps per batch.')
-    
+    new_run_parser.add_argument('--discriminator-loss-threshold', type=float, default=config.Config.discriminator_loss_threshold,
+                                help='Pause discriminator training when its loss falls below this threshold.')
+
     new_run_parser.add_argument('--lr-encoder', type=float, default=config.Config.lr_encoder,
                                 help='Learning rate for encoder')
     new_run_parser.add_argument('--lr-decoder', type=float, default=config.Config.lr_decoder,
@@ -284,7 +284,7 @@ def main():
     new_run_parser.add_argument('--lambda-perceptual', type=float, default=config.Config.lambda_perceptual,
                                 help='Weight for perceptual loss.')
     new_run_parser.add_argument('--use-perceptual-loss', dest='use_perceptual_loss', action='store_true',
-                                default=False,
+                                default=True,
                                 help='Enable VGG perceptual loss (disabled by default).')
     new_run_parser.add_argument('--lambda-message', type=float, default=config.Config.lambda_message,
                                 help='Weight for message loss.')
@@ -323,8 +323,8 @@ def main():
         
         cfg.num_epochs_phase1 = args.epochs_phase1
         cfg.num_epochs_phase2 = args.epochs_phase2
-        cfg.discriminator_steps = args.discriminator_steps
-        
+        cfg.discriminator_loss_threshold = args.discriminator_loss_threshold
+
         cfg.lr_encoder = args.lr_encoder
         cfg.lr_decoder = args.lr_decoder
         cfg.lr_steganalyzer = args.lr_steganalyzer

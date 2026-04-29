@@ -9,15 +9,15 @@ class Config:
 
     lr_encoder = 1e-3
     lr_decoder = 1e-3
-    lr_steganalyzer = 1e-3
+    lr_steganalyzer = 5e-5
 
     num_epochs_phase1 = 300
     num_epochs_phase2 = 100
 
-    discriminator_steps = 2
+    discriminator_loss_threshold = 0.1
 
-    lambda_pixel = 0.3
-    lambda_ssim = 0.3
+    lambda_pixel = 0.5
+    lambda_ssim = 0.5
     lambda_perceptual = 0.5
     use_perceptual_loss = True
     lambda_message = 1.0
@@ -62,9 +62,9 @@ class Config:
             total = self.num_epochs_phase1
             third = total // 3
             if epoch <= third:
-                adv = 0.1
-            elif epoch <= 2 * third:
                 adv = 1.0
+            elif epoch <= 2 * third:
+                adv = 2.0
             else:
                 adv = 3.0
             return {
@@ -85,9 +85,9 @@ class Config:
             else:
                 privacy = 10.0
             return {
-                'visual': 15.0,
+                'visual': 20.0,
                 'message': 10.0,
-                'adv': 3.0,
+                'adv': 5.0,
                 'privacy': privacy,
                 'noised': 0.5,
                 'residual_penalty': 0.3
