@@ -4,11 +4,17 @@ import torch.nn.functional as F
 
 
 class FeatureRedirectionLoss(nn.Module):
-    def __init__(self, clip_weight=1.0, dino_weight=0.5, escape_margin=0.7):
+    def __init__(self, clip_weight=1.0, dino_weight=0.5, escape_margin=0.7,
+                 redirect_margin=0.6, max_target_sim=0.75,
+                 clip_redirect_weight=0.5, dino_redirect_weight=0.3):
         super().__init__()
         self.clip_weight = clip_weight
         self.dino_weight = dino_weight
         self.escape_margin = escape_margin
+        self.redirect_margin = redirect_margin
+        self.max_target_sim = max_target_sim
+        self.clip_redirect_weight = clip_redirect_weight
+        self.dino_redirect_weight = dino_redirect_weight
 
     def escape_loss(self, feat_cover, feat_encoded):
         sim = F.cosine_similarity(feat_encoded, feat_cover, dim=1)
@@ -16,16 +22,53 @@ class FeatureRedirectionLoss(nn.Module):
         loss = torch.mean(torch.log1p(torch.exp(sim - target)))
         return loss
 
-    def forward(self, clip_cover, clip_encoded, dino_cover=None, dino_encoded=None):
+    def directed_escape_loss(self, feat_cover, feat_encoded, feat_negatives=None):
+        escape = self.escape_loss(feat_cover, feat_encoded)
+
+        if feat_negatives is None:
+            return escape, torch.tensor(0.0, device=feat_cover.device), torch.tensor(0.0, device=feat_cover.device)
+
+        sim_neg = F.cosine_similarity(feat_encoded, feat_negatives, dim=1)
+        redirect = torch.mean(torch.relu(self.redirect_margin - sim_neg))
+        control = torch.mean(torch.relu(sim_neg - self.max_target_sim))
+
+        return escape, redirect, control
+
+    def forward(self, clip_cover, clip_encoded, dino_cover=None, dino_encoded=None,
+                clip_negatives=None, dino_negatives=None):
         total_loss = 0.0
         loss_dict = {}
 
-        clip_loss = self.escape_loss(clip_cover, clip_encoded)
+        if clip_negatives is not None:
+            clip_escape, clip_redirect, clip_control = self.directed_escape_loss(
+                clip_cover, clip_encoded, clip_negatives)
+            clip_loss = clip_escape + self.clip_redirect_weight * clip_redirect + 0.3 * clip_control
+            loss_dict['clip_escape'] = clip_escape.item()
+            loss_dict['clip_redirect'] = clip_redirect.item()
+            loss_dict['clip_control'] = clip_control.item()
+        else:
+            clip_loss = self.escape_loss(clip_cover, clip_encoded)
+            loss_dict['clip_escape'] = clip_loss.item()
+            loss_dict['clip_redirect'] = 0.0
+            loss_dict['clip_control'] = 0.0
+
         total_loss += self.clip_weight * clip_loss
         loss_dict['clip_loss'] = clip_loss.item()
 
         if dino_cover is not None and dino_encoded is not None:
-            dino_loss = self.escape_loss(dino_cover, dino_encoded)
+            if dino_negatives is not None:
+                dino_escape, dino_redirect, dino_control = self.directed_escape_loss(
+                    dino_cover, dino_encoded, dino_negatives)
+                dino_loss = dino_escape + self.dino_redirect_weight * dino_redirect + 0.3 * dino_control
+                loss_dict['dino_escape'] = dino_escape.item()
+                loss_dict['dino_redirect'] = dino_redirect.item()
+                loss_dict['dino_control'] = dino_control.item()
+            else:
+                dino_loss = self.escape_loss(dino_cover, dino_encoded)
+                loss_dict['dino_escape'] = dino_loss.item()
+                loss_dict['dino_redirect'] = 0.0
+                loss_dict['dino_control'] = 0.0
+
             total_loss += self.dino_weight * dino_loss
             loss_dict['dino_loss'] = dino_loss.item()
 
@@ -58,7 +101,9 @@ class RedirectionTripletLoss(nn.Module):
 
 class RetrievalEscapeLoss(nn.Module):
     def __init__(self, clip_weight=1.0, dino_weight=0.5,
-                 triplet_weight=0.15, margin=0.7, triplet_margin=0.5, attacker_weight=0.5):
+                 triplet_weight=0.15, margin=0.7, triplet_margin=0.5, attacker_weight=0.5,
+                 redirect_margin=0.6, max_target_sim=0.75,
+                 clip_redirect_weight=0.5, dino_redirect_weight=0.3):
         super().__init__()
         self.clip_weight = clip_weight
         self.triplet_weight = triplet_weight
@@ -69,20 +114,27 @@ class RetrievalEscapeLoss(nn.Module):
         self.multi_feature_loss = FeatureRedirectionLoss(
             clip_weight=clip_weight,
             dino_weight=dino_weight,
-            escape_margin=margin
+            escape_margin=margin,
+            redirect_margin=redirect_margin,
+            max_target_sim=max_target_sim,
+            clip_redirect_weight=clip_redirect_weight,
+            dino_redirect_weight=dino_redirect_weight
         )
         self.triplet_loss = RedirectionTripletLoss(
             escape_margin=triplet_margin,
-            redirect_margin=0.6,
-            max_target_sim=0.75
+            redirect_margin=redirect_margin,
+            max_target_sim=max_target_sim
         )
 
     def forward(self, feat_cover, feat_encoded, feat_negatives=None,
                 dino_cover=None, dino_encoded=None,
-                attacker_feat_cover=None, attacker_feat_encoded=None):
+                attacker_feat_cover=None, attacker_feat_encoded=None,
+                clip_negatives=None, dino_negatives=None):
         multi_loss, loss_dict = self.multi_feature_loss(
             feat_cover, feat_encoded,
-            dino_cover, dino_encoded
+            dino_cover, dino_encoded,
+            clip_negatives=clip_negatives,
+            dino_negatives=dino_negatives
         )
 
         total_loss = multi_loss

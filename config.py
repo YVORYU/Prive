@@ -16,13 +16,13 @@ class Config:
 
     discriminator_loss_threshold = 0.1
 
-    lambda_pixel = 0.5
-    lambda_ssim = 0.5
-    lambda_perceptual = 0.5
+    lambda_pixel = 1.0
+    lambda_ssim = 2.0
+    lambda_perceptual = 0.3
     use_perceptual_loss = True
     lambda_message = 1.0
-    lambda_adv = 0.3
-    lambda_privacy = 1.0
+    lambda_adv = 0.1
+    lambda_privacy = 0.3
 
     privacy_margin = 0.5
 
@@ -44,6 +44,14 @@ class Config:
     use_hard_negatives = True
     hard_negative_k = 5
     memory_warmup_batches = 50
+
+    use_clip_redirect = True
+    clip_memory_size = 1000
+    clip_hard_negative_k = 5
+    clip_redirect_margin = 0.6
+    clip_max_target_sim = 0.75
+    clip_redirect_weight = 0.5
+    dino_redirect_weight = 0.3
 
     data_dir = None
     train_dir = 'train'

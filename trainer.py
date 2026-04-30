@@ -18,6 +18,62 @@ from noise_argparser import NoiseArgParser
 import config
 
 
+class FeatureMemoryBank:
+    def __init__(self, feature_dim, memory_size=1000, device='cuda'):
+        self.feature_dim = feature_dim
+        self.memory_size = memory_size
+        self.device = device
+        self.memory_bank = torch.zeros(memory_size, feature_dim, device=device)
+        self.memory_ptr = 0
+        self.memory_count = 0
+
+    @torch.no_grad()
+    def update(self, features):
+        features = F.normalize(features, p=2, dim=1)
+        batch_size = features.shape[0]
+        ptr = self.memory_ptr
+
+        if ptr + batch_size > self.memory_size:
+            remaining = self.memory_size - ptr
+            self.memory_bank[ptr:] = features[:remaining]
+            self.memory_bank[:batch_size - remaining] = features[remaining:]
+            self.memory_ptr = batch_size - remaining
+        else:
+            self.memory_bank[ptr:ptr + batch_size] = features
+            self.memory_ptr = (ptr + batch_size) % self.memory_size
+
+        self.memory_count = min(self.memory_count + batch_size, self.memory_size)
+
+    def get_hard_negatives(self, features, k=5):
+        if self.memory_count == 0:
+            return None
+
+        valid_memory = self.memory_bank[:self.memory_count]
+        similarities = torch.mm(features, valid_memory.t())
+        actual_k = min(k, self.memory_count)
+        _, indices = similarities.topk(actual_k, dim=1)
+        hard_negatives = valid_memory[indices]
+
+        if hard_negatives.dim() == 3:
+            sims = F.cosine_similarity(features.unsqueeze(1), hard_negatives, dim=2)
+            hardest_idx = sims.argmax(dim=1)
+            hard_negatives = hard_negatives[torch.arange(hard_negatives.size(0)), hardest_idx]
+
+        return hard_negatives
+
+    def state_dict(self):
+        return {
+            'memory_bank': self.memory_bank.cpu(),
+            'memory_ptr': self.memory_ptr,
+            'memory_count': self.memory_count
+        }
+
+    def load_state_dict(self, state_dict):
+        self.memory_bank = state_dict['memory_bank'].to(self.device)
+        self.memory_ptr = state_dict['memory_ptr']
+        self.memory_count = state_dict['memory_count']
+
+
 class Trainer:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -54,8 +110,26 @@ class Trainer:
                 triplet_weight=getattr(cfg, 'triplet_weight', 0.5),
                 margin=cfg.privacy_margin,
                 triplet_margin=getattr(cfg, 'triplet_margin', 0.3),
-                attacker_weight=getattr(cfg, 'attacker_weight', 0.5)
+                attacker_weight=getattr(cfg, 'attacker_weight', 0.5),
+                redirect_margin=getattr(cfg, 'clip_redirect_margin', 0.6),
+                max_target_sim=getattr(cfg, 'clip_max_target_sim', 0.75),
+                clip_redirect_weight=getattr(cfg, 'clip_redirect_weight', 0.5),
+                dino_redirect_weight=getattr(cfg, 'dino_redirect_weight', 0.3)
             ).to(self.device)
+
+            self.use_clip_redirect = getattr(cfg, 'use_clip_redirect', False)
+            if self.use_clip_redirect:
+                clip_feat_dim = 512
+                self.clip_memory_bank = FeatureMemoryBank(
+                    feature_dim=clip_feat_dim,
+                    memory_size=getattr(cfg, 'clip_memory_size', 1000),
+                    device=self.device
+                )
+                self.clip_hard_negative_k = getattr(cfg, 'clip_hard_negative_k', 5)
+            else:
+                self.clip_memory_bank = None
+
+            self.dino_memory_bank = None
             
             if self.dino_weight > 0:
                 dino_model_path = getattr(cfg, 'dino_model_path', None)
@@ -253,9 +327,29 @@ class Trainer:
             attacker_feat_encoded = None
             dino_cover = None
             dino_encoded = None
+            clip_negatives = None
+            dino_negatives = None
             
             dino_cover = self.extract_dino_features(cover_image)
             dino_encoded = self.extract_dino_features(encoded_image)
+            
+            if self.clip_memory_bank is not None:
+                with torch.no_grad():
+                    clip_negatives = self.clip_memory_bank.get_hard_negatives(
+                        feat_cover, k=self.clip_hard_negative_k
+                    )
+                if self.clip_memory_bank.memory_count > 0:
+                    with torch.no_grad():
+                        self.clip_memory_bank.update(feat_cover)
+            
+            if self.dino_memory_bank is not None and dino_cover is not None:
+                with torch.no_grad():
+                    dino_negatives = self.dino_memory_bank.get_hard_negatives(
+                        dino_cover, k=getattr(self.cfg, 'clip_hard_negative_k', 5)
+                    )
+                if self.dino_memory_bank.memory_count > 0:
+                    with torch.no_grad():
+                        self.dino_memory_bank.update(dino_cover)
             
             if self.retrieval_attacker is not None:
                 with torch.no_grad():
@@ -284,7 +378,9 @@ class Trainer:
                 dino_cover=dino_cover,
                 dino_encoded=dino_encoded,
                 attacker_feat_cover=attacker_feat_cover,
-                attacker_feat_encoded=attacker_feat_encoded
+                attacker_feat_encoded=attacker_feat_encoded,
+                clip_negatives=clip_negatives,
+                dino_negatives=dino_negatives
             )
         else:
             L_privacy = self.privacy_loss(feat_cover, feat_encoded)
@@ -441,9 +537,23 @@ class Trainer:
                     attacker_feat_encoded = None
                     dino_cover = None
                     dino_encoded = None
+                    clip_negatives = None
+                    dino_negatives = None
                     
                     dino_cover = self.extract_dino_features(cover_image)
                     dino_encoded = self.extract_dino_features(encoded_image)
+                    
+                    if self.clip_memory_bank is not None:
+                        with torch.no_grad():
+                            clip_negatives = self.clip_memory_bank.get_hard_negatives(
+                                feat_cover, k=self.clip_hard_negative_k
+                            )
+                    
+                    if self.dino_memory_bank is not None and dino_cover is not None:
+                        with torch.no_grad():
+                            dino_negatives = self.dino_memory_bank.get_hard_negatives(
+                                dino_cover, k=getattr(self.cfg, 'clip_hard_negative_k', 5)
+                            )
                     
                     if self.retrieval_attacker is not None:
                         attacker_feat_cover = self.retrieval_attacker(cover_image.detach())
@@ -469,7 +579,9 @@ class Trainer:
                         dino_cover=dino_cover,
                         dino_encoded=dino_encoded,
                         attacker_feat_cover=attacker_feat_cover,
-                        attacker_feat_encoded=attacker_feat_encoded
+                        attacker_feat_encoded=attacker_feat_encoded,
+                        clip_negatives=clip_negatives,
+                        dino_negatives=dino_negatives
                     )
                 else:
                     L_privacy = self.privacy_loss(feat_cover, feat_encoded)
@@ -542,22 +654,44 @@ class Trainer:
         return total_losses
 
     def warmup_memory_bank(self, train_loader, num_batches=50):
-        if self.retrieval_attacker is None:
+        if self.retrieval_attacker is None and self.clip_memory_bank is None and self.dino_memory_bank is None:
             return
-        
-        print(f'Warming up Memory Bank with {num_batches} batches...')
-        self.retrieval_attacker.eval()
-        
+
+        print(f'Warming up Memory Banks with {num_batches} batches...')
+
+        if self.retrieval_attacker is not None:
+            self.retrieval_attacker.eval()
+
         with torch.no_grad():
             for i, batch in enumerate(train_loader):
                 if i >= num_batches:
                     break
                 cover_image = batch['cover_image'].to(self.device)
-                features = self.retrieval_attacker(cover_image)
-                self.retrieval_attacker.update_memory(features)
-        
-        self.retrieval_attacker.train()
-        print(f'Memory Bank warmed up. Current count: {int(self.retrieval_attacker.memory_count[0])}')
+
+                if self.retrieval_attacker is not None:
+                    features = self.retrieval_attacker(cover_image)
+                    self.retrieval_attacker.update_memory(features)
+
+                if self.clip_memory_bank is not None:
+                    clip_feat = self.content_recognizer(cover_image)
+                    self.clip_memory_bank.update(clip_feat)
+
+                if self.dino_memory_bank is not None:
+                    dino_feat = self.extract_dino_features(cover_image)
+                    if dino_feat is not None:
+                        self.dino_memory_bank.update(dino_feat)
+
+        if self.retrieval_attacker is not None:
+            self.retrieval_attacker.train()
+
+        info_parts = []
+        if self.retrieval_attacker is not None:
+            info_parts.append(f'Attacker: {int(self.retrieval_attacker.memory_count[0])}')
+        if self.clip_memory_bank is not None:
+            info_parts.append(f'CLIP: {self.clip_memory_bank.memory_count}')
+        if self.dino_memory_bank is not None:
+            info_parts.append(f'DINO: {self.dino_memory_bank.memory_count}')
+        print(f'Memory Banks warmed up. [{", ".join(info_parts)}]')
 
     def save_checkpoint(self, epoch, phase, is_best=False):
         checkpoint = {
@@ -576,6 +710,12 @@ class Trainer:
         
         if hasattr(self, 'retrieval_attacker') and self.retrieval_attacker is not None:
             checkpoint['retrieval_attacker_state_dict'] = self.retrieval_attacker.state_dict()
+
+        if hasattr(self, 'clip_memory_bank') and self.clip_memory_bank is not None:
+            checkpoint['clip_memory_bank'] = self.clip_memory_bank.state_dict()
+
+        if hasattr(self, 'dino_memory_bank') and self.dino_memory_bank is not None:
+            checkpoint['dino_memory_bank'] = self.dino_memory_bank.state_dict()
         #保存当前轮数的检查点
         path = os.path.join(self.cfg.checkpoint_dir, f'checkpoint_phase{phase}_epoch{epoch}.pth')
         torch.save(checkpoint, path)

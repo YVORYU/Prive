@@ -60,7 +60,14 @@ def save_config(config_path, cfg):
         'attacker_weight': cfg.attacker_weight,
         'use_hard_negatives': cfg.use_hard_negatives,
         'hard_negative_k': cfg.hard_negative_k,
-        'memory_warmup_batches': cfg.memory_warmup_batches
+        'memory_warmup_batches': cfg.memory_warmup_batches,
+        'use_clip_redirect': cfg.use_clip_redirect,
+        'clip_memory_size': cfg.clip_memory_size,
+        'clip_hard_negative_k': cfg.clip_hard_negative_k,
+        'clip_redirect_margin': cfg.clip_redirect_margin,
+        'clip_max_target_sim': cfg.clip_max_target_sim,
+        'clip_redirect_weight': cfg.clip_redirect_weight,
+        'dino_redirect_weight': cfg.dino_redirect_weight
     }
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config_dict, f, indent=4)
@@ -118,7 +125,14 @@ def setup_logger(log_file, cfg, append=False):
             'attacker_weight': cfg.attacker_weight,
             'use_hard_negatives': cfg.use_hard_negatives,
             'hard_negative_k': cfg.hard_negative_k,
-            'memory_warmup_batches': cfg.memory_warmup_batches
+            'memory_warmup_batches': cfg.memory_warmup_batches,
+            'use_clip_redirect': cfg.use_clip_redirect,
+            'clip_memory_size': cfg.clip_memory_size,
+            'clip_hard_negative_k': cfg.clip_hard_negative_k,
+            'clip_redirect_margin': cfg.clip_redirect_margin,
+            'clip_max_target_sim': cfg.clip_max_target_sim,
+            'clip_redirect_weight': cfg.clip_redirect_weight,
+            'dino_redirect_weight': cfg.dino_redirect_weight
         }
         for key, value in config_dict.items():
             f.write(f"  {key}: {value}\n")
@@ -380,6 +394,10 @@ def main():
                     trainer.optimizer_attacker.load_state_dict(checkpoint['optimizer_attacker'])
                 if hasattr(trainer, 'retrieval_attacker') and 'retrieval_attacker_state_dict' in checkpoint:
                     trainer.retrieval_attacker.load_state_dict(checkpoint['retrieval_attacker_state_dict'])
+                if hasattr(trainer, 'clip_memory_bank') and trainer.clip_memory_bank is not None and 'clip_memory_bank' in checkpoint:
+                    trainer.clip_memory_bank.load_state_dict(checkpoint['clip_memory_bank'])
+                if hasattr(trainer, 'dino_memory_bank') and trainer.dino_memory_bank is not None and 'dino_memory_bank' in checkpoint:
+                    trainer.dino_memory_bank.load_state_dict(checkpoint['dino_memory_bank'])
                 #找到最佳损失
                 trainer.best_loss = checkpoint.get('best_loss', float('inf'))
                 start_epoch = checkpoint['epoch'] + 1
@@ -428,6 +446,10 @@ def main():
                 trainer.optimizer_attacker.load_state_dict(checkpoint['optimizer_attacker'])
             if hasattr(trainer, 'retrieval_attacker') and 'retrieval_attacker_state_dict' in checkpoint:
                 trainer.retrieval_attacker.load_state_dict(checkpoint['retrieval_attacker_state_dict'])
+            if hasattr(trainer, 'clip_memory_bank') and trainer.clip_memory_bank is not None and 'clip_memory_bank' in checkpoint:
+                trainer.clip_memory_bank.load_state_dict(checkpoint['clip_memory_bank'])
+            if hasattr(trainer, 'dino_memory_bank') and trainer.dino_memory_bank is not None and 'dino_memory_bank' in checkpoint:
+                trainer.dino_memory_bank.load_state_dict(checkpoint['dino_memory_bank'])
             #找到最佳损失
             trainer.best_loss = checkpoint.get('best_loss', float('inf'))
             start_epoch = checkpoint['epoch'] + 1
