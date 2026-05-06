@@ -32,7 +32,7 @@
   - [8.9 DCT滤波器生成器 (DctFilterGenerator)](#89-dct滤波器生成器-dctfiltergenerator)
 - [9. 训练系统 (trainer.py & train.py)](#9-训练系统-trainerpy--trainpy)
   - [9.1 Trainer类详解](#91-trainer类详解)
-  - [9.2 三阶段训练策略](#92-三阶段训练策略)
+  - [9.2 两阶段训练策略](#92-两阶段训练策略)
   - [9.3 训练流程 (train.py)](#93-训练流程-trainpy)
   - [9.4 记忆库预热与检索攻击者训练](#94-记忆库预热与检索攻击者训练)
 - [10. 验证脚本 (validation_script.py)](#10-验证脚本-validation_scriptpy)
@@ -60,11 +60,12 @@
 
 ### 核心创新点
 
-1. **三阶段渐进式训练**：先学习基础隐写能力 → 再引入对抗鲁棒性 → 最后加入隐私保护
+1. **两阶段渐进式训练**：先学习基础隐写能力 + 渐进对抗 → 再引入隐私保护
 2. **多模态特征逃逸**：同时利用CLIP（ViT-B/32）和DINOv2（ViT-S/14）两种预训练模型的语义特征空间进行隐私约束
-3. **检索攻击者建模**：引入带记忆库的检索攻击模型，通过对抗方式迫使编码器在检索特征空间中也实现"逃逸"
-4. **硬负样本挖掘**：从记忆库中动态选取最难区分的负样本，增强三元组损失的判别能力
-5. **统一特征空间的三元组损失**：三元组损失在攻击者特征空间内统一计算（escape + redirect），避免跨特征空间梯度噪声
+3. **CLIP/DINO 有向重定向**：不仅将编码图像推离原图，还通过记忆库硬负样本将其"拉向"其他无关图像，实现语义伪装
+4. **检索攻击者建模**：引入带记忆库的检索攻击模型，通过对抗方式迫使编码器在检索特征空间中也实现"逃逸"
+5. **硬负样本挖掘**：从记忆库中动态选取最难区分的负样本，增强三元组损失与有向逃逸损失的判别能力
+6. **统一特征空间的三元组损失**：三元组损失在攻击者特征空间内统一计算（escape + redirect），避免跨特征空间梯度噪声
 
 ---
 
@@ -107,7 +108,7 @@
 │   │         └────────┬────────┘                  │            │     │
 │   │                  ▼                            │            │     │
 │   │         RetrievalEscapeLoss ◀─────────────────┘            │     │
-│   │    (多模态特征逃逸 + 三元组 + 攻击者逃逸)                      │     │
+│   │    (多模态特征逃逸 + 三元组 + 攻击者逃逸 + 有向重定向)        │     │
 │   └──────────────────────────────────────────────────────────┘     │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
@@ -197,13 +198,12 @@ class Config:
 - 隐写分析器使用相同的学习率（`1e-3`），因为其训练目标是独立的二分类任务。
 - 检索攻击者使用编码器学习率的一半（`lr_encoder * 0.5 = 5e-4`），在Trainer中单独设置。
 
-### 4.4 三阶段训练轮次
+### 4.4 两阶段训练轮次
 
 | 参数 | 默认值 | 说明 |
 |------|-------|------|
-| `num_epochs_phase1` | `200` | Phase 1: 基础隐写训练 |
-| `num_epochs_phase2` | `100` | Phase 2: 对抗训练 |
-| `num_epochs_phase3` | `100` | Phase 3: 隐私保护训练 |
+| `num_epochs_phase1` | `300` | Phase 1: 基础隐写 + 渐进对抗训练 |
+| `num_epochs_phase2` | `100` | Phase 2: 隐私保护训练 |
 
 总计 **400 epochs** 的训练过程。
 
@@ -211,12 +211,13 @@ class Config:
 
 | 参数 | 默认值 | 说明 |
 |------|-------|------|
-| `lambda_pixel` | `0.3` | MSE像素损失权重 |
-| `lambda_ssim` | `0.3` | SSIM结构相似性损失权重 |
+| `lambda_pixel` | `1.0` | MSE像素损失权重 |
+| `lambda_ssim` | `2.0` | SSIM结构相似性损失权重 |
 | `lambda_perceptual` | `0.3` | VGG19感知损失权重 |
+| `use_perceptual_loss` | `True` | 是否启用VGG感知损失 |
 | `lambda_message` | `1.0` | 消息提取BCE损失权重 |
-| `lambda_adv` | `0.3` | 对抗损失权重 |
-| `lambda_privacy` | `1.0` | 隐私损失权重 |
+| `lambda_adv` | `0.1` | 对抗损失基础权重（Phase 1中渐进放大） |
+| `lambda_privacy` | `0.3` | 隐私损失基础权重（Phase 2中渐进放大） |
 
 **视觉损失组成公式**：
 
@@ -224,9 +225,9 @@ $$L_{visual} = \lambda_{pixel} \cdot L_{pixel} + \lambda_{ssim} \cdot L_{ssim} +
 
 代入默认值：
 
-$$L_{visual} = 0.3 \cdot L_{MSE} + 0.3 \cdot L_{SSIM} + 0.3 \cdot L_{VGG}$$
+$$L_{visual} = 1.0 \cdot L_{MSE} + 2.0 \cdot L_{SSIM} + 0.3 \cdot L_{VGG}$$
 
-三种视觉损失等权重的选择体现了**多尺度图像质量评估**的思想：
+三种视觉损失的权重设计体现了**多尺度图像质量评估**的思想，且SSIM权重较高以优先保证结构相似性：
 - **MSE**：像素级绝对误差
 - **SSIM**：结构级相似性（亮度、对比度、结构）
 - **Perceptual**：高层语义级相似性（VGG特征空间）
@@ -235,29 +236,41 @@ $$L_{visual} = 0.3 \cdot L_{MSE} + 0.3 \cdot L_{SSIM} + 0.3 \cdot L_{VGG}$$
 
 | 参数 | 默认值 | 说明 |
 |------|-------|------|
-| `privacy_margin` | `0.7` | 隐私余量边界 |
+| `privacy_margin` | `0.5` | 隐私余量边界 |
 | `use_advanced_privacy` | `True` | 是否启用高级隐私保护 |
 | `privacy_mode` | `'retrieval_escape'` | 隐私模式（检索逃逸） |
 | `clip_weight` | `1.0` | CLIP特征逃逸损失权重 |
 | `dino_weight` | `0.5` | DINOv2特征逃逸损失权重（Config默认值，Trainer中实际使用0.8） |
 | `dino_model_path` | `'./models/dinov2_vits14_pretrain.pth'` | DINOv2模型权重路径 |
 | `triplet_weight` | `0.15` | 三元组损失权重（Config默认值，Trainer中实际传入0.5） |
-| `triplet_margin` | `0.5` | 三元组margin |
+| `triplet_margin` | `0.5` | 三元组margin（Config默认值，Trainer中实际传入0.3） |
 
-### 4.7 检索攻击者参数
+### 4.7 CLIP/DINO 有向重定向参数
+
+| 参数 | 默认值 | 说明 |
+|------|-------|------|
+| `use_clip_redirect` | `True` | 是否启用CLIP/DINO有向重定向 |
+| `clip_memory_size` | `1000` | CLIP特征记忆库容量 |
+| `clip_hard_negative_k` | `5` | CLIP硬负样本Top-K数量 |
+| `clip_redirect_margin` | `0.6` | 重定向margin（要求与目标相似度 > 0.6） |
+| `clip_max_target_sim` | `0.75` | 最大允许相似度上限（防止特征坍塌） |
+| `clip_redirect_weight` | `0.5` | CLIP重定向损失权重 |
+| `dino_redirect_weight` | `0.3` | DINO重定向损失权重 |
+
+### 4.8 检索攻击者参数
 
 | 参数 | 默认值 | 说明 |
 |------|-------|------|
 | `use_retrieval_attacker` | `True` | 是否启用检索攻击者 |
 | `attacker_feature_dim` | `512` | 攻击者输出特征维度 |
-| `attacker_memory_size` | `1000` | 记忆库容量 |
+| `attacker_memory_size` | `1000` | 攻击者记忆库容量 |
 | `attacker_temperature` | `0.05` | 相似度温度系数（用于InfoNCE/对比损失的温度缩放） |
 | `attacker_weight` | `0.5` | 攻击者逃逸损失权重 |
 | `use_hard_negatives` | `True` | 是否使用硬负样本 |
 | `hard_negative_k` | `5` | 硬负样本数量 |
 | `memory_warmup_batches` | `50` | 记忆库预热批次数 |
 
-### 4.8 其他参数
+### 4.9 其他参数
 
 | 参数 | 默认值 | 说明 |
 |------|-------|------|
@@ -269,55 +282,51 @@ $$L_{visual} = 0.3 \cdot L_{MSE} + 0.3 \cdot L_{SSIM} + 0.3 \cdot L_{VGG}$$
 | `num_workers` | `4` | 数据加载工作线程数 |
 | `save_interval` | `10` | 检查点保存间隔（epoch数） |
 | `noise_config` | `'identity'` | 噪声层配置字符串 |
+| `discriminator_loss_threshold` | `0.1` | 判别器损失阈值，低于此值暂停判别器训练 |
 
-### 4.9 阶段权重函数 `get_phase_weights(phase)`
+### 4.10 阶段权重函数 `get_phase_weights(phase, epoch)`
 
-这是整个系统的**核心调度逻辑**，决定了不同训练阶段的损失权重分配：
+这是整个系统的**核心调度逻辑**，决定了不同训练阶段的损失权重分配。与早期版本不同，当前实现采用**两阶段**训练，且部分权重在阶段内**渐进变化**。
 
-#### Phase 1 — 基础隐写训练（200 epochs）
+#### Phase 1 — 基础隐写 + 渐进对抗训练（300 epochs）
 
 ```python
 {
     'visual': 10.0,        # 高权重：优先学习图像重建
     'message': 10.0,       # 高权重：优先学习消息编解码
-    'adv': 0.0,            # 关闭：不进行对抗训练
+    'adv': 渐进,            # lambda_adv -> 2*lambda_adv -> 3*lambda_adv
     'privacy': 0.0,        # 关闭：不进行隐私保护
     'noised': 1.0,         # 含噪声图像的视觉损失权重
     'residual_penalty': 0.5 # 中等：限制修改幅度
 }
 ```
 
-**目标**：让编码器学会将消息嵌入图像且保持视觉质量，解码器学会准确提取消息。
+**adv 渐进策略**：将Phase 1的300个epoch均分为3段：
+- 第1-100 epoch：`adv = lambda_adv` (默认0.1)
+- 第101-200 epoch：`adv = lambda_adv * 2` (默认0.2)
+- 第201-300 epoch：`adv = lambda_adv * 3` (默认0.3)
 
-#### Phase 2 — 对抗训练（100 epochs）
+**目标**：让编码器先学会将消息嵌入图像且保持视觉质量，解码器学会准确提取消息；在阶段后半段逐步引入轻量级对抗约束，为Phase 2做准备。
 
-```python
-{
-    'visual': 10.0,
-    'message': 10.0,
-    'adv': 3.0,             # 开启：引入隐写分析器对抗
-    'privacy': 0.0,         # 仍然关闭
-    'noised': 1.0,
-    'residual_penalty': 0.5
-}
-```
-
-**目标**：引入隐写分析器（Steganalyzer），通过对抗训练让编码后的图像能够欺骗检测器。
-
-#### Phase 3 — 隐私保护训练（100 epochs）
+#### Phase 2 — 隐私保护训练（100 epochs）
 
 ```python
 {
-    'visual': 10.0,
-    'message': 10.0,
-    'adv': 3.0,             # 保持对抗权重
-    'privacy': 10.0,        # 开启：大幅提高隐私保护权重
+    'visual': 20.0,         # 进一步提高视觉质量权重
+    'message': 10.0,        # 保持消息权重
+    'adv': 5.0,             # 开启并固定对抗权重
+    'privacy': 渐进,         # 1.0 -> 3.0 -> 10.0
     'noised': 0.5,          # 降低含噪声损失权重
     'residual_penalty': 0.3  # 降低残差惩罚
 }
 ```
 
-**目标**：在保证隐写能力和对抗性的基础上，大幅引入隐私保护约束，使编码图像在语义特征空间中远离原始图像。
+**privacy 渐进策略**：将Phase 2的100个epoch均分为3段：
+- 第1-33 epoch：`privacy = 1.0`
+- 第34-66 epoch：`privacy = 3.0`
+- 第67-100 epoch：`privacy = 10.0`
+
+**目标**：在保证隐写能力和对抗性的基础上，由浅入深地引入隐私保护约束，使编码图像在语义特征空间中逐渐远离原始图像，避免隐私损失突然激增导致训练崩溃。
 
 ---
 
@@ -507,6 +516,17 @@ self.linear = nn.Linear(message_length, message_length)
 
 编码器和解码器都使用**8个ConvBNRelu块** + 64通道，形成对称结构。但解码器不需要消息拼接机制，因为它只需要从图像中"读取"信息，而不需要"写入"。
 
+#### 6.2.4 参数量估算
+
+| 层 | 输入通道 | 输出通道 | 卷积核 | 参数量 |
+|---|---------|---------|--------|--------|
+| conv_layers[0] | 3 | 64 | 3×3 | 1,728 |
+| conv_layers[1-7] | 64 | 64 | 3×3 | 258,048 |
+| 最后一层 ConvBNRelu | 64 | 30 | 3×3 | 17,280 |
+| AdaptiveAvgPool2d | - | - | - | 0 |
+| Linear | 30 | 30 | - | 930 |
+| **总计** | | | | **~277,986** |
+
 ---
 
 ### 6.3 隐写分析器 (Steganalyzer)
@@ -538,13 +558,14 @@ Flatten → [B, 512]
        │
        ▼
 ┌──────────────────────┐
-│ Linear(512→256)      │  + LeakyReLU(0.2) + Dropout(0.3)
-│ Linear(256→1)        │  → logit output
+│ Linear(512→1)        │  → logit output (注意：当前实现为单层线性输出)
 └──────────────────────┘
        │
        ▼
 Output: [B, 1]  (正值为stego, 负值为cover)
 ```
+
+> **注**：当前 `steganalyzer.py` 的实现将原双层FC（512→256→1）简化为单层（512→1），以精简参数量。`validation_script.py` 中保留了旧权重的键映射逻辑，确保兼容性。
 
 #### 6.3.2 Spectral Normalization（谱归一化）
 
@@ -867,7 +888,7 @@ mu2_sq = mu2.pow(2)
 mu1_mu2 = mu1 * mu2
 
 sigma1_sq = F.conv2d(img1*img1, window, ...) - mu1_sq  # E[X²] - E[X]²
-sigma2_sq = F.conv2d(img2*img2, window, ...) - mu2_sq
+theta2_sq = F.conv2d(img2*img2, window, ...) - mu2_sq
 sigma12 = F.conv2d(img1*img2, window, ...) - mu1_mu2    # E[XY] - E[X]E[Y]
 ```
 
@@ -970,8 +991,8 @@ $$L_{privacy} = \text{mean}\left(\text{log1p}\left(\exp\left(\text{cos\_sim}(f_{
 
 其中：
 - $\text{cos\_sim}(a, b) = \frac{a \cdot b}{\|a\|\|b\|}$：余弦相似度，范围 `[-1, 1]`
-- `margin`：隐私边界（默认0.7）
-- $(1 - margin) = 0.3$：允许的最大相似度阈值
+- `margin`：隐私边界（默认0.5）
+- $(1 - margin) = 0.5$：允许的最大相似度阈值
 - $\text{log1p}(x) = \log(1 + x)$：数值稳定的softplus近似
 
 #### 7.3.2 实现代码
@@ -987,13 +1008,13 @@ def forward(self, feat_cover, feat_encoded):
 #### 7.3.3 直觉解释
 
 该损失是一个 **Softplus Loss**（`log1p(exp(...))`），是Hinge Loss的平滑近似：
-- 当 `cos_sim >> 0.3` 时：损失快速增长，强力推动特征分离
-- 当 `cos_sim ≈ 0.3` 时：损失接近 `log(2) ≈ 0.693`
-- 当 `cos_sim << 0.3` 时：损失趋近0，已经满足隐私要求
+- 当 `cos_sim >> 0.5` 时：损失快速增长，强力推动特征分离
+- 当 `cos_sim ≈ 0.5` 时：损失接近 `log(2) ≈ 0.693`
+- 当 `cos_sim << 0.5` 时：损失趋近0，已经满足隐私要求
 
 与Hinge Loss（`max(0, sim - target)`）相比，Softplus Loss处处可导，梯度更平滑，有利于优化收敛。
 
-**目标**：让编码图像的特征向量在CLIP语义空间中与原始图像特征向量的夹角足够大（余弦相似度低于0.3），从而防止通过语义检索关联原始图像和隐写图像。
+**目标**：让编码图像的特征向量在CLIP语义空间中与原始图像特征向量的夹角足够大（余弦相似度低于0.5），从而防止通过语义检索关联原始图像和隐写图像。
 
 ---
 
@@ -1003,15 +1024,27 @@ def forward(self, feat_cover, feat_encoded):
 
 #### 7.4.1 设计动机
 
-单一模态的隐私保护可能存在盲区。FeatureRedirectionLoss支持**多模态联合特征逃逸**：
+单一模态的隐私保护可能存在盲区。FeatureRedirectionLoss支持**多模态联合特征逃逸**，并引入了**有向重定向（Directed Escape）**机制：
 
-$$L_{total} = w_{clip} \cdot L_{escape}^{CLIP}(f_{cover}^{CLIP}, f_{encoded}^{CLIP}) + w_{dino} \cdot L_{escape}^{DINO}(f_{cover}^{DINO}, f_{encoded}^{DINO})$$
+$$L_{total} = w_{clip} \cdot L_{escape}^{CLIP} + w_{dino} \cdot L_{escape}^{DINO}$$
 
-其中每个逃逸损失使用与PrivacyLoss相同的Softplus公式：
+其中每个逃逸损失支持两种模式：
+- **纯逃逸**：仅使用Softplus loss将编码图像推离原图
+- **有向重定向**：在推离原图的同时，通过硬负样本将编码图像"拉向"其他无关图像，实现语义伪装
 
-$$L_{escape} = \text{mean}\left(\text{log1p}\left(\exp\left(\text{cos\_sim}(f_{encoded}, f_{cover}) - (1 - escape\_margin)\right)\right)\right)$$
+#### 7.4.2 有向重定向损失公式
 
-#### 7.4.2 模态互补性
+对于单一模态：
+
+$$L_{directed} = L_{escape} + w_{redirect} \cdot \max(0, m_{redirect} - \text{sim}(f_{encoded}, f_{negative})) + 0.3 \cdot \max(0, \text{sim}(f_{encoded}, f_{negative}) - s_{max})$$
+
+其中：
+- $L_{escape}$：Softplus loss，推离原图
+- $m_{redirect}=0.6$：重定向margin，要求与负样本相似度 > 0.6
+- $s_{max}=0.75$：最大允许相似度，防止过度接近导致特征坍塌
+- $w_{redirect}$：重定向权重（CLIP: 0.5, DINO: 0.3）
+
+#### 7.4.3 模态互补性
 
 | 模态 | 模型 | 特征维度 | 优势 |
 |------|------|---------|------|
@@ -1020,9 +1053,9 @@ $$L_{escape} = \text{mean}\left(\text{log1p}\left(\exp\left(\text{cos\_sim}(f_{e
 
 默认配置 `dino_weight=0.5`（Config中），Trainer中实际使用 `dino_weight=0.8`，与CLIP联合使用提供多模态隐私保护。
 
-#### 7.4.3 返回值
+#### 7.4.4 返回值
 
-该方法返回 `(total_loss, loss_dict)`，其中 `loss_dict` 包含 `clip_loss`、`dino_loss`（可选）和 `total_privacy_loss`，便于训练监控。
+该方法返回 `(total_loss, loss_dict)`，其中 `loss_dict` 包含 `clip_escape`、`clip_redirect`、`clip_control`、`dino_escape`、`dino_redirect`、`dino_control`、`total_privacy_loss` 等，便于训练监控。
 
 ---
 
@@ -1037,7 +1070,7 @@ $$L_{triplet} = \underbrace{\text{mean}\left(\text{log1p}\left(\exp(\text{sim}(f
 其中：
 - $f_{cover}^{att}, f_{encoded}^{att}$：攻击者特征空间中的封面/编码图像特征
 - $f_{target}^{att}$：硬负样本特征（从记忆库中获取的最难区分样本，同样在攻击者空间）
-- $m_{escape}=0.5$：逃逸margin，要求余弦相似度 < 0.5
+- $m_{escape}=0.3$（Trainer实际值）：逃逸margin，要求余弦相似度 < 0.7
 - $m_{redirect}=0.6$：重定向margin，要求与目标相似度 > 0.6
 - $s_{max}=0.75$：最大允许相似度
 
@@ -1059,13 +1092,13 @@ $$L_{triplet} = \underbrace{\text{mean}\left(\text{log1p}\left(\exp(\text{sim}(f
 
 这是**最高级别的隐私损失聚合器**，整合了所有隐私保护子模块：
 
-$$L_{retrieval\_escape} = \underbrace{L_{multi\_feature}}_{\text{CLIP/DINO逃逸}} + w_{triplet} \cdot \underbrace{L_{triplet}^{attacker}}_{\text{攻击者空间三元组(逃逸+重定向)}}$$
+$$L_{retrieval\_escape} = \underbrace{L_{multi\_feature}}_{\text{CLIP/DINO有向逃逸}} + w_{triplet} \cdot \underbrace{L_{triplet}^{attacker}}_{\text{攻击者空间三元组(逃逸+重定向)}}$$
 
 #### 7.6.1 各组成部分
 
 | 组件 | 权重 | 来源 | 作用 |
 |------|------|------|------|
-| `multi_feature_loss` | `clip=1.0, dino=0.5` | FeatureRedirectionLoss | 在CLIP/DINO语义空间中拉开距离 |
+| `multi_feature_loss` | `clip=1.0, dino=0.5/0.8` | FeatureRedirectionLoss | 在CLIP/DINO语义空间中执行推离+拉向 |
 | `triplet_loss` | `triplet_weight` | RedirectionTripletLoss | 在攻击者特征空间中执行逃逸+重定向 |
 
 **关键设计决策**：
@@ -1083,6 +1116,7 @@ $$L_{retrieval\_escape} = \underbrace{L_{multi\_feature}}_{\text{CLIP/DINO逃逸
 | `dino_weight` | 0.5 | 0.8 | Trainer中覆盖为0.8 |
 | `triplet_weight` | 0.15 | 0.5 | Trainer中覆盖为0.5 |
 | `triplet_margin` | 0.5 | 0.3 | Trainer中覆盖为0.3 |
+| `margin` | 0.5 | 0.5 | 与Config一致（privacy_margin） |
 
 ---
 
@@ -1380,19 +1414,67 @@ Trainer的 `__init__` 方法完成了整个系统的组装：
    ├── BCELoss / BCEWithLogitsLoss (消息/对抗)
 5. 条件性创建高级组件:
    ├── DINOv2模型 (如 dino_weight > 0)
-   └── RetrievalAttackerWithMemory (如 use_retrieval_attacker)
-       └── optimizer_attacker: Adam(attacker参数, lr=lr_encoder*0.5)
+   ├── RetrievalAttackerWithMemory (如 use_retrieval_attacker)
+   │   └── optimizer_attacker: Adam(attacker参数, lr=lr_encoder*0.5)
+   └── FeatureMemoryBank (如 use_clip_redirect)
+       ├── clip_memory_bank (CLIP特征)
+       └── dino_memory_bank (DINO特征, 预留)
 6. 解析并构建噪声层管道
 ```
 
-#### 9.1.2 DINOv2特征提取
+#### 9.1.2 FeatureMemoryBank (通用特征记忆库)
+
+**文件位置**: [trainer.py](trainer.py) 中的 `FeatureMemoryBank` 类
+
+这是与 `RetrievalAttackerWithMemory` 并列的**通用特征记忆库**，用于存储CLIP/DINO等冻结模型的特征向量：
+
+```python
+class FeatureMemoryBank:
+    def __init__(self, feature_dim, memory_size=1000, device='cuda'):
+        self.memory_bank = torch.zeros(memory_size, feature_dim, device=device)
+        self.memory_ptr = 0
+        self.memory_count = 0
+    
+    @torch.no_grad()
+    def update(self, features):
+        features = F.normalize(features.float(), p=2, dim=1)
+        # 循环缓冲区写入逻辑...
+    
+    def get_hard_negatives(self, features, k=5):
+        # 点积相似度排序，取top-k
+        # 两阶段选择：先top-k，再从中选最难的1个
+```
+
+**与 RetrievalAttackerWithMemory 的区别**：
+
+| 特性 | FeatureMemoryBank | RetrievalAttackerWithMemory |
+|------|-------------------|----------------------------|
+| 用途 | 存储CLIP/DINO等**冻结模型**特征 | 存储**可训练攻击者**提取的特征 |
+| 更新方式 | Python属性（非buffer） | PyTorch register_buffer |
+| 状态保存 | 通过state_dict/load_state_dict | 通过模型state_dict自动保存 |
+| 梯度 | 不参与任何梯度计算 | 攻击者特征参与攻击者训练梯度 |
+
+在 `train_step` 中，CLIP记忆库的更新和硬负样本获取流程：
+
+```python
+if self.clip_memory_bank is not None:
+    with torch.no_grad():
+        clip_negatives = self.clip_memory_bank.get_hard_negatives(feat_cover, k=self.clip_hard_negative_k)
+    if self.clip_memory_bank.memory_count > 0:
+        with torch.no_grad():
+            self.clip_memory_bank.update(feat_cover)
+```
+
+**注意**：记忆库更新使用**当前batch之前的记忆**来获取负样本（避免将当前batch样本作为负样本），更新操作在获取之后执行。
+
+#### 9.1.3 DINOv2特征提取
 
 ```python
 def extract_dino_features(self, image):
     if not hasattr(self, 'dino_model') or self.dino_model is None:
         return None
     with torch.no_grad():
-        image_resized = F.interpolate(image, size=(224, 224), mode='bilinear')
+        image_resized = F.interpolate(image, size=(224, 224), mode='bilinear', align_corners=False)
         image_normalized = (image_resized + 1) / 2  # [-1,1] → [0,1]
         image_normalized = (image_normalized - self.dino_mean) / self.dino_std  # ImageNet标准化
         features = self.dino_model(image_normalized)  # DINOv2前向传播
@@ -1402,7 +1484,7 @@ def extract_dino_features(self, image):
 
 DINOv2 (`vit_small_patch14_dinov2.lvd142m`) 通过timm库加载，输出 **384维** 特征向量。
 
-#### 9.1.3 DINOv2模型加载与位置编码插值
+#### 9.1.4 DINOv2模型加载与位置编码插值
 
 ```python
 self.dino_model = timm.create_model('vit_small_patch14_dinov2.lvd142m', pretrained=False, num_classes=0, img_size=224)
@@ -1433,7 +1515,7 @@ if dino_model_path and os.path.exists(dino_model_path):
 
 **位置编码插值**：当预训练权重的位置编码尺寸与当前模型不匹配时（如预训练使用518×518，当前使用224×224），通过双三次插值将位置编码调整到正确的网格尺寸。保留CLS token不变，仅对patch embedding部分进行插值。
 
-### 9.2 三阶段训练策略
+### 9.2 两阶段训练策略
 
 #### 总体损失函数
 
@@ -1443,9 +1525,9 @@ $$L_{total} = w_{visual}(L_{visual} + w_{noised} \cdot L_{visual}^{noised}) + w_
 
 #### 9.2.1 视觉重建损失
 
-$$L_{visual} = 0.3 \cdot L_{MSE}(I_{enc}, I_{cov}) + 0.3 \cdot L_{SSIM}(I_{enc}, I_{cov}) + 0.3 \cdot L_{perc}(I_{enc}, I_{cov})$$
+$$L_{visual} = 1.0 \cdot L_{MSE}(I_{enc}, I_{cov}) + 2.0 \cdot L_{SSIM}(I_{enc}, I_{cov}) + 0.3 \cdot L_{perc}(I_{enc}, I_{cov})$$
 
-$$L_{visual}^{noised} = 0.3 \cdot L_{MSE}(I_{noised}, I_{cov}) + 0.3 \cdot L_{SSIM}(I_{noised}, I_{cov}) + 0.3 \cdot L_{perc}(I_{noised}, I_{cov})$$
+$$L_{visual}^{noised} = 1.0 \cdot L_{MSE}(I_{noised}, I_{cov}) + 2.0 \cdot L_{SSIM}(I_{noised}, I_{cov}) + 0.3 \cdot L_{perc}(I_{noised}, I_{cov})$$
 
 **双重视觉损失的含义**：
 - $L_{visual}$：无噪声情况下的重建质量（理想条件）
@@ -1475,10 +1557,19 @@ L_D = (self.bce_with_logits_loss(cover_pred, torch.ones_like(cover_pred)) +
 - `cover_pred = Steganalyzer(noised_cover_image)` → **标签=1**（真实图像）
 - `stego_pred = Steganalyzer(noised_encoded_image.detach())` → **标签=0**（隐写图像）
 
+**判别器暂停机制**：
+
+```python
+disc_threshold = getattr(self.cfg, 'discriminator_loss_threshold', None)
+skip_disc = (disc_threshold is not None and L_D.item() < disc_threshold)
+```
+
+当判别器损失低于阈值（默认0.1）时，暂停判别器训练，防止判别器过度强大导致生成器梯度消失。
+
 **生成器（Encoder+Decoder）对抗损失**：
 
 ```python
-stego_pred = self.steganalyzer(noised_encoded_image)  # 注意：没有detach！
+stego_pred = self.steganalyzer(disc_stego_input)  # 注意：没有detach！
 L_adv = self.bce_with_logits_loss(stego_pred, torch.ones_like(stego_pred))
 # 标签=1：希望判别器认为隐写图像是真实的
 ```
@@ -1486,21 +1577,31 @@ L_adv = self.bce_with_logits_loss(stego_pred, torch.ones_like(stego_pred))
 这是标准的**非饱和GAN对抗损失**，生成器试图"欺骗"判别器。
 
 **训练顺序**：
-1. 先计算判别器损失并更新判别器参数（仅在 `adv > 0` 时）
+1. 先计算判别器损失并更新判别器参数（仅在 `adv > 0` 且未达到阈值时）
 2. 再计算生成器对抗损失（使用更新后的判别器）
 3. 最后连同其他损失一起更新生成器参数
 
 #### 9.2.4 隐私保护损失
 
-详见第7节的损失函数分析。在Phase 3中，`RetrievalEscapeLoss` 整合了以下子损失：
+详见第7节的损失函数分析。在Phase 2中，`RetrievalEscapeLoss` 整合了以下子损失：
 
 | 子损失 | 权重 | 含义 |
 |--------|------|------|
-| CLIP逃逸损失 | 1.0 | CLIP特征空间中的Softplus loss |
-| DINO逃逸损失 | 0.8 (Trainer) | DINO特征空间中的Softplus loss |
+| CLIP有向逃逸损失 | 1.0 | CLIP特征空间中的Softplus + 重定向 |
+| DINO有向逃逸损失 | 0.8 (Trainer) | DINO特征空间中的Softplus + 重定向 |
 | 攻击者空间三元组损失 | 0.5 (triplet_weight in Trainer) | 攻击者特征空间中的逃逸+重定向（统一计算） |
 
-**硬负样本选择流程**（Trainer中）：
+**CLIP/DINO 硬负样本选择流程**（Trainer中）：
+
+```python
+# 1. 从CLIP记忆库获取硬负样本
+clip_negatives = self.clip_memory_bank.get_hard_negatives(feat_cover, k=5)
+
+# 2. FeatureRedirectionLoss内部使用这些负样本计算有向重定向
+#    escape + redirect + control
+```
+
+**攻击者硬负样本选择流程**：
 
 ```python
 # 1. 获取top-k硬负样本
@@ -1538,7 +1639,7 @@ $$L_{residual} = MSE(I_{enc}, I_{cov})$$
 ```bash
 python train.py new --data-dir ./dataset --name experiment1 \
     --batch-size 8 --size 256 --message 30 \
-    --epochs-phase1 200 --epochs-phase2 100 --epochs-phase3 100 \
+    --epochs-phase1 300 --epochs-phase2 100 \
     --noise "identity"
 ```
 
@@ -1568,7 +1669,6 @@ experiments/{experiment_name}/
 │   ├── checkpoint_phase{N}_epoch{M}.pth  # 阶段性检查点
 │   ├── best_phase1.pth       # Phase 1 最佳检查点
 │   ├── best_phase2.pth       # Phase 2 最佳检查点
-│   ├── best_phase3.pth       # Phase 3 最佳检查点（最终最佳）
 │   └── visualizations/
 │       ├── phase1_epoch10.png
 │       └── ...
@@ -1578,7 +1678,7 @@ experiments/{experiment_name}/
 #### 9.3.3 训练主循环 (`run_training_loop`)
 
 ```python
-for phase in range(start_phase, 4):          # Phase 1, 2, 3
+for phase in range(start_phase, 3):          # Phase 1, 2
     num_epochs = getattr(cfg, f'num_epochs_phase{phase}')
     phase_start_epoch = start_epoch if phase == start_phase else 1
     
@@ -1603,6 +1703,7 @@ def save_checkpoint(self, epoch, phase, is_best=False):
     # 保存: optimizer_encoder_decoder, optimizer_steganalyzer状态字典
     # 保存: 最佳损失记录
     # 条件保存: attacker优化器和retrieval_attacker状态字典
+    # 条件保存: clip_memory_bank, dino_memory_bank状态字典
     
     # 保留策略: 每个phase最多保留5个最新检查点
     # 自动删除最旧的检查点
@@ -1628,21 +1729,42 @@ def set_seed(seed=42):
 
 ```python
 def warmup_memory_bank(self, train_loader, num_batches=50):
-    if self.retrieval_attacker is None:
+    if self.retrieval_attacker is None and self.clip_memory_bank is None and self.dino_memory_bank is None:
         return
-    self.retrieval_attacker.eval()
+    
+    print(f'Warming up Memory Banks with {num_batches} batches...')
+    
+    if self.retrieval_attacker is not None:
+        self.retrieval_attacker.eval()
+    
     with torch.no_grad():
         for i, batch in enumerate(train_loader):
             if i >= num_batches:
                 break
-            features = self.retrieval_attacker(cover_image)
-            self.retrieval_attacker.update_memory(features)
-    self.retrieval_attacker.train()
+            cover_image = batch['cover_image'].to(self.device)
+            
+            if self.retrieval_attacker is not None:
+                features = self.retrieval_attacker(cover_image)
+                self.retrieval_attacker.update_memory(features)
+            
+            if self.clip_memory_bank is not None:
+                clip_feat = self.content_recognizer(cover_image)
+                self.clip_memory_bank.update(clip_feat)
+            
+            if self.dino_memory_bank is not None:
+                dino_feat = self.extract_dino_features(cover_image)
+                if dino_feat is not None:
+                    self.dino_memory_bank.update(dino_feat)
+    
+    if self.retrieval_attacker is not None:
+        self.retrieval_attacker.train()
+    
+    # 打印各记忆库预热后的状态...
 ```
 
-在Phase 1开始前，用50个batch的封面图像特征**预填**记忆库。这确保在正式训练开始时，记忆库已有足够的样本可供硬负样本挖掘。
+在Phase 1开始前，用50个batch的封面图像特征**预填**所有记忆库（攻击者、CLIP、DINO）。这确保在正式训练开始时，各记忆库已有足够的样本可供硬负样本挖掘。
 
-**检索攻击者训练**：检索攻击者（RetrievalAttackerWithMemory）在Phase 2及之后参与训练，其损失函数使用**InfoNCE（对比学习）损失**：
+**检索攻击者训练**：检索攻击者（RetrievalAttackerWithMemory）在Phase 2参与训练，其损失函数使用**InfoNCE（对比学习）损失**：
 
 ```python
 if valid_count >= self.cfg.batch_size:
@@ -1816,6 +1938,8 @@ CLIP的核心思想是通过对比学习，让图像编码器和文本编码器�
 2. 生成器学会制造更难被检测的隐写图像
 3. 达到纳什均衡时，隐写图像的统计分布与真实图像无法区分
 
+**判别器暂停机制**：当判别器损失低于阈值（0.1）时暂停训练，防止判别器过强导致生成器梯度消失，这是训练稳定性的重要保障。
+
 **SpectralNorm的关键作用**：保证判别器满足1-Lipschitz约束，避免梯度爆炸/消失，使对抗训练稳定收敛。
 
 ### 12.3 隐私保护的多模态特征逃逸机制
@@ -1827,7 +1951,7 @@ CLIP的核心思想是通过对比学习，让图像编码器和文本编码器�
 - 如果编码前后特征相似，攻击者可以通过**语义检索**建立联系
 - 这构成了**推理攻击（Inference Attack）**的一种
 
-#### 解决方案：特征空间逃逸
+#### 解决方案：特征空间逃逸 + 有向重定向
 
 ```
 CLIP语义特征空间（512维单位超球面）
@@ -1835,20 +1959,20 @@ CLIP语义特征空间（512维单位超球面）
                     f_encoded (目标位置)
                        ●
                       /
-                     /  ← 最大化距离
+                     /  ← 最大化距离(推离原图)
                     /
                    /
         f_cover ●─────────────────● f_other_image
-                  \
-                   \  ← 最小化距离（正常图像对）
-                    \
-                     ● f_cover_similar
+                  \               /
+                   \  ← 最小化距离(拉向负样本)
+                    \           /
+                     ● f_hard_negative
 ```
 
 **逃逸策略**：
 1. **推离**（Push Away）：最大化 `sim(f_encoded, f_cover)` 的距离（Softplus Loss）
-2. **拉向**（Pull Toward）：最小化 `sim(f_encoded, f_hard_negative)` 的距离（Triplet Loss）
-3. **对抗逃逸**：在攻击者的特征空间中也执行推离操作
+2. **拉向**（Pull Toward）：最小化 `sim(f_encoded, f_hard_negative)` 的距离（有向重定向）
+3. **对抗逃逸**：在攻击者的特征空间中也执行推离+拉向操作
 
 #### 为什么多模态？
 
@@ -1857,6 +1981,13 @@ CLIP语义特征空间（512维单位超球面）
 - **DINOv2**：自监督学习，对纹理、细粒度结构更敏感
 
 联合使用可以覆盖更多潜在的攻击向量。
+
+#### 有向重定向的优势
+
+相比纯"推离"策略，有向重定向引入了一个**语义目标**：
+- 纯推离：编码图像可能飘向特征空间的任意方向，甚至可能靠近其他敏感区域
+- 有向重定向：明确将编码图像"伪装"成某个无关图像，使攻击者更难以通过检索找到原图
+- 控制项防止过度接近，保持特征多样性
 
 ### 12.4 记忆库驱动的硬负样本挖掘
 
@@ -1880,14 +2011,23 @@ Batch N: 查询 img_X 的特征 f_X
 Top-5 最相似: [f_P, f_Q, f_R, f_S, f_T]  ← 这些就是"硬负样本"
     ↓ 从中选最难的1个
 Hardest: f_P
-    ↓ 用作三元组目标的 f_target
-L_triplet = escape(f_cover, f_encoded) + redirect(f_encoded, f_P) + control(f_encoded, f_P)
+    ↓ 用作重定向目标
+L_redirect = max(0, 0.6 - sim(f_encoded, f_P))
 ```
+
+**多记忆库设计**：
+
+| 记忆库 | 存储特征 | 用途 |
+|--------|---------|------|
+| `clip_memory_bank` | CLIP 512维特征 | CLIP有向重定向的负样本来源 |
+| `dino_memory_bank` | DINOv2 384维特征 | DINO有向重定向的负样本来源（预留） |
+| `retrieval_attacker.memory_bank` | 攻击者512维特征 | 攻击者三元组损失 + InfoNCE训练 |
 
 **优势**：
 - 记忆库积累了历史batch的特征，负样本池远大于当前batch
 - 选择"最相似"的样本作为负样本，迫使模型学习更精细的区分能力
 - 循环缓冲区设计保证特征分布的时效性
+- 多记忆库覆盖多模态攻击向量
 
 ---
 
@@ -1897,7 +2037,7 @@ L_triplet = escape(f_cover, f_encoded) + redirect(f_encoded, f_P) + control(f_en
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        Train Step 数据流 (Phase 3)                       │
+│                        Train Step 数据流 (Phase 2)                       │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  输入                                                                     │
@@ -1950,43 +2090,47 @@ L_triplet = escape(f_cover, f_encoded) + redirect(f_encoded, f_P) + control(f_en
 │  │                                                                        │
 │  │  LOSS COMPUTATIONS                                                     │
 │  │                                                                        │
-│  │  ┌─ Visual Loss ──────────────────────────────────────────────────┐    │
+│  │  ├─ Visual Loss ──────────────────────────────────────────────────┐    │
 │  │  │ L_pixel = MSE(encoded, cover)                                  │    │
 │  │  │ L_ssim = 1 - SSIM(encoded, cover)                              │    │
 │  │  │ L_perceptual = L1(VGG(encoded), VGG(cover))                   │    │
-│  │  │ L_visual = 0.3*L_pixel + 0.3*L_ssim + 0.3*L_perceptual        │    │
+│  │  │ L_visual = 1.0*L_pixel + 2.0*L_ssim + 0.3*L_perceptual        │    │
 │  │  │ L_visual_noised = 同上(noised_encoded vs cover)                │    │
 │  │  └────────────────────────────────────────────────────────────────┘    │
 │  │                                                                        │
-│  │  ┌─ Message Loss ─────────────────────────────────────────────────┐    │
+│  │  ├─ Message Loss ─────────────────────────────────────────────────┐    │
 │  │  │ L_message = BCEWithLogits(message_pred, message)               │    │
 │  │  └────────────────────────────────────────────────────────────────┘    │
 │  │                                                                        │
-│  │  ┌─ Adversarial Loss ─────────────────────────────────────────────┐    │
+│  │  ├─ Adversarial Loss ─────────────────────────────────────────────┐    │
 │  │  │ D_train: BCE(Stego(noised_cover)→1, Stego(noised_enc.detach)→0)│   │
 │  │  │ L_adv = BCE(Stego(noised_enc)→1)  [生成器视角]                │    │
 │  │  └────────────────────────────────────────────────────────────────┘    │
 │  │                                                                        │
-│  │  ┌─ Privacy Loss (Phase 3 only) ──────────────────────────────────┐    │
+│  │  ├─ Privacy Loss (Phase 2 only) ──────────────────────────────────┐    │
 │  │  │ 1. CLIP features:                                               │    │
 │  │  │    f_cover = ContentRecognizer(cover).detach()  [B,512]        │    │
 │  │  │    f_encoded = ContentRecognizer(encoded)       [B,512]        │    │
 │  │  │ 2. DINO features:                                               │    │
 │  │  │    dino_cover = DINOv2(cover)             [B,384]             │    │
 │  │  │    dino_encoded = DINOv2(encoded)          [B,384]             │    │
-│  │  │ 3. Attacker features (统一特征空间):                             │    │
-│  │  │    Get hard negatives from memory bank (k=5 → select hardest 1) │    │
+│  │  │ 3. CLIP/DINO硬负样本 (from FeatureMemoryBank):                  │    │
+│  │  │    clip_negatives = clip_memory_bank.get_hard_negatives(f_cover)│   │
+│  │  │ 4. Attacker features (统一特征空间):                             │    │
 │  │  │    att_cover = RetrievalAttacker(cover)      [B,512]           │    │
 │  │  │    att_encoded = RetrievalAttacker(encoded)  [B,512]           │    │
-│  │  │ 4. RetrievalEscapeLoss:                                         │    │
+│  │  │    feat_negatives = attacker.get_hard_negatives(att_cover)     │    │
+│  │  │ 5. RetrievalEscapeLoss:                                         │    │
 │  │  │    L_privacy = L_multi_feature + 0.5*L_triplet(att_space)      │    │
-│  │  │    L_multi_feature = 1.0*L_clip + 0.8*L_dino                   │    │
+│  │  │    L_multi_feature = 1.0*L_clip_escape/redirect + 0.8*L_dino   │    │
 │  │  │    L_triplet = escape(att) + redirect(att) + control(att)      │    │
 │  │  └────────────────────────────────────────────────────────────────┘    │
 │  │                                                                        │
-│  │  ┌─ Total Loss ────────────────────────────────────────────────────┐    │
-│  │  │ L_total = 10*(L_visual + 0.5*L_visual_noised)                   │    │
-│  │  │        + 10*L_message + 3*L_adv + 10*L_privacy + 0.3*L_residual│    │
+│  │  ├─ Total Loss ────────────────────────────────────────────────────┐    │
+│  │  │ L_total = 20*(L_visual + 0.5*L_visual_noised)                   │    │
+│  │  │        + 10*L_message + 5*L_adv + privacy*L_privacy            │    │
+│  │  │        + 0.3*L_residual                                         │    │
+│  │  │  (privacy 渐进: 1.0→3.0→10.0)                                  │    │
 │  │  └────────────────────────────────────────────────────────────────┘    │
 │  │                                                                        │
 │  ├───────────────────────────────────────────────────────────────────────┤
@@ -1997,7 +2141,7 @@ L_triplet = escape(f_cover, f_encoded) + redirect(f_encoded, f_P) + control(f_en
 │  │  3. clip_grad_norm(enc+dec params, max_norm=1.0)                      │
 │  │  4. optimizer_encoder_decoder.step()                                   │
 │  │  5. [If phase>=2]: Update attacker with InfoNCE loss                  │
-│  │  6. Update memory bank with att_cover features                        │
+│  │  6. Update memory banks (attacker + CLIP + DINO)                      │
 │  │                                                                        │
 │  └───────────────────────────────────────────────────────────────────────┘
 │                                                                         │
@@ -2073,8 +2217,8 @@ tensorboard --logdir experiments/my_experiment/tensorboard
 ```
 
 TensorBoard中可查看的标量：
-- `Phase{1,2,3}/Train/{L_total, L_visual, L_message, L_adv, L_privacy, ...}`
-- `Phase{1,2,3}/Val/{L_total, L_visual, L_message, L_adv, L_privacy, ...}`
+- `Phase{1,2}/Train/{L_total, L_visual, L_message, L_adv, L_privacy, ...}`
+- `Phase{1,2}/Val/{L_total, L_visual, L_message, L_adv, L_privacy, ...}`
 
 ### 14.5 噪声层配置语法
 
@@ -2101,26 +2245,31 @@ TensorBoard中可查看的标量：
 | LR | lr_encoder/decoder | 1e-3 | 生成器学习率 |
 | LR | lr_steganalyzer | 1e-3 | 判别器学习率 |
 | LR | attacker (隐含) | 5e-4 | 攻击者学习率 (lr_encoder*0.5) |
-| λ | lambda_pixel | 0.3 | MSE权重 |
-| λ | lambda_ssim | 0.3 | SSIM权重 |
+| λ | lambda_pixel | 1.0 | MSE权重 |
+| λ | lambda_ssim | 2.0 | SSIM权重 |
 | λ | lambda_perceptual | 0.3 | VGG感知权重 |
 | λ | lambda_message | 1.0 | 消息损失权重 |
-| λ | lambda_adv | 0.3 | 对抗损失权重（基础） |
-| λ | lambda_privacy | 1.0 | 隐私损失权重（基础） |
-| 隐私 | privacy_margin | 0.7 | 隐私安全边界 |
+| λ | lambda_adv | 0.1 | 对抗损失基础权重 |
+| λ | lambda_privacy | 0.3 | 隐私损失基础权重 |
+| 隐私 | privacy_margin | 0.5 | 隐私安全边界 |
 | 隐私 | clip_weight | 1.0 | CLIP特征逃逸权重 |
 | 隐私 | dino_weight | 0.5 (Config) / 0.8 (Trainer) | DINOv2特征逃逸权重 |
 | 隐私 | triplet_weight | 0.15 (Config) / 0.5 (Trainer) | 三元组损失权重 |
 | 隐私 | triplet_margin | 0.5 (Config) / 0.3 (Trainer) | 三元组margin |
+| 重定向 | use_clip_redirect | True | 启用有向重定向 |
+| 重定向 | clip_redirect_weight | 0.5 | CLIP重定向权重 |
+| 重定向 | dino_redirect_weight | 0.3 | DINO重定向权重 |
+| 重定向 | clip_redirect_margin | 0.6 | 重定向margin |
+| 重定向 | clip_max_target_sim | 0.75 | 最大允许相似度 |
 | 攻击 | attacker_feature_dim | 512 | 攻击特征维度 |
-| 攻击 | attacker_memory_size | 1000 | 记忆库容量 |
+| 攻击 | attacker_memory_size | 1000 | 攻击者记忆库容量 |
 | 攻击 | attacker_temperature | 0.05 | 温度系数 |
 | 攻击 | attacker_weight | 0.5 | 攻击者逃逸权重 |
 | 攻击 | hard_negative_k | 5 | 硬负样本数 |
 | 攻击 | memory_warmup_batches | 50 | 记忆库预热批次数 |
-| 阶段 | P1 epochs | 200 | 基础训练 |
-| 阶段 | P2 epochs | 100 | 对抗训练 |
-| 阶段 | P3 epochs | 100 | 隐私训练 |
+| 阶段 | P1 epochs | 300 | 基础+渐进对抗训练 |
+| 阶段 | P2 epochs | 100 | 隐私保护训练 |
+| 其他 | discriminator_loss_threshold | 0.1 | 判别器暂停阈值 |
 | 其他 | num_workers | 4 | 数据加载线程 |
 | 其他 | save_interval | 10 | 检查点保存间隔 |
 | 其他 | seed | 42 | 随机种子 |
@@ -2129,14 +2278,14 @@ TensorBoard中可查看的标量：
 
 | 模型 | 近似参数量 | 可训练 |
 |------|-----------|--------|
-| Encoder (UNet-style) | ~315K | ✓ |
-| Decoder (CNN) | ~299K | ✓ |
-| Steganalyzer (CNN+SN) | ~2.8M | ✓ |
+| Encoder (UNet-style) | ~316K | ✓ |
+| Decoder (CNN) | ~278K | ✓ |
+| Steganalyzer (CNN+SN) | ~2.5M | ✓ |
 | ContentRecognizer (CLIP ViT-B/32) | ~150M | ✗ (冻结) |
 | RetrievalAttacker | ~2.5M | ✓ |
 | Memory Bank | ~2M (1000×512×4B) | buffer only |
 | DINOv2 (可选) | ~22M | ✗ (冻结) |
-| **总可训练** | **~5.9M** | |
+| **总可训练** | **~5.6M** | |
 
 ## 附录C：术语表
 
@@ -2152,6 +2301,7 @@ TensorBoard中可查看的标量：
 | SSIM | Structural Similarity | 结构相似性指数 |
 | 感知损失 | Perceptual Loss | 基于预训练网络特征的距离度量 |
 | 特征逃逸 | Feature Escape | 在特征空间中拉开原始/编码图像的距离 |
+| 有向重定向 | Directed Redirection | 将编码图像特征拉向无关负样本 |
 | 硬负样本 | Hard Negative | 与查询样本最相似的负样本 |
 | 记忆库 | Memory Bank | 存储历史特征向量的循环缓冲区 |
 | Softplus Loss | | log1p(exp(x)) 形式的平滑损失函数 |

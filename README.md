@@ -7,7 +7,7 @@
 - **消息嵌入与提取**：在图像中嵌入二进制消息（默认 30 bit），解码端可准确提取
 - **视觉不可感知性**：编码图像与原图在像素级（MSE）、结构级（SSIM）、感知级（VGG19 感知损失）上保持高度一致
 - **隐写分析对抗**：通过 GAN 对抗训练 + SpectralNorm 使隐写图像能逃逸隐写分析器的检测
-- **检索逃逸隐私保护**：利用 CLIP + DINOv2 多特征空间使隐写图像在语义特征层面与原图产生偏移，防止被 CBIR 系统检索关联
+- **有向重定向隐私保护**：利用 CLIP + DINOv2 多特征空间进行有向重定向，将隐写图像特征偏移至语义相近但不同的硬负样本目标，防止被 CBIR 系统检索关联
 - **检索攻击模拟**：内置带记忆库的检索攻击模型（RetrievalAttackerWithMemory），通过 InfoNCE 损失 + 硬负样本挖掘增强隐私鲁棒性
 - **统一特征空间三元组损失**：三元组损失在攻击者特征空间内统一计算（逃逸 + 重定向 + 排斥控制），避免跨空间梯度噪声
 - **噪声鲁棒性**：支持多种噪声层（裁剪、JPEG 压缩、量化等），保证消息在信道干扰下仍可提取
@@ -64,9 +64,10 @@ PrivSteg/
 
 ### 隐写分析器（Steganalyzer）
 
-- 8 层卷积（SpectralNorm）+ 全连接判别头
+- 8 层卷积（SpectralNorm）+ 全局平均池化 + 双层全连接判别头
 - 渐进式下采样：256 → 128 → 64 → 32 → 1
 - LeakyReLU(0.2) + Dropout(0.3)
+- FC 结构：512 → 256 → 1
 - 输出：图像是否为隐写图像的 logits
 
 ### 内容识别器（ContentRecognizer）
@@ -92,30 +93,42 @@ PrivSteg/
 | L\_perceptual | VGG19 感知损失（前18层，L1，ImageNet 归一化 + 空间/通道归一化） |
 | L\_message    | 消息提取 BCEWithLogits 损失                       |
 | L\_adv        | GAN 对抗损失（非饱和 + SpectralNorm）               |
-| L\_privacy    | 隐私保护损失（CLIP + DINOv2 Softplus 逃逸 + 攻击者空间三元组） |
-| L\_residual   | 残差惩罚项（编码图与原图 MSE）                          |
+| L\_privacy    | 隐私保护损失（CLIP + DINOv2 有向重定向 + 攻击者空间三元组） |
+| L\_residual   | 残差惩罚项（编码图与原图 MSE，控制隐写强度）                |
 
 ### 隐私损失详解
 
-隐私损失由 `RetrievalEscapeLoss` 聚合：
+隐私损失由 `RetrievalEscapeLoss` 聚合，包含两大组件：
 
-- **多模态特征逃逸**：CLIP (512d) + DINOv2 (384d) 各自的 Softplus Loss（`log1p(exp(sim - target))`）
-- **攻击者空间三元组损失**：统一在攻击者特征空间内计算
-  - 逃逸项：Softplus Loss 推动编码特征远离封面特征
-  - 吸引项：Hinge Loss 推动编码特征靠近硬负样本
-  - 排斥控制项：Hinge Loss 防止过度接近导致特征坍塌
+#### 1. 多模态有向重定向损失（`FeatureRedirectionLoss`）
 
-## 三阶段训练
+在 CLIP (512d) 和 DINOv2 (384d) 特征空间中分别计算：
+- **逃逸项**：Softplus Loss 推动编码图像特征远离原图特征
+- **重定向项**：Hinge Loss 推动编码图像特征靠近预选的硬负样本目标
+- **排斥控制项**：Hinge Loss 防止过度接近导致特征坍塌，维持语义多样性
+- **最大相似度上限**：`clip_max_target_sim=0.75` 限制重定向目标的最大允许相似度
+
+#### 2. 攻击者空间三元组损失（`RedirectionTripletLoss`）
+
+统一在检索攻击者特征空间内计算：
+- **逃逸项**：Softplus Loss 推动编码特征远离封面特征
+- **吸引项**：Hinge Loss 推动编码特征靠近硬负样本
+- **排斥控制项**：Hinge Loss 防止过度接近导致特征坍塌
+
+## 两阶段训练
 
 | 阶段      | Epoch | 目标               | 关键权重                                          |
 | ------- | ----- | ---------------- | --------------------------------------------- |
-| Phase 1 | 200   | 基础训练：视觉质量 + 消息提取 | visual=10, message=10, adv=0, privacy=0       |
-| Phase 2 | 100   | 对抗训练：加入隐写分析器对抗   | visual=10, message=10, adv=3, privacy=0       |
-| Phase 3 | 100   | 隐私训练：加入隐私保护损失    | visual=10, message=10, adv=3, privacy=10      |
+| Phase 1 | 300   | 基础训练：视觉质量 + 消息提取 + 渐进对抗 | visual=10, message=10, adv 渐进, privacy=0       |
+| Phase 2 | 100   | 隐私训练：加入隐私保护损失 + 检索攻击对抗 | visual=20, message=10, adv=5, privacy 渐进      |
 
 **记忆库预热**：Phase 1 开始前用 50 个 batch 的封面图像特征预填记忆库。
 
-**检索攻击者训练**：Phase 2 及之后使用 InfoNCE 损失训练攻击者（记忆库不足时退化为 MSE 损失）。
+**检索攻击者训练**：Phase 2 使用 InfoNCE 损失训练攻击者（记忆库不足时退化为 MSE 损失）。
+
+**阶段权重渐进调度**：
+- Phase 1 内 `adv` 权重分三段渐进放大（1× → 2× → 3×）
+- Phase 2 内 `privacy` 权重分三段渐进放大（1.0 → 3.0 → 10.0）
 
 ## 环境要求
 
@@ -170,9 +183,8 @@ python train.py new \
     --batch-size 8 \
     --size 256 \
     --message 30 \
-    --epochs-phase1 200 \
+    --epochs-phase1 300 \
     --epochs-phase2 100 \
-    --epochs-phase3 100 \
     --lr-encoder 1e-3 \
     --lr-decoder 1e-3 \
     --lr-steganalyzer 1e-3 \
@@ -242,12 +254,15 @@ python validation_script.py \
 | `lr_encoder`             | 1e-3              | 编码器学习率                              |
 | `lr_decoder`             | 1e-3              | 解码器学习率                              |
 | `lr_steganalyzer`        | 1e-3              | 隐写分析器学习率                            |
+| `num_epochs_phase1`      | 300               | Phase 1 训练轮数                         |
+| `num_epochs_phase2`      | 100               | Phase 2 训练轮数                         |
+| `discriminator_loss_threshold` | 0.1         | 判别器损失低于此值时暂停训练                    |
 | `use_advanced_privacy`   | True              | 是否启用高级隐私损失（CLIP + DINOv2 + 三元组）    |
 | `privacy_mode`           | retrieval\_escape | 隐私模式                                |
 | `clip_weight`            | 1.0               | CLIP 特征偏移损失权重                       |
-| `dino_weight`            | 0.5               | DINOv2 特征偏移损失权重（Config 默认值，Trainer 中实际使用 0.8） |
-| `triplet_weight`         | 0.15              | 三元组损失权重（Config 默认值，Trainer 中实际传入 0.5） |
-| `triplet_margin`         | 0.5               | 三元组 margin（Config 默认值，Trainer 中实际传入 0.3） |
+| `dino_weight`            | 0.5               | DINOv2 特征偏移损失权重（Trainer 中实际使用 0.8） |
+| `triplet_weight`         | 0.15              | 三元组损失权重（Trainer 中实际使用 0.5）        |
+| `triplet_margin`         | 0.5               | 三元组 margin（Trainer 中实际使用 0.3）         |
 | `use_retrieval_attacker` | True              | 是否启用检索攻击模型                          |
 | `attacker_feature_dim`   | 512               | 攻击模型特征维度                            |
 | `attacker_memory_size`   | 1000              | 记忆库大小                               |
@@ -255,8 +270,13 @@ python validation_script.py \
 | `attacker_weight`        | 0.5               | 攻击者逃逸损失权重                           |
 | `hard_negative_k`        | 5                 | 硬负样本候选数                             |
 | `memory_warmup_batches`  | 50                | 记忆库预热批次数                            |
-| `privacy_margin`         | 0.7               | 隐私损失间隔                              |
+| `privacy_margin`         | 0.5               | 隐私损失间隔（Softplus 边界）                  |
 | `noise_config`           | identity          | 噪声层配置                               |
+| `use_clip_redirect`      | True              | 启用 CLIP/DINO 有向重定向（仅 config.py 可调）   |
+| `clip_redirect_weight`   | 0.5               | CLIP 重定向损失权重                         |
+| `dino_redirect_weight`   | 0.3               | DINO 重定向损失权重                         |
+| `clip_redirect_margin`   | 0.6               | 重定向 margin                            |
+| `clip_max_target_sim`    | 0.75              | 最大允许目标相似度上限                         |
 
 ## 输出说明
 
@@ -271,7 +291,6 @@ experiments/my_experiment/
 │   ├── checkpoint_phase{N}_epoch{M}.pth  # 阶段性检查点
 │   ├── best_phase1.pth      # Phase 1 最佳模型
 │   ├── best_phase2.pth      # Phase 2 最佳模型
-│   ├── best_phase3.pth      # Phase 3 最佳模型
 │   └── visualizations/      # 验证可视化图像
 └── tensorboard/             # TensorBoard 日志
 ```
@@ -288,10 +307,11 @@ tensorboard --logdir ./experiments/my_experiment/tensorboard
 
 传统隐写方法仅关注视觉不可感知性和消息鲁棒性，但忽略了基于内容的图像检索（CBIR）威胁——攻击者可通过特征相似度检索将隐写图像关联到原始载体。PrivSteg 通过以下机制解决此问题：
 
-1. **多特征空间偏移**：同时在 CLIP（512d，语义理解）和 DINOv2（384d，细粒度纹理）特征空间中使用 Softplus Loss 推动隐写图像特征远离原图特征
+1. **多特征空间有向重定向**：同时在 CLIP（512d，语义理解）和 DINOv2（384d，细粒度纹理）特征空间中，不仅使用 Softplus Loss 推动隐写图像特征远离原图特征，还通过 Hinge Loss 将特征重定向至语义相近但不同的硬负样本目标，实现有方向的隐私偏移
 2. **统一空间三元组损失**：在攻击者特征空间内统一计算逃逸项（Softplus）+ 吸引项（Hinge）+ 排斥控制项（Hinge），避免跨特征空间梯度噪声
 3. **对抗检索攻击**：训练检索攻击模型模拟 CBIR 攻击者，通过 InfoNCE 损失增强攻击者的检索能力，从而在对抗中提升隐私保护强度
 4. **硬负样本挖掘**：从记忆库（MoCo 风格循环缓冲区）中动态选取 top-k 最相似样本，再选最难的 1 个作为三元组目标，增强判别能力
+5. **最大相似度上限控制**：通过 `clip_max_target_sim` 限制重定向目标的最大允许相似度，防止编码图像被重定向到与原图过于相似的样本，保证隐私偏移的有效性
 
 ### 噪声鲁棒性
 

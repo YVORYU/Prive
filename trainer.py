@@ -29,7 +29,7 @@ class FeatureMemoryBank:
 
     @torch.no_grad()
     def update(self, features):
-        features = F.normalize(features, p=2, dim=1)
+        features = F.normalize(features.float(), p=2, dim=1)
         batch_size = features.shape[0]
         ptr = self.memory_ptr
 
@@ -48,6 +48,7 @@ class FeatureMemoryBank:
         if self.memory_count == 0:
             return None
 
+        features = features.float()
         valid_memory = self.memory_bank[:self.memory_count]
         similarities = torch.mm(features, valid_memory.t())
         actual_k = min(k, self.memory_count)
@@ -129,8 +130,6 @@ class Trainer:
             else:
                 self.clip_memory_bank = None
 
-            self.dino_memory_bank = None
-            
             if self.dino_weight > 0:
                 dino_model_path = getattr(cfg, 'dino_model_path', None)
                 self.dino_model = timm.create_model('vit_small_patch14_dinov2.lvd142m', pretrained=False, num_classes=0, img_size=224)
@@ -165,6 +164,18 @@ class Trainer:
                     param.requires_grad = False
                 self.dino_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
                 self.dino_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
+
+                if self.use_clip_redirect:
+                    dino_feat_dim = 384
+                    self.dino_memory_bank = FeatureMemoryBank(
+                        feature_dim=dino_feat_dim,
+                        memory_size=getattr(cfg, 'clip_memory_size', 1000),
+                        device=self.device
+                    )
+                else:
+                    self.dino_memory_bank = None
+            else:
+                self.dino_memory_bank = None
             
             if hasattr(cfg, 'use_retrieval_attacker') and cfg.use_retrieval_attacker:
                 self.retrieval_attacker = RetrievalAttackerWithMemory(

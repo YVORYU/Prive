@@ -9,7 +9,7 @@ class Config:
 
     lr_encoder = 1e-3
     lr_decoder = 1e-3
-    lr_steganalyzer = 5e-5
+    lr_steganalyzer = 1e-3
 
     num_epochs_phase1 = 300
     num_epochs_phase2 = 100
@@ -48,7 +48,7 @@ class Config:
     use_clip_redirect = True
     clip_memory_size = 1000
     clip_hard_negative_k = 5
-    clip_redirect_margin = 0.6
+    clip_redirect_margin = 0.3
     clip_max_target_sim = 0.75
     clip_redirect_weight = 0.5
     dino_redirect_weight = 0.3
@@ -70,11 +70,11 @@ class Config:
             total = self.num_epochs_phase1
             third = total // 3
             if epoch <= third:
-                adv = 1.0
+                adv = self.lambda_adv
             elif epoch <= 2 * third:
-                adv = 2.0
+                adv = self.lambda_adv * 2
             else:
-                adv = 3.0
+                adv = self.lambda_adv * 3
             return {
                 'visual': 10.0,
                 'message': 10.0,
