@@ -6,7 +6,8 @@ import torch.nn.functional as F
 class FeatureRedirectionLoss(nn.Module):
     def __init__(self, clip_weight=1.0, dino_weight=0.5, escape_margin=0.7,
                  redirect_margin=0.6, max_target_sim=0.75,
-                 clip_redirect_weight=0.5, dino_redirect_weight=0.3):
+                 clip_redirect_weight=0.5, dino_redirect_weight=0.3,
+                 dino_redirect_margin=None, dino_max_target_sim=None):
         super().__init__()
         self.clip_weight = clip_weight
         self.dino_weight = dino_weight
@@ -15,6 +16,8 @@ class FeatureRedirectionLoss(nn.Module):
         self.max_target_sim = max_target_sim
         self.clip_redirect_weight = clip_redirect_weight
         self.dino_redirect_weight = dino_redirect_weight
+        self.dino_redirect_margin = dino_redirect_margin if dino_redirect_margin is not None else redirect_margin
+        self.dino_max_target_sim = dino_max_target_sim if dino_max_target_sim is not None else max_target_sim
 
     def escape_loss(self, feat_cover, feat_encoded):
         sim = F.cosine_similarity(feat_encoded, feat_cover, dim=1)
@@ -22,15 +25,18 @@ class FeatureRedirectionLoss(nn.Module):
         loss = torch.mean(torch.log1p(torch.exp(sim - target)))
         return loss
 
-    def directed_escape_loss(self, feat_cover, feat_encoded, feat_negatives=None):
+    def directed_escape_loss(self, feat_cover, feat_encoded, feat_negatives=None,
+                             redirect_margin=None, max_target_sim=None):
         escape = self.escape_loss(feat_cover, feat_encoded)
 
         if feat_negatives is None:
             return escape, torch.tensor(0.0, device=feat_cover.device), torch.tensor(0.0, device=feat_cover.device)
 
+        r_margin = redirect_margin if redirect_margin is not None else self.redirect_margin
+        m_sim = max_target_sim if max_target_sim is not None else self.max_target_sim
         sim_neg = F.cosine_similarity(feat_encoded, feat_negatives, dim=1)
-        redirect = torch.mean(torch.relu(self.redirect_margin - sim_neg))
-        control = torch.mean(torch.relu(sim_neg - self.max_target_sim))
+        redirect = torch.mean(torch.relu(r_margin - sim_neg))
+        control = torch.mean(torch.relu(sim_neg - m_sim))
 
         return escape, redirect, control
 
@@ -58,7 +64,9 @@ class FeatureRedirectionLoss(nn.Module):
         if dino_cover is not None and dino_encoded is not None:
             if dino_negatives is not None:
                 dino_escape, dino_redirect, dino_control = self.directed_escape_loss(
-                    dino_cover, dino_encoded, dino_negatives)
+                    dino_cover, dino_encoded, dino_negatives,
+                    redirect_margin=self.dino_redirect_margin,
+                    max_target_sim=self.dino_max_target_sim)
                 dino_loss = dino_escape + self.dino_redirect_weight * dino_redirect + 0.3 * dino_control
                 loss_dict['dino_escape'] = dino_escape.item()
                 loss_dict['dino_redirect'] = dino_redirect.item()
@@ -103,7 +111,8 @@ class RetrievalEscapeLoss(nn.Module):
     def __init__(self, clip_weight=1.0, dino_weight=0.5,
                  triplet_weight=0.15, margin=0.7, triplet_margin=0.5, attacker_weight=0.5,
                  redirect_margin=0.6, max_target_sim=0.75,
-                 clip_redirect_weight=0.5, dino_redirect_weight=0.3):
+                 clip_redirect_weight=0.5, dino_redirect_weight=0.3,
+                 dino_redirect_margin=None, dino_max_target_sim=None):
         super().__init__()
         self.clip_weight = clip_weight
         self.triplet_weight = triplet_weight
@@ -118,7 +127,9 @@ class RetrievalEscapeLoss(nn.Module):
             redirect_margin=redirect_margin,
             max_target_sim=max_target_sim,
             clip_redirect_weight=clip_redirect_weight,
-            dino_redirect_weight=dino_redirect_weight
+            dino_redirect_weight=dino_redirect_weight,
+            dino_redirect_margin=dino_redirect_margin,
+            dino_max_target_sim=dino_max_target_sim
         )
         self.triplet_loss = RedirectionTripletLoss(
             escape_margin=triplet_margin,

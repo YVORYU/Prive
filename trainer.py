@@ -112,10 +112,12 @@ class Trainer:
                 margin=cfg.privacy_margin,
                 triplet_margin=getattr(cfg, 'triplet_margin', 0.3),
                 attacker_weight=getattr(cfg, 'attacker_weight', 0.5),
-                redirect_margin=getattr(cfg, 'clip_redirect_margin', 0.6),
-                max_target_sim=getattr(cfg, 'clip_max_target_sim', 0.75),
+                redirect_margin=getattr(cfg, 'clip_redirect_margin', 0.3),
+                max_target_sim=getattr(cfg, 'clip_max_target_sim', 0.55),
                 clip_redirect_weight=getattr(cfg, 'clip_redirect_weight', 0.5),
-                dino_redirect_weight=getattr(cfg, 'dino_redirect_weight', 0.3)
+                dino_redirect_weight=getattr(cfg, 'dino_redirect_weight', 0.5),
+                dino_redirect_margin=getattr(cfg, 'dino_redirect_margin', 0.3),
+                dino_max_target_sim=getattr(cfg, 'dino_max_target_sim', None)
             ).to(self.device)
 
             self.use_clip_redirect = getattr(cfg, 'use_clip_redirect', False)
@@ -346,21 +348,19 @@ class Trainer:
             
             if self.clip_memory_bank is not None:
                 with torch.no_grad():
-                    clip_negatives = self.clip_memory_bank.get_hard_negatives(
-                        feat_cover, k=self.clip_hard_negative_k
-                    )
-                if self.clip_memory_bank.memory_count > 0:
-                    with torch.no_grad():
-                        self.clip_memory_bank.update(feat_cover)
+                    self.clip_memory_bank.update(feat_cover)
+                    if self.clip_memory_bank.memory_count > self.cfg.batch_size:
+                        clip_negatives = self.clip_memory_bank.get_hard_negatives(
+                            feat_cover, k=self.clip_hard_negative_k
+                        )
             
             if self.dino_memory_bank is not None and dino_cover is not None:
                 with torch.no_grad():
-                    dino_negatives = self.dino_memory_bank.get_hard_negatives(
-                        dino_cover, k=getattr(self.cfg, 'clip_hard_negative_k', 5)
-                    )
-                if self.dino_memory_bank.memory_count > 0:
-                    with torch.no_grad():
-                        self.dino_memory_bank.update(dino_cover)
+                    self.dino_memory_bank.update(dino_cover)
+                    if self.dino_memory_bank.memory_count > self.cfg.batch_size:
+                        dino_negatives = self.dino_memory_bank.get_hard_negatives(
+                            dino_cover, k=getattr(self.cfg, 'clip_hard_negative_k', 5)
+                        )
             
             if self.retrieval_attacker is not None:
                 with torch.no_grad():
