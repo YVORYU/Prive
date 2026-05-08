@@ -49,7 +49,7 @@ class Config:
     clip_memory_size = 1000
     clip_hard_negative_k = 5
     clip_redirect_margin = 0.3
-    clip_max_target_sim = 0.55
+    clip_max_target_sim = 0.85
     clip_redirect_weight = 0.5
     dino_redirect_weight = 0.5
     dino_redirect_margin = 0.3

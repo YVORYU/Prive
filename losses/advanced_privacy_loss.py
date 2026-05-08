@@ -35,7 +35,7 @@ class FeatureRedirectionLoss(nn.Module):
         r_margin = redirect_margin if redirect_margin is not None else self.redirect_margin
         m_sim = max_target_sim if max_target_sim is not None else self.max_target_sim
         sim_neg = F.cosine_similarity(feat_encoded, feat_negatives, dim=1)
-        redirect = torch.mean(torch.relu(r_margin - sim_neg))
+        redirect = torch.mean(torch.log1p(torch.exp(r_margin - sim_neg)))
         control = torch.mean(torch.relu(sim_neg - m_sim))
 
         return escape, redirect, control
@@ -98,7 +98,7 @@ class RedirectionTripletLoss(nn.Module):
 
         if feat_target is not None:
             sim_target = F.cosine_similarity(feat_encoded, feat_target, dim=1)
-            redirect_loss = torch.mean(torch.relu(self.redirect_margin - sim_target))
+            redirect_loss = torch.mean(torch.log1p(torch.exp(self.redirect_margin - sim_target)))
             control_loss = torch.mean(torch.relu(sim_target - self.max_target_sim))
             total_loss = escape_loss + redirect_loss + 0.3 * control_loss
         else:

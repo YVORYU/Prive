@@ -62,6 +62,13 @@ class FeatureMemoryBank:
 
         return hard_negatives
 
+    @torch.no_grad()
+    def get_random_negatives(self, batch_size):
+        if self.memory_count == 0:
+            return None
+        indices = torch.randint(0, self.memory_count, (batch_size,), device=self.device)
+        return self.memory_bank[indices]
+
     def state_dict(self):
         return {
             'memory_bank': self.memory_bank.cpu(),
@@ -113,7 +120,7 @@ class Trainer:
                 triplet_margin=getattr(cfg, 'triplet_margin', 0.3),
                 attacker_weight=getattr(cfg, 'attacker_weight', 0.5),
                 redirect_margin=getattr(cfg, 'clip_redirect_margin', 0.3),
-                max_target_sim=getattr(cfg, 'clip_max_target_sim', 0.55),
+                max_target_sim=getattr(cfg, 'clip_max_target_sim', 0.85),
                 clip_redirect_weight=getattr(cfg, 'clip_redirect_weight', 0.5),
                 dino_redirect_weight=getattr(cfg, 'dino_redirect_weight', 0.5),
                 dino_redirect_margin=getattr(cfg, 'dino_redirect_margin', 0.3),
@@ -348,19 +355,19 @@ class Trainer:
             
             if self.clip_memory_bank is not None:
                 with torch.no_grad():
-                    self.clip_memory_bank.update(feat_cover)
                     if self.clip_memory_bank.memory_count > self.cfg.batch_size:
-                        clip_negatives = self.clip_memory_bank.get_hard_negatives(
-                            feat_cover, k=self.clip_hard_negative_k
+                        clip_negatives = self.clip_memory_bank.get_random_negatives(
+                            batch_size=feat_cover.shape[0]
                         )
+                    self.clip_memory_bank.update(feat_cover)
             
             if self.dino_memory_bank is not None and dino_cover is not None:
                 with torch.no_grad():
-                    self.dino_memory_bank.update(dino_cover)
                     if self.dino_memory_bank.memory_count > self.cfg.batch_size:
-                        dino_negatives = self.dino_memory_bank.get_hard_negatives(
-                            dino_cover, k=getattr(self.cfg, 'clip_hard_negative_k', 5)
+                        dino_negatives = self.dino_memory_bank.get_random_negatives(
+                            batch_size=dino_cover.shape[0]
                         )
+                    self.dino_memory_bank.update(dino_cover)
             
             if self.retrieval_attacker is not None:
                 with torch.no_grad():
