@@ -7,7 +7,8 @@ class FeatureRedirectionLoss(nn.Module):
     def __init__(self, clip_weight=1.0, dino_weight=0.5, escape_margin=0.7,
                  redirect_margin=0.6, max_target_sim=0.75,
                  clip_redirect_weight=0.5, dino_redirect_weight=0.3,
-                 dino_redirect_margin=None, dino_max_target_sim=None):
+                 dino_redirect_margin=None, dino_max_target_sim=None,
+                 text_escape_weight=0.5):
         super().__init__()
         self.clip_weight = clip_weight
         self.dino_weight = dino_weight
@@ -18,6 +19,7 @@ class FeatureRedirectionLoss(nn.Module):
         self.dino_redirect_weight = dino_redirect_weight
         self.dino_redirect_margin = dino_redirect_margin if dino_redirect_margin is not None else redirect_margin
         self.dino_max_target_sim = dino_max_target_sim if dino_max_target_sim is not None else max_target_sim
+        self.text_escape_weight = text_escape_weight
 
     def escape_loss(self, feat_cover, feat_encoded):
         sim = F.cosine_similarity(feat_encoded, feat_cover, dim=1)
@@ -40,8 +42,13 @@ class FeatureRedirectionLoss(nn.Module):
 
         return escape, redirect, control
 
+    def text_guided_escape_loss(self, feat_encoded, text_anchors):
+        sim_text = F.cosine_similarity(feat_encoded, text_anchors, dim=1)
+        loss = torch.mean(1 - sim_text)
+        return loss
+
     def forward(self, clip_cover, clip_encoded, dino_cover=None, dino_encoded=None,
-                clip_negatives=None, dino_negatives=None):
+                clip_negatives=None, dino_negatives=None, text_anchors=None):
         total_loss = 0.0
         loss_dict = {}
 
@@ -57,6 +64,13 @@ class FeatureRedirectionLoss(nn.Module):
             loss_dict['clip_escape'] = clip_loss.item()
             loss_dict['clip_redirect'] = 0.0
             loss_dict['clip_control'] = 0.0
+
+        if text_anchors is not None:
+            text_loss = self.text_guided_escape_loss(clip_encoded, text_anchors)
+            clip_loss = clip_loss + self.text_escape_weight * text_loss
+            loss_dict['text_escape'] = text_loss.item()
+        else:
+            loss_dict['text_escape'] = 0.0
 
         total_loss += self.clip_weight * clip_loss
         loss_dict['clip_loss'] = clip_loss.item()
@@ -112,7 +126,8 @@ class RetrievalEscapeLoss(nn.Module):
                  triplet_weight=0.15, margin=0.7, triplet_margin=0.5, attacker_weight=0.5,
                  redirect_margin=0.6, max_target_sim=0.75,
                  clip_redirect_weight=0.5, dino_redirect_weight=0.3,
-                 dino_redirect_margin=None, dino_max_target_sim=None):
+                 dino_redirect_margin=None, dino_max_target_sim=None,
+                 text_escape_weight=0.5):
         super().__init__()
         self.clip_weight = clip_weight
         self.triplet_weight = triplet_weight
@@ -129,7 +144,8 @@ class RetrievalEscapeLoss(nn.Module):
             clip_redirect_weight=clip_redirect_weight,
             dino_redirect_weight=dino_redirect_weight,
             dino_redirect_margin=dino_redirect_margin,
-            dino_max_target_sim=dino_max_target_sim
+            dino_max_target_sim=dino_max_target_sim,
+            text_escape_weight=text_escape_weight
         )
         self.triplet_loss = RedirectionTripletLoss(
             escape_margin=triplet_margin,
@@ -140,12 +156,14 @@ class RetrievalEscapeLoss(nn.Module):
     def forward(self, feat_cover, feat_encoded, feat_negatives=None,
                 dino_cover=None, dino_encoded=None,
                 attacker_feat_cover=None, attacker_feat_encoded=None,
-                clip_negatives=None, dino_negatives=None):
+                clip_negatives=None, dino_negatives=None,
+                text_anchors=None):
         multi_loss, loss_dict = self.multi_feature_loss(
             feat_cover, feat_encoded,
             dino_cover, dino_encoded,
             clip_negatives=clip_negatives,
-            dino_negatives=dino_negatives
+            dino_negatives=dino_negatives,
+            text_anchors=text_anchors
         )
 
         total_loss = multi_loss

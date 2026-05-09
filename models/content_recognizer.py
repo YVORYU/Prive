@@ -42,3 +42,10 @@ class ContentRecognizer(nn.Module):
         image_features = self.clip_model.encode_image(image_resized)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         return image_features
+
+    def encode_text(self, text):
+        tokens = clip.tokenize(text, truncate=True).to(self._device)
+        with torch.no_grad():
+            text_features = self.clip_model.encode_text(tokens)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        return text_features

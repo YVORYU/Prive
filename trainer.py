@@ -119,13 +119,28 @@ class Trainer:
                 margin=cfg.privacy_margin,
                 triplet_margin=getattr(cfg, 'triplet_margin', 0.3),
                 attacker_weight=getattr(cfg, 'attacker_weight', 0.5),
-                redirect_margin=getattr(cfg, 'clip_redirect_margin', 0.3),
-                max_target_sim=getattr(cfg, 'clip_max_target_sim', 0.85),
-                clip_redirect_weight=getattr(cfg, 'clip_redirect_weight', 0.5),
-                dino_redirect_weight=getattr(cfg, 'dino_redirect_weight', 0.5),
-                dino_redirect_margin=getattr(cfg, 'dino_redirect_margin', 0.3),
-                dino_max_target_sim=getattr(cfg, 'dino_max_target_sim', None)
+                redirect_margin=getattr(cfg, 'clip_redirect_margin', 0.45),
+                max_target_sim=getattr(cfg, 'clip_max_target_sim', 0.55),
+                clip_redirect_weight=getattr(cfg, 'clip_redirect_weight', 0.3),
+                dino_redirect_weight=getattr(cfg, 'dino_redirect_weight', 0.2),
+                dino_redirect_margin=getattr(cfg, 'dino_redirect_margin', 0.45),
+                dino_max_target_sim=getattr(cfg, 'dino_max_target_sim', 0.55),
+                text_escape_weight=getattr(cfg, 'text_escape_weight', 0.5)
             ).to(self.device)
+
+            self.use_text_escape = getattr(cfg, 'use_text_escape', False)
+            self.text_escape_prompts = getattr(cfg, 'text_escape_prompts', [])
+            if self.use_text_escape and self.text_escape_prompts:
+                text_features = self.content_recognizer.encode_text(self.text_escape_prompts)
+                self.text_anchor_features = text_features.to(self.device)
+                self.text_anchor_count = len(self.text_escape_prompts)
+                print(f'Text escape enabled with {self.text_anchor_count} anchors')
+            else:
+                self.use_text_escape = False
+                self.text_anchor_features = None
+
+            self.use_ortho_grad = getattr(cfg, 'use_ortho_grad', False)
+            self.ortho_alpha = getattr(cfg, 'ortho_alpha', 0.3)
 
             self.use_clip_redirect = getattr(cfg, 'use_clip_redirect', False)
             if self.use_clip_redirect:
@@ -390,6 +405,12 @@ class Trainer:
                 attacker_feat_cover = self.retrieval_attacker(cover_image.detach())
                 attacker_feat_encoded = self.retrieval_attacker(encoded_image)
             
+            text_anchors = None
+            if self.use_text_escape and self.text_anchor_features is not None:
+                batch_size = feat_cover.shape[0]
+                anchor_indices = torch.randint(0, self.text_anchor_count, (batch_size,), device=self.device)
+                text_anchors = self.text_anchor_features[anchor_indices]
+
             L_privacy, privacy_loss_dict = self.retrieval_escape_loss(
                 feat_cover, feat_encoded,
                 feat_negatives=feat_negatives,
@@ -398,22 +419,71 @@ class Trainer:
                 attacker_feat_cover=attacker_feat_cover,
                 attacker_feat_encoded=attacker_feat_encoded,
                 clip_negatives=clip_negatives,
-                dino_negatives=dino_negatives
+                dino_negatives=dino_negatives,
+                text_anchors=text_anchors
             )
         else:
             L_privacy = self.privacy_loss(feat_cover, feat_encoded)
             privacy_loss_dict = {'privacy_loss': L_privacy.item()}
         
         residual_penalty_weight = weights.get('residual_penalty', 0.05)
-        #计算总损失，按权重加权
-        L_total = (weights['visual'] * (L_visual + weights['noised'] * L_visual_noised) +
-                  weights['message'] * L_message +
-                  weights['adv'] * L_adv +
-                  weights['privacy'] * L_privacy +
-                  residual_penalty_weight * residual_penalty)
-        
+        L_visual_weighted = weights['visual'] * (L_visual + weights['noised'] * L_visual_noised)
+        L_non_visual = (weights['message'] * L_message +
+                       weights['adv'] * L_adv +
+                       residual_penalty_weight * residual_penalty)
+        L_privacy_weighted = weights['privacy'] * L_privacy
+        L_total = L_visual_weighted + L_non_visual + L_privacy_weighted
+
         self.optimizer_encoder_decoder.zero_grad()
-        L_total.backward()
+
+        if (self.use_ortho_grad and phase >= 2 and
+                self.use_advanced_privacy and weights.get('privacy', 0) > 0):
+            L_visual_weighted.backward(retain_graph=True)
+            grad_visual = {}
+            for name, p in self.encoder.named_parameters():
+                if p.grad is not None:
+                    grad_visual[name] = p.grad.clone()
+
+            self.optimizer_encoder_decoder.zero_grad()
+            L_privacy_weighted.backward(retain_graph=True)
+            grad_privacy = {}
+            for name, p in self.encoder.named_parameters():
+                if p.grad is not None:
+                    grad_privacy[name] = p.grad.clone()
+
+            grad_ortho = {}
+            for name in grad_privacy:
+                gv = grad_visual.get(name)
+                gp = grad_privacy[name]
+                if gv is not None:
+                    dot = torch.dot(gp.flatten(), gv.flatten())
+                    norm_v_sq = torch.dot(gv.flatten(), gv.flatten()) + 1e-8
+                    proj = (dot / norm_v_sq) * gv
+                    grad_ortho[name] = gp - (1 - self.ortho_alpha) * proj
+                else:
+                    grad_ortho[name] = gp
+
+            self.optimizer_encoder_decoder.zero_grad()
+            L_non_visual.backward(retain_graph=False)
+
+            for name, p in self.encoder.named_parameters():
+                gv = grad_visual.get(name)
+                go = grad_ortho.get(name)
+                if p.grad is not None:
+                    if gv is not None:
+                        p.grad = p.grad + gv
+                    if go is not None:
+                        p.grad = p.grad + go
+                else:
+                    total = torch.zeros_like(p.data)
+                    if gv is not None:
+                        total = total + gv
+                    if go is not None:
+                        total = total + go
+                    if gv is not None or go is not None:
+                        p.grad = total
+        else:
+            L_total.backward()
         
         #梯度裁剪，防止梯度爆炸
         torch.nn.utils.clip_grad_norm_(list(self.encoder.parameters()) + list(self.decoder.parameters()), max_norm=1.0)

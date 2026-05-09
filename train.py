@@ -67,7 +67,11 @@ def save_config(config_path, cfg):
         'clip_redirect_margin': cfg.clip_redirect_margin,
         'clip_max_target_sim': cfg.clip_max_target_sim,
         'clip_redirect_weight': cfg.clip_redirect_weight,
-        'dino_redirect_weight': cfg.dino_redirect_weight
+        'dino_redirect_weight': cfg.dino_redirect_weight,
+        'use_text_escape': cfg.use_text_escape,
+        'text_escape_weight': cfg.text_escape_weight,
+        'use_ortho_grad': cfg.use_ortho_grad,
+        'ortho_alpha': cfg.ortho_alpha
     }
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config_dict, f, indent=4)
@@ -132,7 +136,11 @@ def setup_logger(log_file, cfg, append=False):
             'clip_redirect_margin': cfg.clip_redirect_margin,
             'clip_max_target_sim': cfg.clip_max_target_sim,
             'clip_redirect_weight': cfg.clip_redirect_weight,
-            'dino_redirect_weight': cfg.dino_redirect_weight
+            'dino_redirect_weight': cfg.dino_redirect_weight,
+            'use_text_escape': cfg.use_text_escape,
+            'text_escape_weight': cfg.text_escape_weight,
+            'use_ortho_grad': cfg.use_ortho_grad,
+            'ortho_alpha': cfg.ortho_alpha
         }
         for key, value in config_dict.items():
             f.write(f"  {key}: {value}\n")

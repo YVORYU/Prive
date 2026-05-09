@@ -48,11 +48,28 @@ class Config:
     use_clip_redirect = True
     clip_memory_size = 1000
     clip_hard_negative_k = 5
-    clip_redirect_margin = 0.3
-    clip_max_target_sim = 0.85
-    clip_redirect_weight = 0.5
-    dino_redirect_weight = 0.5
-    dino_redirect_margin = 0.3
+    clip_redirect_margin = 0.45
+    clip_max_target_sim = 0.55
+    clip_redirect_weight = 0.3
+    dino_redirect_weight = 0.2
+    dino_redirect_margin = 0.45
+    dino_max_target_sim = 0.55
+
+    use_text_escape = True
+    text_escape_weight = 0.5
+    text_escape_prompts = [
+        "a photo of a mountain landscape",
+        "a photo of an ocean sunset",
+        "a photo of a dense forest",
+        "a photo of a desert sand dune",
+        "a photo of a city skyline at night",
+        "a photo of a snowy field",
+        "a photo of a calm lake reflection",
+        "a photo of a flower garden",
+    ]
+
+    use_ortho_grad = True
+    ortho_alpha = 0.3
 
     data_dir = None
     train_dir = 'train'
