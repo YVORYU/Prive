@@ -11,7 +11,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import save_image, make_grid
 
 from models import Encoder, Decoder, Steganalyzer, ContentRecognizer, RetrievalAttackerWithMemory
-from losses import SSIMLoss, PerceptualLoss, PrivacyLoss, RetrievalEscapeLoss
+from losses import SSIMLoss, PerceptualLoss, PrivacyLoss, SimpleEscapeLoss
 from data import SteganographyDataset
 from noise_layers.noiser import Noiser
 from noise_argparser import NoiseArgParser
@@ -89,7 +89,7 @@ class Trainer:
         #初始化日志记录器
         self.writer = SummaryWriter(cfg.log_dir)
         #定义编码器、解码器、判别器和内容识别器(冻结参数，不进行训练)
-        self.encoder = Encoder(message_length=cfg.message_length, n_channels=3, image_size=cfg.image_size).to(self.device)
+        self.encoder = Encoder(message_length=cfg.message_length, n_channels=3, image_size=cfg.image_size, pixel_budget=cfg.pixel_budget).to(self.device)
         self.decoder = Decoder(message_length=cfg.message_length, n_channels=3).to(self.device)
         self.steganalyzer = Steganalyzer(n_channels=3, use_spectral_norm=True).to(self.device)
         self.content_recognizer = ContentRecognizer(device=self.device).to(self.device)
@@ -112,47 +112,22 @@ class Trainer:
         if hasattr(cfg, 'use_advanced_privacy') and cfg.use_advanced_privacy:
             self.use_advanced_privacy = True
             self.dino_weight = getattr(cfg, 'dino_weight', 0.8)
-            self.retrieval_escape_loss = RetrievalEscapeLoss(
+            self.retrieval_escape_loss = SimpleEscapeLoss(
                 clip_weight=getattr(cfg, 'clip_weight', 1.0),
                 dino_weight=self.dino_weight,
-                triplet_weight=getattr(cfg, 'triplet_weight', 0.5),
-                margin=cfg.privacy_margin,
-                triplet_margin=getattr(cfg, 'triplet_margin', 0.3),
-                attacker_weight=getattr(cfg, 'attacker_weight', 0.5),
-                redirect_margin=getattr(cfg, 'clip_redirect_margin', 0.45),
-                max_target_sim=getattr(cfg, 'clip_max_target_sim', 0.55),
-                clip_redirect_weight=getattr(cfg, 'clip_redirect_weight', 0.3),
-                dino_redirect_weight=getattr(cfg, 'dino_redirect_weight', 0.2),
-                dino_redirect_margin=getattr(cfg, 'dino_redirect_margin', 0.45),
-                dino_max_target_sim=getattr(cfg, 'dino_max_target_sim', 0.55),
-                text_escape_weight=getattr(cfg, 'text_escape_weight', 0.5)
+                escape_margin=cfg.privacy_margin
             ).to(self.device)
 
-            self.use_text_escape = getattr(cfg, 'use_text_escape', False)
-            self.text_escape_prompts = getattr(cfg, 'text_escape_prompts', [])
-            if self.use_text_escape and self.text_escape_prompts:
-                text_features = self.content_recognizer.encode_text(self.text_escape_prompts)
-                self.text_anchor_features = text_features.to(self.device)
-                self.text_anchor_count = len(self.text_escape_prompts)
-                print(f'Text escape enabled with {self.text_anchor_count} anchors')
-            else:
-                self.use_text_escape = False
-                self.text_anchor_features = None
+            self.use_text_escape = False
+            self.text_anchor_features = None
 
-            self.use_ortho_grad = getattr(cfg, 'use_ortho_grad', False)
-            self.ortho_alpha = getattr(cfg, 'ortho_alpha', 0.3)
+            self.use_ortho_grad = False
+            self.ortho_alpha = 0.0
 
-            self.use_clip_redirect = getattr(cfg, 'use_clip_redirect', False)
-            if self.use_clip_redirect:
-                clip_feat_dim = 512
-                self.clip_memory_bank = FeatureMemoryBank(
-                    feature_dim=clip_feat_dim,
-                    memory_size=getattr(cfg, 'clip_memory_size', 1000),
-                    device=self.device
-                )
-                self.clip_hard_negative_k = getattr(cfg, 'clip_hard_negative_k', 5)
-            else:
-                self.clip_memory_bank = None
+            self.use_clip_redirect = False
+            self.clip_memory_bank = None
+
+            self.dino_memory_bank = None
 
             if self.dino_weight > 0:
                 dino_model_path = getattr(cfg, 'dino_model_path', None)
@@ -188,24 +163,16 @@ class Trainer:
                     param.requires_grad = False
                 self.dino_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
                 self.dino_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
-
-                if self.use_clip_redirect:
-                    dino_feat_dim = 384
-                    self.dino_memory_bank = FeatureMemoryBank(
-                        feature_dim=dino_feat_dim,
-                        memory_size=getattr(cfg, 'clip_memory_size', 1000),
-                        device=self.device
-                    )
-                else:
-                    self.dino_memory_bank = None
             else:
-                self.dino_memory_bank = None
-            
-            if hasattr(cfg, 'use_retrieval_attacker') and cfg.use_retrieval_attacker:
+                self.dino_model = None
+
+            self.use_retrieval_attacker = getattr(cfg, 'use_retrieval_attacker', False)
+            if self.use_retrieval_attacker:
+                attacker_feat_dim = getattr(cfg, 'attacker_feature_dim', 512)
                 self.retrieval_attacker = RetrievalAttackerWithMemory(
-                    feature_dim=getattr(cfg, 'attacker_feature_dim', 512),
+                    feature_dim=attacker_feat_dim,
                     memory_size=getattr(cfg, 'attacker_memory_size', 1000),
-                    temperature=getattr(cfg, 'attacker_temperature', 0.07)
+                    device=self.device
                 ).to(self.device)
                 self.optimizer_attacker = optim.Adam(
                     self.retrieval_attacker.parameters(), 
@@ -357,70 +324,13 @@ class Trainer:
         feat_encoded = self.content_recognizer(encoded_image)
         
         if self.use_advanced_privacy:
-            feat_negatives = None
-            attacker_feat_cover = None
-            attacker_feat_encoded = None
-            dino_cover = None
-            dino_encoded = None
-            clip_negatives = None
-            dino_negatives = None
-            
             dino_cover = self.extract_dino_features(cover_image)
             dino_encoded = self.extract_dino_features(encoded_image)
-            
-            if self.clip_memory_bank is not None:
-                with torch.no_grad():
-                    if self.clip_memory_bank.memory_count > self.cfg.batch_size:
-                        clip_negatives = self.clip_memory_bank.get_random_negatives(
-                            batch_size=feat_cover.shape[0]
-                        )
-                    self.clip_memory_bank.update(feat_cover)
-            
-            if self.dino_memory_bank is not None and dino_cover is not None:
-                with torch.no_grad():
-                    if self.dino_memory_bank.memory_count > self.cfg.batch_size:
-                        dino_negatives = self.dino_memory_bank.get_random_negatives(
-                            batch_size=dino_cover.shape[0]
-                        )
-                    self.dino_memory_bank.update(dino_cover)
-            
-            if self.retrieval_attacker is not None:
-                with torch.no_grad():
-                    attacker_feat_cover_for_negatives = self.retrieval_attacker(cover_image)
-                
-                if hasattr(self.cfg, 'use_hard_negatives') and self.cfg.use_hard_negatives:
-                    feat_negatives = self.retrieval_attacker.get_hard_negatives(
-                        attacker_feat_cover_for_negatives, k=getattr(self.cfg, 'hard_negative_k', 5)
-                    )
-                    if feat_negatives is not None:
-                        if feat_negatives.dim() == 3:
-                            similarities = F.cosine_similarity(
-                                attacker_feat_cover_for_negatives.unsqueeze(1),
-                                feat_negatives,
-                                dim=2
-                            )
-                            hardest_idx = similarities.argmax(dim=1)
-                            feat_negatives = feat_negatives[torch.arange(feat_negatives.size(0)), hardest_idx]
-                
-                attacker_feat_cover = self.retrieval_attacker(cover_image.detach())
-                attacker_feat_encoded = self.retrieval_attacker(encoded_image)
-            
-            text_anchors = None
-            if self.use_text_escape and self.text_anchor_features is not None:
-                batch_size = feat_cover.shape[0]
-                anchor_indices = torch.randint(0, self.text_anchor_count, (batch_size,), device=self.device)
-                text_anchors = self.text_anchor_features[anchor_indices]
 
             L_privacy, privacy_loss_dict = self.retrieval_escape_loss(
                 feat_cover, feat_encoded,
-                feat_negatives=feat_negatives,
                 dino_cover=dino_cover,
-                dino_encoded=dino_encoded,
-                attacker_feat_cover=attacker_feat_cover,
-                attacker_feat_encoded=attacker_feat_encoded,
-                clip_negatives=clip_negatives,
-                dino_negatives=dino_negatives,
-                text_anchors=text_anchors
+                dino_encoded=dino_encoded
             )
         else:
             L_privacy = self.privacy_loss(feat_cover, feat_encoded)
@@ -435,87 +345,11 @@ class Trainer:
         L_total = L_visual_weighted + L_non_visual + L_privacy_weighted
 
         self.optimizer_encoder_decoder.zero_grad()
-
-        if (self.use_ortho_grad and phase >= 2 and
-                self.use_advanced_privacy and weights.get('privacy', 0) > 0):
-            L_visual_weighted.backward(retain_graph=True)
-            grad_visual = {}
-            for name, p in self.encoder.named_parameters():
-                if p.grad is not None:
-                    grad_visual[name] = p.grad.clone()
-
-            self.optimizer_encoder_decoder.zero_grad()
-            L_privacy_weighted.backward(retain_graph=True)
-            grad_privacy = {}
-            for name, p in self.encoder.named_parameters():
-                if p.grad is not None:
-                    grad_privacy[name] = p.grad.clone()
-
-            grad_ortho = {}
-            for name in grad_privacy:
-                gv = grad_visual.get(name)
-                gp = grad_privacy[name]
-                if gv is not None:
-                    dot = torch.dot(gp.flatten(), gv.flatten())
-                    norm_v_sq = torch.dot(gv.flatten(), gv.flatten()) + 1e-8
-                    proj = (dot / norm_v_sq) * gv
-                    grad_ortho[name] = gp - (1 - self.ortho_alpha) * proj
-                else:
-                    grad_ortho[name] = gp
-
-            self.optimizer_encoder_decoder.zero_grad()
-            L_non_visual.backward(retain_graph=False)
-
-            for name, p in self.encoder.named_parameters():
-                gv = grad_visual.get(name)
-                go = grad_ortho.get(name)
-                if p.grad is not None:
-                    if gv is not None:
-                        p.grad = p.grad + gv
-                    if go is not None:
-                        p.grad = p.grad + go
-                else:
-                    total = torch.zeros_like(p.data)
-                    if gv is not None:
-                        total = total + gv
-                    if go is not None:
-                        total = total + go
-                    if gv is not None or go is not None:
-                        p.grad = total
-        else:
-            L_total.backward()
+        L_total.backward()
         
-        #梯度裁剪，防止梯度爆炸
         torch.nn.utils.clip_grad_norm_(list(self.encoder.parameters()) + list(self.decoder.parameters()), max_norm=1.0)
         
         self.optimizer_encoder_decoder.step()
-        
-        if self.use_advanced_privacy and self.retrieval_attacker is not None and phase >= 2:
-            attacker_feat_cover_new = self.retrieval_attacker(cover_image.detach())
-            attacker_feat_encoded_new = self.retrieval_attacker(encoded_image.detach())
-            
-            valid_count = int(self.retrieval_attacker.memory_count[0])
-            temperature = getattr(self.cfg, 'attacker_temperature', 0.07)
-            
-            if valid_count >= self.cfg.batch_size:
-                valid_memory = self.retrieval_attacker.memory_bank[:valid_count].detach()
-                
-                pos_sim = torch.sum(attacker_feat_encoded_new * attacker_feat_cover_new.detach(), dim=1, keepdim=True) / temperature
-                neg_sim = torch.mm(attacker_feat_encoded_new, valid_memory.t()) / temperature
-                
-                logits = torch.cat([pos_sim, neg_sim], dim=1)
-                labels = torch.zeros(logits.size(0), dtype=torch.long, device=self.device)
-                L_attacker = F.cross_entropy(logits, labels)
-            else:
-                L_attacker = F.mse_loss(attacker_feat_encoded_new, attacker_feat_cover_new.detach())
-            
-            self.optimizer_attacker.zero_grad()
-            L_attacker.backward()
-            torch.nn.utils.clip_grad_norm_(self.retrieval_attacker.parameters(), max_norm=1.0)
-            self.optimizer_attacker.step()
-            
-            with torch.no_grad():
-                self.retrieval_attacker.update_memory(attacker_feat_cover_new)
         
         with torch.no_grad():
             message_pred_binary = (torch.sigmoid(message_pred) > 0.5).float()
@@ -620,56 +454,13 @@ class Trainer:
                 feat_encoded = self.content_recognizer(encoded_image)
                 
                 if self.use_advanced_privacy:
-                    feat_negatives = None
-                    attacker_feat_cover = None
-                    attacker_feat_encoded = None
-                    dino_cover = None
-                    dino_encoded = None
-                    clip_negatives = None
-                    dino_negatives = None
-                    
                     dino_cover = self.extract_dino_features(cover_image)
                     dino_encoded = self.extract_dino_features(encoded_image)
-                    
-                    if self.clip_memory_bank is not None:
-                        with torch.no_grad():
-                            clip_negatives = self.clip_memory_bank.get_hard_negatives(
-                                feat_cover, k=self.clip_hard_negative_k
-                            )
-                    
-                    if self.dino_memory_bank is not None and dino_cover is not None:
-                        with torch.no_grad():
-                            dino_negatives = self.dino_memory_bank.get_hard_negatives(
-                                dino_cover, k=getattr(self.cfg, 'clip_hard_negative_k', 5)
-                            )
-                    
-                    if self.retrieval_attacker is not None:
-                        attacker_feat_cover = self.retrieval_attacker(cover_image.detach())
-                        attacker_feat_encoded = self.retrieval_attacker(encoded_image.detach())
-                        
-                        if hasattr(self.cfg, 'use_hard_negatives') and self.cfg.use_hard_negatives:
-                            feat_negatives = self.retrieval_attacker.get_hard_negatives(
-                                attacker_feat_cover, k=getattr(self.cfg, 'hard_negative_k', 5)
-                            )
-                            if feat_negatives is not None:
-                                if feat_negatives.dim() == 3:
-                                    sim = F.cosine_similarity(
-                                        attacker_feat_cover.unsqueeze(1),
-                                        feat_negatives,
-                                        dim=2
-                                    )
-                                    hardest_idx = sim.argmax(dim=1)
-                                    feat_negatives = feat_negatives[torch.arange(feat_negatives.size(0)), hardest_idx]
-                    
+
                     L_privacy, _ = self.retrieval_escape_loss(
                         feat_cover, feat_encoded,
-                        feat_negatives=feat_negatives,
                         dino_cover=dino_cover,
-                        dino_encoded=dino_encoded,
-                        attacker_feat_cover=attacker_feat_cover,
-                        attacker_feat_encoded=attacker_feat_encoded,
-                        clip_negatives=clip_negatives,
-                        dino_negatives=dino_negatives
+                        dino_encoded=dino_encoded
                     )
                 else:
                     L_privacy = self.privacy_loss(feat_cover, feat_encoded)

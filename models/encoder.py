@@ -17,13 +17,14 @@ class ConvBNRelu(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, message_length=30, n_channels=3, bilinear=False,image_size=256):
+    def __init__(self, message_length=30, n_channels=3, bilinear=False, image_size=256, pixel_budget=0.08):
         super(Encoder, self).__init__()
         self.message_length = message_length
         self.n_channels = n_channels
         self.bilinear = bilinear
         self.H = image_size
         self.W = image_size
+        self.pixel_budget = pixel_budget
 
         channels = 64
         num_blocks = 8
@@ -49,10 +50,12 @@ class Encoder(nn.Module):
 
         im_w = self.after_concat_layer(concat)
 
-        encoded_image = self.final_layer(im_w)
+        residual = self.final_layer(im_w)
+        residual = self.pixel_budget * torch.tanh(residual)
 
-        encoded_image = torch.tanh(encoded_image)
+        encoded_image = cover_image + residual
+        encoded_image = torch.clamp(encoded_image, -1, 1)
 
-        residual_penalty = torch.mean((encoded_image - cover_image) ** 2)
+        residual_penalty = torch.mean(residual ** 2)
 
         return encoded_image, residual_penalty

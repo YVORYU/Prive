@@ -71,7 +71,8 @@ def save_config(config_path, cfg):
         'use_text_escape': cfg.use_text_escape,
         'text_escape_weight': cfg.text_escape_weight,
         'use_ortho_grad': cfg.use_ortho_grad,
-        'ortho_alpha': cfg.ortho_alpha
+        'ortho_alpha': cfg.ortho_alpha,
+        'pixel_budget': cfg.pixel_budget
     }
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config_dict, f, indent=4)
@@ -140,7 +141,8 @@ def setup_logger(log_file, cfg, append=False):
             'use_text_escape': cfg.use_text_escape,
             'text_escape_weight': cfg.text_escape_weight,
             'use_ortho_grad': cfg.use_ortho_grad,
-            'ortho_alpha': cfg.ortho_alpha
+            'ortho_alpha': cfg.ortho_alpha,
+            'pixel_budget': cfg.pixel_budget
         }
         for key, value in config_dict.items():
             f.write(f"  {key}: {value}\n")
@@ -210,6 +212,10 @@ def run_training_loop(trainer, train_loader, val_loader, cfg, start_phase, start
             trainer.encoder.train()
             trainer.decoder.train()
             trainer.steganalyzer.train()
+            
+            # 更新隐私损失的当前epoch，用于自适应margin
+            if hasattr(trainer, 'retrieval_escape_loss') and trainer.retrieval_escape_loss is not None:
+                trainer.retrieval_escape_loss.set_epoch(epoch)
             
             epoch_losses = {}
             num_batches = 0
@@ -306,7 +312,7 @@ def main():
     new_run_parser.add_argument('--lambda-perceptual', type=float, default=config.Config.lambda_perceptual,
                                 help='Weight for perceptual loss.')
     new_run_parser.add_argument('--use-perceptual-loss', dest='use_perceptual_loss', action='store_true',
-                                default=True,
+                                default=False,
                                 help='Enable VGG perceptual loss (disabled by default).')
     new_run_parser.add_argument('--lambda-message', type=float, default=config.Config.lambda_message,
                                 help='Weight for message loss.')
