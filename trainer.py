@@ -1,5 +1,4 @@
 import os
-import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,8 +9,8 @@ import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import save_image, make_grid
 
-from models import Encoder, Decoder, Steganalyzer, ContentRecognizer, RetrievalAttackerWithMemory
-from losses import SSIMLoss, PerceptualLoss, PrivacyLoss, SimpleEscapeLoss
+from models import Encoder, Decoder, Steganalyzer, ContentRecognizer
+from losses import SSIMLoss, FeatureRedirectionLoss
 from data import SteganographyDataset
 from noise_layers.noiser import Noiser
 from noise_argparser import NoiseArgParser
@@ -55,19 +54,7 @@ class FeatureMemoryBank:
         _, indices = similarities.topk(actual_k, dim=1)
         hard_negatives = valid_memory[indices]
 
-        if hard_negatives.dim() == 3:
-            sims = F.cosine_similarity(features.unsqueeze(1), hard_negatives, dim=2)
-            hardest_idx = sims.argmax(dim=1)
-            hard_negatives = hard_negatives[torch.arange(hard_negatives.size(0)), hardest_idx]
-
         return hard_negatives
-
-    @torch.no_grad()
-    def get_random_negatives(self, batch_size):
-        if self.memory_count == 0:
-            return None
-        indices = torch.randint(0, self.memory_count, (batch_size,), device=self.device)
-        return self.memory_bank[indices]
 
     def state_dict(self):
         return {
@@ -86,105 +73,98 @@ class Trainer:
     def __init__(self, cfg):
         self.cfg = cfg
         self.device = cfg.device
-        #初始化日志记录器
         self.writer = SummaryWriter(cfg.log_dir)
-        #定义编码器、解码器、判别器和内容识别器(冻结参数，不进行训练)
-        self.encoder = Encoder(message_length=cfg.message_length, n_channels=3, image_size=cfg.image_size, pixel_budget=cfg.pixel_budget).to(self.device)
+
+        self.encoder = Encoder(
+            message_length=cfg.message_length,
+            n_channels=3,
+            image_size=cfg.image_size,
+            msg_budget=cfg.msg_budget,
+            prv_budget=cfg.prv_budget
+        ).to(self.device)
         self.decoder = Decoder(message_length=cfg.message_length, n_channels=3).to(self.device)
         self.steganalyzer = Steganalyzer(n_channels=3, use_spectral_norm=True).to(self.device)
         self.content_recognizer = ContentRecognizer(device=self.device).to(self.device)
-        #定义优化器
+
         self.optimizer_encoder_decoder = optim.Adam([
             {"params": self.encoder.parameters(), "lr": cfg.lr_encoder},
             {"params": self.decoder.parameters(), "lr": cfg.lr_decoder},
         ])
         self.optimizer_steganalyzer = optim.Adam(self.steganalyzer.parameters(), lr=cfg.lr_steganalyzer)
-        #定义损失函数
+
         self.ssim_loss = SSIMLoss().to(self.device)
-        self.use_perceptual_loss = getattr(cfg, 'use_perceptual_loss', False)
-        if self.use_perceptual_loss:
-            self.perceptual_loss = PerceptualLoss().to(self.device)
-        self.privacy_loss = PrivacyLoss(margin=cfg.privacy_margin).to(self.device)
         self.mse_loss = nn.MSELoss()
-        self.bce_loss = nn.BCELoss()
         self.bce_with_logits_loss = nn.BCEWithLogitsLoss()
-        
-        if hasattr(cfg, 'use_advanced_privacy') and cfg.use_advanced_privacy:
-            self.use_advanced_privacy = True
-            self.dino_weight = getattr(cfg, 'dino_weight', 0.8)
-            self.retrieval_escape_loss = SimpleEscapeLoss(
-                clip_weight=getattr(cfg, 'clip_weight', 1.0),
-                dino_weight=self.dino_weight,
-                escape_margin=cfg.privacy_margin
-            ).to(self.device)
 
-            self.use_text_escape = False
-            self.text_anchor_features = None
+        self.retrieval_escape_loss = FeatureRedirectionLoss(
+            clip_weight=cfg.clip_weight,
+            dino_weight=cfg.dino_weight,
+            escape_margin=cfg.privacy_margin_start,
+            clip_redirect_weight=cfg.clip_redirect_weight,
+            dino_redirect_weight=cfg.dino_redirect_weight,
+            clip_redirect_margin=cfg.clip_redirect_margin,
+            dino_redirect_margin=cfg.dino_redirect_margin,
+            clip_max_target_sim=cfg.clip_max_target_sim,
+            dino_max_target_sim=cfg.dino_max_target_sim
+        ).to(self.device)
 
-            self.use_ortho_grad = False
-            self.ortho_alpha = 0.0
+        self.use_clip_redirect = cfg.use_clip_redirect
+        self.clip_memory_bank = None
+        self.dino_memory_bank = None
 
-            self.use_clip_redirect = False
-            self.clip_memory_bank = None
+        if self.use_clip_redirect:
+            self.clip_memory_bank = FeatureMemoryBank(
+                feature_dim=512,
+                memory_size=cfg.clip_memory_size,
+                device=self.device
+            )
+            self.clip_hard_negative_k = cfg.clip_hard_negative_k
 
-            self.dino_memory_bank = None
+        self.dino_weight = cfg.dino_weight
+        if self.dino_weight > 0:
+            dino_model_path = getattr(cfg, 'dino_model_path', None)
+            self.dino_model = timm.create_model('vit_small_patch14_dinov2.lvd142m', pretrained=False, num_classes=0, img_size=224)
+            if dino_model_path and os.path.exists(dino_model_path):
+                state_dict = torch.load(dino_model_path, map_location=self.device)
+                if isinstance(state_dict, dict) and 'state_dict' in state_dict:
+                    state_dict = state_dict['state_dict']
+                elif isinstance(state_dict, dict) and 'model' in state_dict:
+                    state_dict = state_dict['model']
 
-            if self.dino_weight > 0:
-                dino_model_path = getattr(cfg, 'dino_model_path', None)
-                self.dino_model = timm.create_model('vit_small_patch14_dinov2.lvd142m', pretrained=False, num_classes=0, img_size=224)
-                if dino_model_path and os.path.exists(dino_model_path):
-                    state_dict = torch.load(dino_model_path, map_location=self.device)
-                    if isinstance(state_dict, dict) and 'state_dict' in state_dict:
-                        state_dict = state_dict['state_dict']
-                    elif isinstance(state_dict, dict) and 'model' in state_dict:
-                        state_dict = state_dict['model']
-                    
-                    model_pos_embed = self.dino_model.pos_embed.data
-                    ckpt_pos_embed = state_dict.get('pos_embed', None)
-                    if ckpt_pos_embed is not None and ckpt_pos_embed.shape != model_pos_embed.shape:
-                        cls_token = ckpt_pos_embed[:, :1, :]
-                        patch_embed = ckpt_pos_embed[:, 1:, :]
-                        embed_dim = patch_embed.shape[-1]
-                        orig_grid_size = int(patch_embed.shape[1] ** 0.5)
-                        new_grid_size = int((model_pos_embed.shape[1] - 1) ** 0.5)
-                        patch_embed = patch_embed.reshape(1, orig_grid_size, orig_grid_size, embed_dim).permute(0, 3, 1, 2)
-                        patch_embed = F.interpolate(patch_embed, size=(new_grid_size, new_grid_size), mode='bicubic', align_corners=False)
-                        patch_embed = patch_embed.permute(0, 2, 3, 1).reshape(1, new_grid_size * new_grid_size, embed_dim)
-                        state_dict['pos_embed'] = torch.cat([cls_token, patch_embed], dim=1)
-                        print(f'DINOv2 pos_embed interpolated from {orig_grid_size}x{orig_grid_size} to {new_grid_size}x{new_grid_size}')
-                    
-                    self.dino_model.load_state_dict(state_dict, strict=False)
-                    print(f'DINOv2 model loaded from {dino_model_path}')
-                else:
-                    print(f'Warning: DINOv2 model not found at {dino_model_path}, using random initialization')
-                self.dino_model = self.dino_model.to(self.device)
-                self.dino_model.eval()
-                for param in self.dino_model.parameters():
-                    param.requires_grad = False
-                self.dino_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
-                self.dino_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
+                model_pos_embed = self.dino_model.pos_embed.data
+                ckpt_pos_embed = state_dict.get('pos_embed', None)
+                if ckpt_pos_embed is not None and ckpt_pos_embed.shape != model_pos_embed.shape:
+                    cls_token = ckpt_pos_embed[:, :1, :]
+                    patch_embed = ckpt_pos_embed[:, 1:, :]
+                    embed_dim = patch_embed.shape[-1]
+                    orig_grid_size = int(patch_embed.shape[1] ** 0.5)
+                    new_grid_size = int((model_pos_embed.shape[1] - 1) ** 0.5)
+                    patch_embed = patch_embed.reshape(1, orig_grid_size, orig_grid_size, embed_dim).permute(0, 3, 1, 2)
+                    patch_embed = F.interpolate(patch_embed, size=(new_grid_size, new_grid_size), mode='bicubic', align_corners=False)
+                    patch_embed = patch_embed.permute(0, 2, 3, 1).reshape(1, new_grid_size * new_grid_size, embed_dim)
+                    state_dict['pos_embed'] = torch.cat([cls_token, patch_embed], dim=1)
+                    print(f'DINOv2 pos_embed interpolated from {orig_grid_size}x{orig_grid_size} to {new_grid_size}x{new_grid_size}')
+
+                self.dino_model.load_state_dict(state_dict, strict=False)
+                print(f'DINOv2 model loaded from {dino_model_path}')
             else:
-                self.dino_model = None
+                print(f'Warning: DINOv2 model not found at {dino_model_path}, using random initialization')
+            self.dino_model = self.dino_model.to(self.device)
+            self.dino_model.eval()
+            for param in self.dino_model.parameters():
+                param.requires_grad = False
+            self.dino_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
+            self.dino_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
 
-            self.use_retrieval_attacker = getattr(cfg, 'use_retrieval_attacker', False)
-            if self.use_retrieval_attacker:
-                attacker_feat_dim = getattr(cfg, 'attacker_feature_dim', 512)
-                self.retrieval_attacker = RetrievalAttackerWithMemory(
-                    feature_dim=attacker_feat_dim,
-                    memory_size=getattr(cfg, 'attacker_memory_size', 1000),
+            if self.use_clip_redirect:
+                self.dino_memory_bank = FeatureMemoryBank(
+                    feature_dim=384,
+                    memory_size=cfg.clip_memory_size,
                     device=self.device
-                ).to(self.device)
-                self.optimizer_attacker = optim.Adam(
-                    self.retrieval_attacker.parameters(), 
-                    lr=cfg.lr_encoder * 0.5
                 )
-            else:
-                self.retrieval_attacker = None
         else:
-            self.use_advanced_privacy = False
-            self.retrieval_attacker = None
-        
-        #定义噪声层
+            self.dino_model = None
+
         noise_layers = []
         if cfg.noise_config != 'identity':
             from noise_argparser import parse_crop, parse_cropout, parse_dropout, parse_resize
@@ -205,27 +185,26 @@ class Trainer:
                 elif command.startswith('quant'):
                     from noise_layers.quantization import Quantization
                     noise_layers.append(Quantization(self.device))
-        
+
         self.noiser = Noiser(noise_layers, self.device).to(self.device)
         self.has_noise = not (len(self.noiser._layer_names) == 1 and self.noiser._layer_names[0] == 'identity')
-        
+
         self.best_loss = float('inf')
-        
-    #获取数据加载器
+        self.phase2_msg_head_frozen = False
+
     def get_dataloaders(self):
         train_dataset = SteganographyDataset(
             root_dir=os.path.join(self.cfg.data_dir, self.cfg.train_dir),
             image_size=self.cfg.image_size,
             message_length=self.cfg.message_length
         )
-        
+
         val_dataset = SteganographyDataset(
             root_dir=os.path.join(self.cfg.data_dir, self.cfg.val_dir),
             image_size=self.cfg.image_size,
             message_length=self.cfg.message_length
         )
 
-        #定义数据加载器
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.cfg.batch_size,
@@ -233,7 +212,6 @@ class Trainer:
             num_workers=self.cfg.num_workers,
             pin_memory=True
         )
-        #定义验证数据加载器
         val_loader = DataLoader(
             val_dataset,
             batch_size=self.cfg.batch_size,
@@ -241,9 +219,9 @@ class Trainer:
             num_workers=self.cfg.num_workers,
             pin_memory=True
         )
-        
+
         return train_loader, val_loader
-    
+
     def extract_dino_features(self, image):
         if not hasattr(self, 'dino_model') or self.dino_model is None:
             return None
@@ -254,59 +232,85 @@ class Trainer:
             features = self.dino_model(image_normalized)
             features = features / (features.norm(dim=-1, keepdim=True) + 1e-7)
         return features
-    
-    #训练batch
+
+    def freeze_msg_head(self):
+        for param in self.encoder.msg_head.parameters():
+            param.requires_grad = False
+        self.phase2_msg_head_frozen = True
+
+    def unfreeze_msg_head(self):
+        for param in self.encoder.msg_head.parameters():
+            param.requires_grad = True
+        self.phase2_msg_head_frozen = False
+
+    def freeze_prv_head(self):
+        for param in self.encoder.prv_head.parameters():
+            param.requires_grad = False
+
+    def unfreeze_prv_head(self):
+        for param in self.encoder.prv_head.parameters():
+            param.requires_grad = True
+
+    def freeze_shared_layers(self):
+        for param in self.encoder.conv_layers.parameters():
+            param.requires_grad = False
+        for param in self.encoder.after_concat_layer.parameters():
+            param.requires_grad = False
+
+    def unfreeze_shared_layers(self):
+        for param in self.encoder.conv_layers.parameters():
+            param.requires_grad = True
+        for param in self.encoder.after_concat_layer.parameters():
+            param.requires_grad = True
+
+    def _set_phase_freeze(self, phase, epoch):
+        if phase == 1:
+            self.unfreeze_msg_head()
+            self.freeze_prv_head()
+            self.unfreeze_shared_layers()
+        else:
+            self.freeze_msg_head()
+            self.unfreeze_prv_head()
+            if epoch <= self.cfg.num_epochs_phase2 // 3:
+                self.unfreeze_shared_layers()
+            else:
+                self.freeze_shared_layers()
+
     def train_step(self, batch, phase, epoch=1):
+        self._set_phase_freeze(phase, epoch)
+
         cover_image = batch['cover_image'].to(self.device)
         message = batch['message'].to(self.device)
 
         weights = self.cfg.get_phase_weights(phase, epoch)
+        prv_noise_ratio = self.cfg.get_prv_noise_ratio(epoch) if phase == 1 else 0.0
 
-        #编码器编码图像
-        encoded_image, residual_penalty = self.encoder(cover_image, message)
-        
-        #添加噪声
+        encoded_image, residual_penalty, msg_residual, prv_residual = self.encoder(
+            cover_image, message, phase=phase, prv_noise_ratio=prv_noise_ratio
+        )
+
         noised_encoded_image, noised_cover_image = self.noiser((encoded_image, cover_image))
-        
-        #解码器解码图像
+
         message_pred = self.decoder(noised_encoded_image)
 
-        #计算损失
         L_pixel = self.mse_loss(encoded_image, cover_image)
         L_ssim = self.ssim_loss(encoded_image, cover_image)
-        if self.use_perceptual_loss:
-            L_perceptual = self.perceptual_loss(encoded_image, cover_image)
-            L_visual = (self.cfg.lambda_pixel * L_pixel +
-                       self.cfg.lambda_ssim * L_ssim +
-                       self.cfg.lambda_perceptual * L_perceptual)
-        else:
-            L_perceptual = torch.tensor(0.0, device=self.device)
-            L_visual = self.cfg.lambda_pixel * L_pixel + self.cfg.lambda_ssim * L_ssim
-        #计算噪声图像损失
+        L_visual = self.cfg.lambda_pixel * L_pixel + self.cfg.lambda_ssim * L_ssim
+
         L_pixel_noised = self.mse_loss(noised_encoded_image, cover_image)
         L_ssim_noised = self.ssim_loss(noised_encoded_image, cover_image)
-        if self.use_perceptual_loss:
-            L_perceptual_noised = self.perceptual_loss(noised_encoded_image, cover_image)
-            L_visual_noised = (self.cfg.lambda_pixel * L_pixel_noised +
-                               self.cfg.lambda_ssim * L_ssim_noised +
-                               self.cfg.lambda_perceptual * L_perceptual_noised)
-        else:
-            L_perceptual_noised = torch.tensor(0.0, device=self.device)
-            L_visual_noised = self.cfg.lambda_pixel * L_pixel_noised + self.cfg.lambda_ssim * L_ssim_noised
-        #计算消息损失
+        L_visual_noised = self.cfg.lambda_pixel * L_pixel_noised + self.cfg.lambda_ssim * L_ssim_noised
+
         L_message = self.bce_with_logits_loss(message_pred, message)
-        
-        #判别器输入动态选择: 有噪声用noised, 无噪声用encoded_image
+
         disc_stego_input = noised_encoded_image if self.has_noise else encoded_image
-        #判别器进行预测
         stego_pred = self.steganalyzer(disc_stego_input.detach())
         cover_pred = self.steganalyzer(cover_image)
 
-        #判别器损失：cover=1, stego=0
         discr_cover_bce = self.bce_with_logits_loss(cover_pred, torch.ones_like(cover_pred))
         discr_encod_bce = self.bce_with_logits_loss(stego_pred, torch.zeros_like(stego_pred))
         L_D = discr_cover_bce + discr_encod_bce
-        
+
         if weights.get('adv', 0.0) > 0:
             disc_threshold = getattr(self.cfg, 'discriminator_loss_threshold', None)
             skip_disc = (disc_threshold is not None and L_D.item() < disc_threshold)
@@ -315,27 +319,42 @@ class Trainer:
                 L_D.backward()
                 torch.nn.utils.clip_grad_norm_(self.steganalyzer.parameters(), max_norm=1.0)
                 self.optimizer_steganalyzer.step()
-        
+
         stego_pred = self.steganalyzer(disc_stego_input)
-        #对抗损失：生成器希望stego被判别为cover(标签1)
         L_adv = self.bce_with_logits_loss(stego_pred, torch.ones_like(stego_pred))
 
         feat_cover = self.content_recognizer(cover_image).detach()
         feat_encoded = self.content_recognizer(encoded_image)
-        
-        if self.use_advanced_privacy:
-            dino_cover = self.extract_dino_features(cover_image)
-            dino_encoded = self.extract_dino_features(encoded_image)
 
-            L_privacy, privacy_loss_dict = self.retrieval_escape_loss(
-                feat_cover, feat_encoded,
-                dino_cover=dino_cover,
-                dino_encoded=dino_encoded
+        dino_cover = self.extract_dino_features(cover_image)
+        dino_encoded = self.extract_dino_features(encoded_image)
+
+        clip_hard_negatives = None
+        dino_hard_negatives = None
+
+        if self.use_clip_redirect and self.clip_memory_bank is not None:
+            self.clip_memory_bank.update(feat_cover.detach())
+            clip_hard_negatives = self.clip_memory_bank.get_hard_negatives(
+                feat_encoded.detach(), k=self.clip_hard_negative_k
             )
-        else:
-            L_privacy = self.privacy_loss(feat_cover, feat_encoded)
-            privacy_loss_dict = {'privacy_loss': L_privacy.item()}
-        
+
+        if self.use_clip_redirect and self.dino_memory_bank is not None and dino_cover is not None:
+            self.dino_memory_bank.update(dino_cover.detach())
+            dino_hard_negatives = self.dino_memory_bank.get_hard_negatives(
+                dino_encoded.detach(), k=self.clip_hard_negative_k
+            )
+
+        escape_margin = self.cfg.get_escape_margin(phase, epoch)
+
+        L_privacy, privacy_loss_dict = self.retrieval_escape_loss(
+            feat_cover, feat_encoded,
+            dino_cover=dino_cover,
+            dino_encoded=dino_encoded,
+            clip_hard_negatives=clip_hard_negatives,
+            dino_hard_negatives=dino_hard_negatives,
+            escape_margin=escape_margin
+        )
+
         residual_penalty_weight = weights.get('residual_penalty', 0.05)
         L_visual_weighted = weights['visual'] * (L_visual + weights['noised'] * L_visual_noised)
         L_non_visual = (weights['message'] * L_message +
@@ -346,23 +365,25 @@ class Trainer:
 
         self.optimizer_encoder_decoder.zero_grad()
         L_total.backward()
-        
+
+        if phase == 2 and self.phase2_msg_head_frozen:
+            for param in self.encoder.msg_head.parameters():
+                param.grad = None
+
         torch.nn.utils.clip_grad_norm_(list(self.encoder.parameters()) + list(self.decoder.parameters()), max_norm=1.0)
-        
+
         self.optimizer_encoder_decoder.step()
-        
+
         with torch.no_grad():
             message_pred_binary = (torch.sigmoid(message_pred) > 0.5).float()
             bit_accuracy = (message_pred_binary == message).float().mean().item()
-        
+
         losses = {
             'L_pixel': L_pixel.item(),
             'L_ssim': L_ssim.item(),
-            'L_perceptual': L_perceptual.item(),
             'L_visual': L_visual.item(),
             'L_pixel_noised': L_pixel_noised.item(),
             'L_ssim_noised': L_ssim_noised.item(),
-            'L_perceptual_noised': L_perceptual_noised.item(),
             'L_visual_noised': L_visual_noised.item(),
             'L_message': L_message.item(),
             'L_adv': L_adv.item(),
@@ -371,117 +392,130 @@ class Trainer:
             'L_privacy': L_privacy.item(),
             'L_residual_penalty': residual_penalty.item(),
             'L_total': L_total.item(),
-            'bit_accuracy': bit_accuracy
+            'bit_accuracy': bit_accuracy,
+            'escape_margin': escape_margin,
+            'prv_noise_ratio': prv_noise_ratio
         }
-        
-        if self.use_advanced_privacy:
-            for key, value in privacy_loss_dict.items():
-                losses[f'privacy_{key}'] = value if isinstance(value, float) else value
-        
+
+        for key, value in privacy_loss_dict.items():
+            losses[f'privacy_{key}'] = value if isinstance(value, float) else value
+
         return losses
 
-#验证函数
+    def recovery_step(self, train_loader, num_batches=5):
+        self.encoder.eval()
+        self.decoder.train()
+
+        self.freeze_prv_head()
+
+        temp_optimizer = optim.Adam(self.decoder.parameters(), lr=self.cfg.lr_decoder * 0.5)
+
+        for i, batch in enumerate(train_loader):
+            if i >= num_batches:
+                break
+
+            cover_image = batch['cover_image'].to(self.device)
+            message = batch['message'].to(self.device)
+
+            with torch.no_grad():
+                _, _, msg_residual, _ = self.encoder(
+                    cover_image, message, phase=1, prv_noise_ratio=0.0
+                )
+                clean_encoded = cover_image + msg_residual
+                clean_encoded = torch.clamp(clean_encoded, -1, 1)
+
+            message_pred = self.decoder(clean_encoded)
+            L_msg = self.bce_with_logits_loss(message_pred, message)
+
+            temp_optimizer.zero_grad()
+            L_msg.backward()
+            torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), max_norm=1.0)
+            temp_optimizer.step()
+
+        self.unfreeze_prv_head()
+        self.encoder.train()
+
     def validate(self, val_loader, phase, epoch, save_vis=False):
-        #切换到评估模式
         self.encoder.eval()
         self.decoder.eval()
         self.steganalyzer.eval()
-        
+
         total_losses = {}
         num_batches = 0
-        
+
         sample_images = []
         max_samples = 8
-        #计算验证集的样本数量，如果小于max_samples，就使用所有样本，否则就随机选择max_samples个样本
         all_batches = list(val_loader)
         num_total_samples = sum(batch['cover_image'].size(0) for batch in all_batches)
         if num_total_samples < max_samples:
             selected_indices = list(range(num_total_samples))
         else:
+            import random
             selected_indices = random.sample(range(num_total_samples), max_samples)
-        #将选中的样本索引转换为集合，方便后续判断
         selected_indices_set = set(selected_indices)
-        
+
+        prv_noise_ratio = self.cfg.get_prv_noise_ratio(epoch) if phase == 1 else 0.0
+        escape_margin = self.cfg.get_escape_margin(phase, epoch)
+
         with torch.no_grad():
             current_idx = 0
             for batch in all_batches:
                 cover_image = batch['cover_image'].to(self.device)
                 message = batch['message'].to(self.device)
-                
+
                 weights = self.cfg.get_phase_weights(phase, epoch)
-                
-                #编码，加噪声，解码
-                encoded_image, residual_penalty = self.encoder(cover_image, message)
+
+                encoded_image, residual_penalty, msg_residual, prv_residual = self.encoder(
+                    cover_image, message, phase=phase, prv_noise_ratio=prv_noise_ratio
+                )
                 noised_encoded_image, noised_cover_image = self.noiser((encoded_image, cover_image))
                 message_pred = self.decoder(noised_encoded_image)
-                
-                #计算视觉损失
+
                 L_pixel = self.mse_loss(encoded_image, cover_image)
                 L_ssim = self.ssim_loss(encoded_image, cover_image)
-                if self.use_perceptual_loss:
-                    L_perceptual = self.perceptual_loss(encoded_image, cover_image)
-                    L_visual = (self.cfg.lambda_pixel * L_pixel + 
-                               self.cfg.lambda_ssim * L_ssim + 
-                               self.cfg.lambda_perceptual * L_perceptual)
-                else:
-                    L_perceptual = torch.tensor(0.0, device=self.device)
-                    L_visual = self.cfg.lambda_pixel * L_pixel + self.cfg.lambda_ssim * L_ssim
-                
-                #计算含噪声的视觉损失
+                L_visual = self.cfg.lambda_pixel * L_pixel + self.cfg.lambda_ssim * L_ssim
+
                 L_pixel_noised = self.mse_loss(noised_encoded_image, cover_image)
                 L_ssim_noised = self.ssim_loss(noised_encoded_image, cover_image)
-                if self.use_perceptual_loss:
-                    L_perceptual_noised = self.perceptual_loss(noised_encoded_image, cover_image)
-                    L_visual_noised = (self.cfg.lambda_pixel * L_pixel_noised +
-                                       self.cfg.lambda_ssim * L_ssim_noised +
-                                       self.cfg.lambda_perceptual * L_perceptual_noised)
-                else:
-                    L_perceptual_noised = torch.tensor(0.0, device=self.device)
-                    L_visual_noised = self.cfg.lambda_pixel * L_pixel_noised + self.cfg.lambda_ssim * L_ssim_noised
-                
-                #计算消息损失
+                L_visual_noised = self.cfg.lambda_pixel * L_pixel_noised + self.cfg.lambda_ssim * L_ssim_noised
+
                 L_message = self.bce_with_logits_loss(message_pred, message)
-                
-                #判别器预测
+
                 disc_stego_input = noised_encoded_image if self.has_noise else encoded_image
                 stego_pred = self.steganalyzer(disc_stego_input)
                 cover_pred = self.steganalyzer(cover_image)
                 L_adv = self.bce_with_logits_loss(stego_pred, torch.ones_like(stego_pred))
                 discr_cover_bce = self.bce_with_logits_loss(cover_pred, torch.ones_like(cover_pred))
                 discr_encod_bce = self.bce_with_logits_loss(stego_pred, torch.zeros_like(stego_pred))
-                
+
                 feat_cover = self.content_recognizer(cover_image)
                 feat_encoded = self.content_recognizer(encoded_image)
-                
-                if self.use_advanced_privacy:
-                    dino_cover = self.extract_dino_features(cover_image)
-                    dino_encoded = self.extract_dino_features(encoded_image)
 
-                    L_privacy, _ = self.retrieval_escape_loss(
-                        feat_cover, feat_encoded,
-                        dino_cover=dino_cover,
-                        dino_encoded=dino_encoded
-                    )
-                else:
-                    L_privacy = self.privacy_loss(feat_cover, feat_encoded)
-                
+                dino_cover = self.extract_dino_features(cover_image)
+                dino_encoded = self.extract_dino_features(encoded_image)
+
+                L_privacy, _ = self.retrieval_escape_loss(
+                    feat_cover, feat_encoded,
+                    dino_cover=dino_cover,
+                    dino_encoded=dino_encoded,
+                    escape_margin=escape_margin
+                )
+
                 residual_penalty_weight = weights.get('residual_penalty', 0.05)
-                #计算总损失
-                L_total = (weights['visual'] * (L_visual + weights['noised'] * L_visual_noised) + 
-                          weights['message'] * L_message + 
-                          weights['adv'] * L_adv + 
+                L_total = (weights['visual'] * (L_visual + weights['noised'] * L_visual_noised) +
+                          weights['message'] * L_message +
+                          weights['adv'] * L_adv +
                           weights['privacy'] * L_privacy +
                           residual_penalty_weight * residual_penalty)
-                
+
                 message_pred_binary = (torch.sigmoid(message_pred) > 0.5).float()
                 bit_accuracy = (message_pred_binary == message).float().mean()
-                
-                #计算总损失
+
                 for key, value in [
-                    ('L_pixel', L_pixel), ('L_ssim', L_ssim), 
-                    ('L_perceptual', L_perceptual), ('L_visual', L_visual),
+                    ('L_pixel', L_pixel), ('L_ssim', L_ssim),
+                    ('L_visual', L_visual),
                     ('L_pixel_noised', L_pixel_noised), ('L_ssim_noised', L_ssim_noised),
-                    ('L_perceptual_noised', L_perceptual_noised), ('L_visual_noised', L_visual_noised),
+                    ('L_visual_noised', L_visual_noised),
                     ('L_message', L_message), ('L_adv', L_adv),
                     ('discr_cover_bce', discr_cover_bce), ('discr_encod_bce', discr_encod_bce),
                     ('L_privacy', L_privacy), ('L_residual_penalty', residual_penalty),
@@ -490,10 +524,9 @@ class Trainer:
                     if key not in total_losses:
                         total_losses[key] = 0
                     total_losses[key] += value.item()
-                
+
                 num_batches += 1
-                
-                #遍历批次中的所有样本，判断是否在之前选中的样本索引中，如果是，就保存该样本的原始图像和编码后的图像
+
                 for i in range(cover_image.size(0)):
                     if current_idx in selected_indices_set:
                         sample_images.append({
@@ -501,55 +534,46 @@ class Trainer:
                             'encoded': encoded_image[i].cpu()
                         })
                     current_idx += 1
-        
-        #计算平均损失
+
         for key in total_losses:
             total_losses[key] /= num_batches
-        
+
         if save_vis and sample_images:
             save_samples = sample_images[:5]
-            
+
             cover_images = [img['cover'] for img in save_samples]
             encoded_images = [img['encoded'] for img in save_samples]
-            
+
             cover_grid = make_grid(cover_images, nrow=5, padding=2, normalize=False)
             encoded_grid = make_grid(encoded_images, nrow=5, padding=2, normalize=False)
             combined = torch.cat([cover_grid, encoded_grid], dim=1)
-            
+
             save_dir = os.path.join(self.cfg.checkpoint_dir, 'visualizations')
             os.makedirs(save_dir, exist_ok=True)
             save_path = os.path.join(save_dir, f'phase{phase}_epoch{epoch}.png')
-            
+
             combined_normalized = (combined + 1) / 2
             combined_normalized = torch.clamp(combined_normalized, 0, 1)
             save_image(combined_normalized, save_path)
             print(f' [OK] Visualization saved: {save_path}')
-        
-        #切换到训练模式
+
         self.encoder.train()
         self.decoder.train()
         self.steganalyzer.train()
-        
+
         return total_losses
 
     def warmup_memory_bank(self, train_loader, num_batches=50):
-        if self.retrieval_attacker is None and self.clip_memory_bank is None and self.dino_memory_bank is None:
+        if self.clip_memory_bank is None and self.dino_memory_bank is None:
             return
 
         print(f'Warming up Memory Banks with {num_batches} batches...')
-
-        if self.retrieval_attacker is not None:
-            self.retrieval_attacker.eval()
 
         with torch.no_grad():
             for i, batch in enumerate(train_loader):
                 if i >= num_batches:
                     break
                 cover_image = batch['cover_image'].to(self.device)
-
-                if self.retrieval_attacker is not None:
-                    features = self.retrieval_attacker(cover_image)
-                    self.retrieval_attacker.update_memory(features)
 
                 if self.clip_memory_bank is not None:
                     clip_feat = self.content_recognizer(cover_image)
@@ -560,12 +584,7 @@ class Trainer:
                     if dino_feat is not None:
                         self.dino_memory_bank.update(dino_feat)
 
-        if self.retrieval_attacker is not None:
-            self.retrieval_attacker.train()
-
         info_parts = []
-        if self.retrieval_attacker is not None:
-            info_parts.append(f'Attacker: {int(self.retrieval_attacker.memory_count[0])}')
         if self.clip_memory_bank is not None:
             info_parts.append(f'CLIP: {self.clip_memory_bank.memory_count}')
         if self.dino_memory_bank is not None:
@@ -581,34 +600,26 @@ class Trainer:
             'steganalyzer_state_dict': self.steganalyzer.state_dict(),
             'optimizer_encoder_decoder': self.optimizer_encoder_decoder.state_dict(),
             'optimizer_steganalyzer': self.optimizer_steganalyzer.state_dict(),
-            'best_loss': self.best_loss
+            'best_loss': self.best_loss,
+            'phase2_msg_head_frozen': self.phase2_msg_head_frozen
         }
-        
-        if hasattr(self, 'optimizer_attacker') and self.optimizer_attacker is not None:
-            checkpoint['optimizer_attacker'] = self.optimizer_attacker.state_dict()
-        
-        if hasattr(self, 'retrieval_attacker') and self.retrieval_attacker is not None:
-            checkpoint['retrieval_attacker_state_dict'] = self.retrieval_attacker.state_dict()
 
-        if hasattr(self, 'clip_memory_bank') and self.clip_memory_bank is not None:
+        if self.clip_memory_bank is not None:
             checkpoint['clip_memory_bank'] = self.clip_memory_bank.state_dict()
 
-        if hasattr(self, 'dino_memory_bank') and self.dino_memory_bank is not None:
+        if self.dino_memory_bank is not None:
             checkpoint['dino_memory_bank'] = self.dino_memory_bank.state_dict()
-        #保存当前轮数的检查点
+
         path = os.path.join(self.cfg.checkpoint_dir, f'checkpoint_phase{phase}_epoch{epoch}.pth')
         torch.save(checkpoint, path)
-        
-        #更新最新的检查点
+
         latest_path = os.path.join(self.cfg.checkpoint_dir, 'checkpoint.pth')
         torch.save(checkpoint, latest_path)
-        
-        #如果当前轮数的损失小于最佳损失，就更新最佳损失
+
         if is_best:
             best_path = os.path.join(self.cfg.checkpoint_dir, f'best_phase{phase}.pth')
             torch.save(checkpoint, best_path)
-        
-        #删除旧的检查点，只保留最新的5个
+
         checkpoint_files = [f for f in os.listdir(self.cfg.checkpoint_dir)
                           if f.startswith(f'checkpoint_phase{phase}_epoch') and f.endswith('.pth')]
 
@@ -616,8 +627,3 @@ class Trainer:
             checkpoint_files.sort(key=lambda x: os.path.getmtime(os.path.join(self.cfg.checkpoint_dir, x)))
             oldest_file = checkpoint_files[0]
             os.remove(os.path.join(self.cfg.checkpoint_dir, oldest_file))
-
-
-"""
-pythonw.exe train.py new --data_dir ./dataset1 --name train1 > log.txt 2>&1
-"""

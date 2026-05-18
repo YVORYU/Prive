@@ -17,17 +17,19 @@ class ConvBNRelu(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, message_length=30, n_channels=3, bilinear=False, image_size=256, pixel_budget=0.08):
+    def __init__(self, message_length=30, n_channels=3, bilinear=False,
+                 image_size=256, msg_budget=0.05, prv_budget=0.03):
         super(Encoder, self).__init__()
         self.message_length = message_length
         self.n_channels = n_channels
         self.bilinear = bilinear
         self.H = image_size
         self.W = image_size
-        self.pixel_budget = pixel_budget
+        self.msg_budget = msg_budget
+        self.prv_budget = prv_budget
 
-        channels = 64
-        num_blocks = 8
+        channels = 128
+        num_blocks = 16
 
         self.conv_layers = nn.Sequential(
             ConvBNRelu(3, channels)
@@ -37,25 +39,52 @@ class Encoder(nn.Module):
 
         self.after_concat_layer = ConvBNRelu(channels + 3 + message_length, channels)
 
-        self.final_layer = nn.Conv2d(channels, 3, kernel_size=1)
+        self.msg_head = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, 3, kernel_size=1)
+        )
 
-    def forward(self, cover_image, message):
-        expanded_message = message.unsqueeze(-1)
-        expanded_message = expanded_message.unsqueeze(-1)
-        expanded_message = expanded_message.expand(-1, -1, self.H, self.W)
+        self.prv_head = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, 3, kernel_size=1)
+        )
 
-        encoded_image = self.conv_layers(cover_image)
+    def forward(self, cover_image, message, phase=1, prv_noise_ratio=0.0):
+        expanded_message = message.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.H, self.W)
 
-        concat = torch.cat([expanded_message, encoded_image, cover_image], dim=1)
+        features = self.conv_layers(cover_image)
+        concat = torch.cat([expanded_message, features, cover_image], dim=1)
+        shared = self.after_concat_layer(concat)
 
-        im_w = self.after_concat_layer(concat)
+        if phase == 2 and not self.msg_head[0].weight.requires_grad:
+            with torch.no_grad():
+                msg_residual = self.msg_head(shared)
+                msg_residual = self.msg_budget * torch.tanh(msg_residual)
+        else:
+            msg_residual = self.msg_head(shared)
+            msg_residual = self.msg_budget * torch.tanh(msg_residual)
 
-        residual = self.final_layer(im_w)
-        residual = self.pixel_budget * torch.tanh(residual)
+        prv_residual = None
+        if phase == 1:
+            dummy_prv = self.prv_budget * prv_noise_ratio * torch.randn_like(cover_image)
+            encoded_image = cover_image + msg_residual + dummy_prv
+            residual_penalty = torch.mean(msg_residual ** 2) + torch.mean(dummy_prv ** 2)
+        else:
+            prv_residual = self.prv_head(shared)
+            prv_residual = self.prv_budget * torch.tanh(prv_residual)
+            encoded_image = cover_image + msg_residual + prv_residual
+            residual_penalty = torch.mean(msg_residual ** 2) + torch.mean(prv_residual ** 2)
 
-        encoded_image = cover_image + residual
         encoded_image = torch.clamp(encoded_image, -1, 1)
 
-        residual_penalty = torch.mean(residual ** 2)
-
-        return encoded_image, residual_penalty
+        return encoded_image, residual_penalty, msg_residual, prv_residual
