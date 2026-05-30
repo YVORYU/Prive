@@ -222,10 +222,10 @@ class Trainer:
 
         return train_loader, val_loader
 
-    def extract_dino_features(self, image):
+    def extract_dino_features(self, image, allow_grad=False):
         if not hasattr(self, 'dino_model') or self.dino_model is None:
             return None
-        with torch.no_grad():
+        with torch.set_grad_enabled(allow_grad):
             image_resized = F.interpolate(image, size=(224, 224), mode='bilinear', align_corners=False)
             image_normalized = (image_resized + 1) / 2
             image_normalized = (image_normalized - self.dino_mean) / self.dino_std
@@ -327,7 +327,7 @@ class Trainer:
         feat_encoded = self.content_recognizer(encoded_image)
 
         dino_cover = self.extract_dino_features(cover_image)
-        dino_encoded = self.extract_dino_features(encoded_image)
+        dino_encoded = self.extract_dino_features(encoded_image, allow_grad=True)
 
         clip_hard_negatives = None
         dino_hard_negatives = None

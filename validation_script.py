@@ -94,22 +94,39 @@ class ValidationScript:
         print(f"加载检查点: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
+        def _report(module_name, result):
+            missing, unexpected = result
+            if missing:
+                print(f"[{module_name}] 缺失键: {list(missing)}")
+            if unexpected:
+                print(f"[{module_name}] 多余键: {list(unexpected)}")
+
         if 'encoder_state_dict' in checkpoint:
-            self.encoder.load_state_dict(checkpoint['encoder_state_dict'])
+            result = self.encoder.load_state_dict(checkpoint['encoder_state_dict'], strict=False)
+            _report('encoder', result)
         if 'decoder_state_dict' in checkpoint:
-            self.decoder.load_state_dict(checkpoint['decoder_state_dict'])
+            result = self.decoder.load_state_dict(checkpoint['decoder_state_dict'], strict=False)
+            _report('decoder', result)
         if 'steganalyzer_state_dict' in checkpoint:
             steganalyzer_state_dict = checkpoint['steganalyzer_state_dict'].copy()
 
-            old_keys = ['fc_layers.3.weight', 'fc_layers.3.bias']
-            new_keys = ['fc_layers.2.weight', 'fc_layers.2.bias']
+            model_keys = set(self.steganalyzer.state_dict().keys())
+            ckpt_keys = set(steganalyzer_state_dict.keys())
+            for ckpt_key in list(ckpt_keys - model_keys):
+                if not ckpt_key.startswith('fc_layers.'):
+                    continue
+                suffix = ckpt_key.split('.', 2)[2]
+                candidates = sorted(
+                    k for k in (model_keys - ckpt_keys)
+                    if k.startswith('fc_layers.') and k.endswith('.' + suffix)
+                )
+                if candidates:
+                    target = candidates[0]
+                    steganalyzer_state_dict[target] = steganalyzer_state_dict.pop(ckpt_key)
+                    print(f"映射键: {ckpt_key} -> {target}")
 
-            for old_key, new_key in zip(old_keys, new_keys):
-                if old_key in steganalyzer_state_dict:
-                    steganalyzer_state_dict[new_key] = steganalyzer_state_dict.pop(old_key)
-                    print(f"映射键: {old_key} -> {new_key}")
-
-            self.steganalyzer.load_state_dict(steganalyzer_state_dict, strict=False)
+            result = self.steganalyzer.load_state_dict(steganalyzer_state_dict, strict=False)
+            _report('steganalyzer', result)
 
         self.encoder.eval()
         self.decoder.eval()
@@ -205,12 +222,14 @@ class ValidationScript:
             prediction = self.steganalyzer(image)
             probability = torch.sigmoid(prediction)
 
-        prob_value = probability.item()
+        cover_prob = probability.item()
+        stego_prob = 1.0 - cover_prob
         print(f"判别器输出 (logits): {prediction.item():.6f}")
-        print(f"隐写概率 (sigmoid): {prob_value*100:.2f}%")
-        print(f"判断结果: {'隐写图像' if prob_value > 0.5 else '原始图像'}")
+        print(f"原始图像概率 (sigmoid): {cover_prob*100:.2f}%")
+        print(f"隐写概率 (1-sigmoid): {stego_prob*100:.2f}%")
+        print(f"判断结果: {'原始图像' if cover_prob > 0.5 else '隐写图像'}")
 
-        return prob_value, prediction.item()
+        return stego_prob, prediction.item()
 
     def extract_dino_features(self, image):
         if self.dino_model is None:
@@ -235,8 +254,8 @@ class ValidationScript:
 
         euclidean_dist = torch.norm(feat_encoded - feat_cover, p=2, dim=1).item()
 
-        # CLIP特征已L2归一化，余弦相似度范围即为[0, 1]
-        similarity_prob = cosine_sim
+        # CLIP/DINO 余弦相似度理论范围 [-1, 1]，clamp 到 [0, 1] 后用作隐私指标
+        similarity_prob = max(0.0, min(1.0, cosine_sim))
 
         # DINO 相似度
         dino_sim = None
@@ -246,6 +265,9 @@ class ValidationScript:
             feat_encoded_dino = self.extract_dino_features(encoded_image)
             dino_sim = F.cosine_similarity(feat_cover_dino, feat_encoded_dino, dim=1).item()
             dino_euclidean_dist = torch.norm(feat_encoded_dino - feat_cover_dino, p=2, dim=1).item()
+            dino_sim_prob = max(0.0, min(1.0, dino_sim))
+        else:
+            dino_sim_prob = None
 
         ssim_value = 1 - self.ssim_loss(cover_image, encoded_image).item()
 
@@ -266,14 +288,15 @@ class ValidationScript:
         print(f"  - CLIP 特征相似度: {similarity_prob*100:.2f}%")
         print(f"  - CLIP 隐私保护程度: {(1-similarity_prob)*100:.2f}%")
         if dino_sim is not None:
-            print(f"  - DINO 特征相似度: {dino_sim*100:.2f}%")
-            print(f"  - DINO 隐私保护程度: {(1-dino_sim)*100:.2f}%")
+            print(f"  - DINO 特征相似度: {dino_sim_prob*100:.2f}%")
+            print(f"  - DINO 隐私保护程度: {(1-dino_sim_prob)*100:.2f}%")
 
         return {
             'cosine_similarity': cosine_sim,
             'euclidean_distance': euclidean_dist,
             'similarity_probability': similarity_prob,
             'dino_similarity': dino_sim,
+            'dino_similarity_probability': dino_sim_prob,
             'dino_euclidean_distance': dino_euclidean_dist,
             'ssim': ssim_value,
             'psnr': psnr
@@ -329,8 +352,8 @@ class ValidationScript:
         print(f"CLIP 隐私相似度: {privacy_results['similarity_probability']*100:.2f}%")
         print(f"CLIP 隐私保护程度: {(1-privacy_results['similarity_probability'])*100:.2f}%")
         if privacy_results.get('dino_similarity') is not None:
-            print(f"DINO 隐私相似度: {privacy_results['dino_similarity']*100:.2f}%")
-            print(f"DINO 隐私保护程度: {(1-privacy_results['dino_similarity'])*100:.2f}%")
+            print(f"DINO 隐私相似度: {privacy_results['dino_similarity_probability']*100:.2f}%")
+            print(f"DINO 隐私保护程度: {(1-privacy_results['dino_similarity_probability'])*100:.2f}%")
         print("#"*60)
 
         return {
@@ -401,8 +424,8 @@ class ValidationScript:
         print(f"  - CLIP 相似概率: {privacy_results['similarity_probability']*100:.2f}%")
         print(f"  - CLIP 隐私保护程度: {(1-privacy_results['similarity_probability'])*100:.2f}%")
         if privacy_results.get('dino_similarity') is not None:
-            print(f"  - DINO 相似概率: {privacy_results['dino_similarity']*100:.2f}%")
-            print(f"  - DINO 隐私保护程度: {(1-privacy_results['dino_similarity'])*100:.2f}%")
+            print(f"  - DINO 相似概率: {privacy_results['dino_similarity_probability']*100:.2f}%")
+            print(f"  - DINO 隐私保护程度: {(1-privacy_results['dino_similarity_probability'])*100:.2f}%")
         print("#"*60)
 
         return privacy_results

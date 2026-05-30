@@ -26,7 +26,10 @@ class FeatureRedirectionLoss(nn.Module):
     def escape_loss(self, feat_cover, feat_encoded, margin):
         sim = F.cosine_similarity(feat_encoded, feat_cover, dim=1)
         target = 1 - margin
-        loss = torch.mean(torch.log1p(torch.exp(sim - target)))
+        diff = sim - target
+        hinge_sq = torch.mean(F.relu(diff) ** 2) * 25.0
+        warmup = torch.mean(F.softplus(diff)) * 0.1
+        loss = hinge_sq + warmup
         return loss, sim.mean().item()
 
     def redirect_loss(self, feat_encoded, hard_negatives, margin, max_target_sim):

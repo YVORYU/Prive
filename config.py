@@ -12,13 +12,13 @@ class Config:
     lr_decoder = 1e-3
     lr_steganalyzer = 1e-3
 
-    num_epochs_phase1 = 130
+    num_epochs_phase1 = 150
     num_epochs_phase2 = 150
 
     discriminator_loss_threshold = 0.4
 
     lambda_pixel = 1.0
-    lambda_ssim = 2.0
+    lambda_ssim = 1.0
     lambda_message = 1.0
     lambda_adv = 0.1
     lambda_privacy = 0.3
@@ -26,21 +26,21 @@ class Config:
     msg_budget = 0.04
     prv_budget = 0.06
 
-    privacy_margin_start = 0.05
-    privacy_margin_end = 0.30
+    privacy_margin_start = 0.15
+    privacy_margin_end = 0.45
 
-    use_clip_redirect = False
+    use_clip_redirect = True
     clip_memory_size = 1000
     clip_hard_negative_k = 5
-    clip_redirect_margin = 0.3
+    clip_redirect_margin = 0.35
     clip_max_target_sim = 0.55
-    clip_redirect_weight = 0.3
-    dino_redirect_weight = 0.2
+    clip_redirect_weight = 0.6
+    dino_redirect_weight = 0.3
     dino_redirect_margin = 0.3
     dino_max_target_sim = 0.55
 
     clip_weight = 1.0
-    dino_weight = 1.0
+    dino_weight = 0.5
     dino_model_path = './models/dinov2_vits14_pretrain.pth'
 
     use_retrieval_attacker = False
