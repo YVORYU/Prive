@@ -10,27 +10,37 @@ class Config:
 
     lr_encoder = 1e-3
     lr_decoder = 1e-3
-    lr_steganalyzer = 1e-3
+    lr_steganalyzer = 2e-4
 
     num_epochs_phase1 = 150
-    num_epochs_phase2 = 150
+    num_epochs_phase2 = 100
 
-    discriminator_loss_threshold = 0.4
+    discriminator_loss_threshold = 0.6
+    disc_acc_high = 0.70
+    disc_hinge_margin = 1.0
 
     lambda_pixel = 1.0
     lambda_ssim = 1.0
-    lambda_message = 1.0
-    lambda_adv = 0.1
-    lambda_privacy = 0.3
 
     msg_budget = 0.04
-    prv_budget = 0.06
+    prv_budget = 0.04
+
+    phase1_adv_start = 0.0
+    phase1_adv_mid = 0.25
+    phase1_adv_end = 0.75
+    phase2_adv = 0.5
+
+    phase1_prv_noise_start = 0.50
+    phase1_prv_noise_end = 0.90
+    phase1_prv_noise_max_ratio = 0.50
+    phase1_prv_noise_power = 2.0
+    phase1_prv_noise_smooth_kernel = 7
 
     privacy_margin_start = 0.15
-    privacy_margin_end = 0.45
+    privacy_margin_end = 0.35
 
-    use_clip_redirect = True
-    clip_memory_size = 1000
+    use_clip_redirect = False
+    clip_memory_size = 5000
     clip_hard_negative_k = 5
     clip_redirect_margin = 0.35
     clip_max_target_sim = 0.55
@@ -43,9 +53,6 @@ class Config:
     dino_weight = 0.5
     dino_model_path = './models/dinov2_vits14_pretrain.pth'
 
-    use_retrieval_attacker = False
-    attacker_feature_dim = 512
-    attacker_memory_size = 1000
 
     memory_warmup_batches = 50
 
@@ -69,11 +76,11 @@ class Config:
             total = self.num_epochs_phase1
             third = total // 3
             if epoch <= third:
-                adv = self.lambda_adv
+                adv = self.phase1_adv_start
             elif epoch <= 2 * third:
-                adv = self.lambda_adv * 2
+                adv = self.phase1_adv_mid
             else:
-                adv = self.lambda_adv * 3
+                adv = self.phase1_adv_end
             return {
                 'visual': 10.0,
                 'message': 10.0,
@@ -86,21 +93,21 @@ class Config:
             total = self.num_epochs_phase2
             third = total // 3
             if epoch <= third:
-                privacy = 3.0
-                message = 15.0
+                privacy = 2.0
+                message = 20.0
             elif epoch <= 2 * third:
-                privacy = 6.0
-                message = 12.0
+                privacy = 4.0
+                message = 15.0
             else:
-                privacy = 10.0
+                privacy = 5.0
                 message = 10.0
             return {
-                'visual': 1.0,
+                'visual': 10.0,
                 'message': message,
-                'adv': 2.0,
+                'adv': self.phase2_adv,
                 'privacy': privacy,
                 'noised': 0.3,
-                'residual_penalty': 0.2
+                'residual_penalty': 0.5
             }
         else:
             raise ValueError(f'Invalid phase: {phase}')
@@ -114,11 +121,13 @@ class Config:
 
     def get_prv_noise_ratio(self, epoch):
         total = self.num_epochs_phase1
-        warmup_end = total * 0.3
-        ramp_end = total * 0.7
+        warmup_end = total * self.phase1_prv_noise_start
+        ramp_end = total * self.phase1_prv_noise_end
         if epoch <= warmup_end:
             return 0.0
         elif epoch <= ramp_end:
-            return (epoch - warmup_end) / (ramp_end - warmup_end)
+            progress = (epoch - warmup_end) / max(1.0, ramp_end - warmup_end)
+            progress = min(1.0, max(0.0, progress))
+            return self.phase1_prv_noise_max_ratio * (progress ** self.phase1_prv_noise_power)
         else:
-            return 1.0
+            return self.phase1_prv_noise_max_ratio

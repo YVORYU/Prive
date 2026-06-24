@@ -32,16 +32,24 @@ def save_config(config_path, cfg):
         'num_epochs_phase1': cfg.num_epochs_phase1,
         'num_epochs_phase2': cfg.num_epochs_phase2,
         'discriminator_loss_threshold': cfg.discriminator_loss_threshold,
+        'disc_acc_high': cfg.disc_acc_high,
+        'disc_hinge_margin': cfg.disc_hinge_margin,
         'lr_encoder': cfg.lr_encoder,
         'lr_decoder': cfg.lr_decoder,
         'lr_steganalyzer': cfg.lr_steganalyzer,
         'lambda_pixel': cfg.lambda_pixel,
         'lambda_ssim': cfg.lambda_ssim,
-        'lambda_message': cfg.lambda_message,
-        'lambda_adv': cfg.lambda_adv,
-        'lambda_privacy': cfg.lambda_privacy,
         'msg_budget': cfg.msg_budget,
         'prv_budget': cfg.prv_budget,
+        'phase1_adv_start': cfg.phase1_adv_start,
+        'phase1_adv_mid': cfg.phase1_adv_mid,
+        'phase1_adv_end': cfg.phase1_adv_end,
+        'phase2_adv': cfg.phase2_adv,
+        'phase1_prv_noise_start': cfg.phase1_prv_noise_start,
+        'phase1_prv_noise_end': cfg.phase1_prv_noise_end,
+        'phase1_prv_noise_max_ratio': cfg.phase1_prv_noise_max_ratio,
+        'phase1_prv_noise_power': cfg.phase1_prv_noise_power,
+        'phase1_prv_noise_smooth_kernel': cfg.phase1_prv_noise_smooth_kernel,
         'privacy_margin_start': cfg.privacy_margin_start,
         'privacy_margin_end': cfg.privacy_margin_end,
         'use_clip_redirect': cfg.use_clip_redirect,
@@ -85,6 +93,16 @@ def setup_logger(log_file, cfg, append=False):
             'data_dir': cfg.data_dir,
             'msg_budget': cfg.msg_budget,
             'prv_budget': cfg.prv_budget,
+            'disc_acc_high': cfg.disc_acc_high,
+            'phase1_adv_start': cfg.phase1_adv_start,
+            'phase1_adv_mid': cfg.phase1_adv_mid,
+            'phase1_adv_end': cfg.phase1_adv_end,
+            'phase2_adv': cfg.phase2_adv,
+            'phase1_prv_noise_start': cfg.phase1_prv_noise_start,
+            'phase1_prv_noise_end': cfg.phase1_prv_noise_end,
+            'phase1_prv_noise_max_ratio': cfg.phase1_prv_noise_max_ratio,
+            'phase1_prv_noise_power': cfg.phase1_prv_noise_power,
+            'phase1_prv_noise_smooth_kernel': cfg.phase1_prv_noise_smooth_kernel,
             'privacy_margin_start': cfg.privacy_margin_start,
             'privacy_margin_end': cfg.privacy_margin_end,
             'use_clip_redirect': cfg.use_clip_redirect,
@@ -109,14 +127,19 @@ def setup_logger(log_file, cfg, append=False):
 def log_batch_losses(log_file, batch_idx, losses, phase):
     with open(log_file, 'a', encoding='utf-8') as f:
         f.write(f"Phase {phase} - Batch {batch_idx}: ")
-        f.write(f"L_total={losses['L_total']:.6f}, ")
         f.write(f"L_visual={losses['L_visual']:.6f}, ")
         f.write(f"L_message={losses['L_message']:.6f}, ")
         f.write(f"L_adv={losses['L_adv']:.6f}, ")
+        f.write(f"L_D={losses.get('L_D', 0):.6f}, ")
+        f.write(f"D_acc={losses.get('D_acc', 0):.4f}, ")
+        f.write(f"D_updated={losses.get('D_updated', 0):.0f}, ")
+        f.write(f"D_real_prob={losses.get('D_real_prob', 0):.4f}, ")
+        f.write(f"D_fake_prob={losses.get('D_fake_prob', 0):.4f}, ")
         f.write(f"discr_cover_bce={losses['discr_cover_bce']:.6f}, ")
         f.write(f"discr_encod_bce={losses['discr_encod_bce']:.6f}, ")
         f.write(f"L_privacy={losses['L_privacy']:.6f}, ")
         f.write(f"bit_accuracy={losses['bit_accuracy']:.4f}, ")
+        f.write(f"prv_noise_ratio={losses.get('prv_noise_ratio', 0):.4f}, ")
         f.write(f"escape_margin={losses.get('escape_margin', 0):.4f}\n")
 
 
@@ -181,18 +204,18 @@ def run_training_loop(trainer, train_loader, val_loader, cfg, start_phase, start
             val_losses = trainer.validate(val_loader, phase, epoch, save_vis)
             log_epoch_losses(log_file, epoch, epoch_losses, val_losses, phase)
 
-            print(f'Phase {phase} - Epoch {epoch} - Train Loss: {epoch_losses["L_total"]:.4f} - Val Loss: {val_losses["L_total"]:.4f} - Bit Acc: {epoch_losses["bit_accuracy"]:.4f}')
+            print(f'Phase {phase} - Epoch {epoch} - Train Bit Acc: {epoch_losses["bit_accuracy"]:.4f} - Val Bit Acc: {val_losses["bit_accuracy"]:.4f}')
 
             for key, value in epoch_losses.items():
                 trainer.writer.add_scalar(f'Phase{phase}/Train/{key}', value, epoch)
             for key, value in val_losses.items():
                 trainer.writer.add_scalar(f'Phase{phase}/Val/{key}', value, epoch)
 
-            is_best = val_losses['L_total'] < trainer.best_loss
+            is_best = val_losses['L_message'] < trainer.best_loss
             if is_best:
-                trainer.best_loss = val_losses['L_total']
+                trainer.best_loss = val_losses['L_message']
             if epoch % cfg.save_interval == 0:
-                trainer.save_checkpoint(epoch, phase, is_best)
+                trainer.save_checkpoint(epoch, phase)
 
             if phase == 2:
                 val_bit_acc = val_losses.get('bit_accuracy', 1.0)
@@ -240,7 +263,31 @@ def main():
     new_run_parser.add_argument('--epochs-phase2', type=int, default=config.Config.num_epochs_phase2,
                                 help='Number of epochs for phase 2 (privacy training).')
     new_run_parser.add_argument('--discriminator-loss-threshold', type=float, default=config.Config.discriminator_loss_threshold,
-                                help='Pause discriminator training when its loss falls below this threshold.')
+                                help='Legacy discriminator loss threshold kept for compatibility.')
+    new_run_parser.add_argument('--disc-acc-high', type=float, default=config.Config.disc_acc_high,
+                                help='Pause discriminator updates when discriminator accuracy reaches this value.')
+    new_run_parser.add_argument('--disc-hinge-margin', type=float, default=config.Config.disc_hinge_margin,
+                                help='Margin used by discriminator hinge loss.')
+
+    new_run_parser.add_argument('--phase1-adv-start', type=float, default=config.Config.phase1_adv_start,
+                                help='Phase 1 adversarial weight during the first third.')
+    new_run_parser.add_argument('--phase1-adv-mid', type=float, default=config.Config.phase1_adv_mid,
+                                help='Phase 1 adversarial weight during the second third.')
+    new_run_parser.add_argument('--phase1-adv-end', type=float, default=config.Config.phase1_adv_end,
+                                help='Phase 1 adversarial weight during the final third.')
+    new_run_parser.add_argument('--phase2-adv', type=float, default=config.Config.phase2_adv,
+                                help='Phase 2 adversarial weight.')
+
+    new_run_parser.add_argument('--phase1-prv-noise-start', type=float, default=config.Config.phase1_prv_noise_start,
+                                help='Phase 1 fraction before dummy privacy noise starts ramping.')
+    new_run_parser.add_argument('--phase1-prv-noise-end', type=float, default=config.Config.phase1_prv_noise_end,
+                                help='Phase 1 fraction where dummy privacy noise reaches its cap.')
+    new_run_parser.add_argument('--phase1-prv-noise-max-ratio', type=float, default=config.Config.phase1_prv_noise_max_ratio,
+                                help='Maximum Phase 1 dummy privacy noise ratio.')
+    new_run_parser.add_argument('--phase1-prv-noise-power', type=float, default=config.Config.phase1_prv_noise_power,
+                                help='Power used for the Phase 1 dummy privacy noise ramp.')
+    new_run_parser.add_argument('--phase1-prv-noise-smooth-kernel', type=int, default=config.Config.phase1_prv_noise_smooth_kernel,
+                                help='Average-pooling kernel for smoothing Phase 1 dummy privacy noise.')
 
     new_run_parser.add_argument('--lr-encoder', type=float, default=config.Config.lr_encoder,
                                 help='Learning rate for encoder')
@@ -253,13 +300,6 @@ def main():
                                 help='Weight for pixel loss.')
     new_run_parser.add_argument('--lambda-ssim', type=float, default=config.Config.lambda_ssim,
                                 help='Weight for SSIM loss.')
-    new_run_parser.add_argument('--lambda-message', type=float, default=config.Config.lambda_message,
-                                help='Weight for message loss.')
-    new_run_parser.add_argument('--lambda-adv', type=float, default=config.Config.lambda_adv,
-                                help='Weight for adversarial loss.')
-    new_run_parser.add_argument('--lambda-privacy', type=float, default=config.Config.lambda_privacy,
-                                help='Weight for privacy loss.')
-
     new_run_parser.add_argument('--num-workers', type=int, default=config.Config.num_workers,
                                 help='Number of data loading workers.')
     new_run_parser.add_argument('--save-interval', type=int, default=config.Config.save_interval,
@@ -289,6 +329,17 @@ def main():
         cfg.num_epochs_phase1 = args.epochs_phase1
         cfg.num_epochs_phase2 = args.epochs_phase2
         cfg.discriminator_loss_threshold = args.discriminator_loss_threshold
+        cfg.disc_acc_high = args.disc_acc_high
+        cfg.disc_hinge_margin = args.disc_hinge_margin
+        cfg.phase1_adv_start = args.phase1_adv_start
+        cfg.phase1_adv_mid = args.phase1_adv_mid
+        cfg.phase1_adv_end = args.phase1_adv_end
+        cfg.phase2_adv = args.phase2_adv
+        cfg.phase1_prv_noise_start = args.phase1_prv_noise_start
+        cfg.phase1_prv_noise_end = args.phase1_prv_noise_end
+        cfg.phase1_prv_noise_max_ratio = args.phase1_prv_noise_max_ratio
+        cfg.phase1_prv_noise_power = args.phase1_prv_noise_power
+        cfg.phase1_prv_noise_smooth_kernel = args.phase1_prv_noise_smooth_kernel
 
         cfg.lr_encoder = args.lr_encoder
         cfg.lr_decoder = args.lr_decoder
@@ -296,9 +347,6 @@ def main():
 
         cfg.lambda_pixel = args.lambda_pixel
         cfg.lambda_ssim = args.lambda_ssim
-        cfg.lambda_message = args.lambda_message
-        cfg.lambda_adv = args.lambda_adv
-        cfg.lambda_privacy = args.lambda_privacy
 
         cfg.num_workers = args.num_workers
         cfg.save_interval = args.save_interval

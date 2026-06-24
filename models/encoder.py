@@ -18,7 +18,8 @@ class ConvBNRelu(nn.Module):
 
 class Encoder(nn.Module):
     def __init__(self, message_length=30, n_channels=3, bilinear=False,
-                 image_size=256, msg_budget=0.05, prv_budget=0.03):
+                 image_size=256, msg_budget=0.05, prv_budget=0.03,
+                 phase1_prv_noise_smooth_kernel=7):
         super(Encoder, self).__init__()
         self.message_length = message_length
         self.n_channels = n_channels
@@ -27,6 +28,7 @@ class Encoder(nn.Module):
         self.W = image_size
         self.msg_budget = msg_budget
         self.prv_budget = prv_budget
+        self.phase1_prv_noise_smooth_kernel = phase1_prv_noise_smooth_kernel
 
         channels = 128
         num_blocks = 16
@@ -76,7 +78,15 @@ class Encoder(nn.Module):
 
         prv_residual = None
         if phase == 1:
-            dummy_prv = self.prv_budget * prv_noise_ratio * torch.randn_like(cover_image)
+            noise = torch.randn_like(cover_image)
+            kernel = self.phase1_prv_noise_smooth_kernel
+            if kernel > 1:
+                if kernel % 2 == 0:
+                    kernel += 1
+                noise = F.avg_pool2d(noise, kernel_size=kernel, stride=1, padding=kernel // 2)
+            noise = noise - noise.mean(dim=(2, 3), keepdim=True)
+            noise = noise / (noise.std(dim=(2, 3), keepdim=True) + 1e-6)
+            dummy_prv = self.prv_budget * prv_noise_ratio * torch.tanh(noise)
             encoded_image = cover_image + msg_residual + dummy_prv
             residual_penalty = torch.mean(msg_residual ** 2) + torch.mean(dummy_prv ** 2)
         else:

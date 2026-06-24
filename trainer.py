@@ -13,7 +13,6 @@ from models import Encoder, Decoder, Steganalyzer, ContentRecognizer
 from losses import SSIMLoss, FeatureRedirectionLoss
 from data import SteganographyDataset
 from noise_layers.noiser import Noiser
-from noise_argparser import NoiseArgParser
 import config
 
 
@@ -80,7 +79,8 @@ class Trainer:
             n_channels=3,
             image_size=cfg.image_size,
             msg_budget=cfg.msg_budget,
-            prv_budget=cfg.prv_budget
+            prv_budget=cfg.prv_budget,
+            phase1_prv_noise_smooth_kernel=cfg.phase1_prv_noise_smooth_kernel
         ).to(self.device)
         self.decoder = Decoder(message_length=cfg.message_length, n_channels=3).to(self.device)
         self.steganalyzer = Steganalyzer(n_channels=3, use_spectral_norm=True).to(self.device)
@@ -191,6 +191,7 @@ class Trainer:
 
         self.best_loss = float('inf')
         self.phase2_msg_head_frozen = False
+        self.disc_train_counter = 0
 
     def get_dataloaders(self):
         train_dataset = SteganographyDataset(
@@ -263,6 +264,46 @@ class Trainer:
         for param in self.encoder.after_concat_layer.parameters():
             param.requires_grad = True
 
+    def _set_requires_grad(self, module, requires_grad):
+        for param in module.parameters():
+            param.requires_grad = requires_grad
+
+    def _disc_hinge_loss(self, real_logits, fake_logits):
+        margin = getattr(self.cfg, 'disc_hinge_margin', 1.0)
+        real_loss = F.relu(margin - real_logits).mean()
+        fake_loss = F.relu(margin + fake_logits).mean()
+        return real_loss + fake_loss
+
+    def _gen_adv_loss(self, fake_logits):
+        return F.softplus(-fake_logits).mean()
+
+    def _disc_metrics(self, real_logits, fake_logits):
+        real_prob = torch.sigmoid(real_logits)
+        fake_prob = torch.sigmoid(fake_logits)
+        real_acc = (real_logits > 0).float().mean()
+        fake_acc = (fake_logits < 0).float().mean()
+        disc_acc = 0.5 * (real_acc + fake_acc)
+        return {
+            'D_real_logit': real_logits.mean().item(),
+            'D_fake_logit': fake_logits.mean().item(),
+            'D_real_prob': real_prob.mean().item(),
+            'D_fake_prob': fake_prob.mean().item(),
+            'D_acc': disc_acc.item()
+        }
+
+    def _adversarial_inputs(self, cover_image, encoded_image, noised_cover_image, noised_encoded_image):
+        if self.has_noise:
+            return noised_cover_image, noised_encoded_image
+        return cover_image, encoded_image
+
+    def _adversarial_losses_and_metrics(self, real_logits, fake_logits):
+        L_D = self._disc_hinge_loss(real_logits, fake_logits)
+        L_adv = self._gen_adv_loss(fake_logits)
+        discr_cover_bce = self.bce_with_logits_loss(real_logits, torch.ones_like(real_logits))
+        discr_encod_bce = self.bce_with_logits_loss(fake_logits, torch.zeros_like(fake_logits))
+        metrics = self._disc_metrics(real_logits, fake_logits)
+        return L_D, L_adv, discr_cover_bce, discr_encod_bce, metrics
+
     def _set_phase_freeze(self, phase, epoch):
         if phase == 1:
             self.unfreeze_msg_head()
@@ -297,31 +338,38 @@ class Trainer:
         L_ssim = self.ssim_loss(encoded_image, cover_image)
         L_visual = self.cfg.lambda_pixel * L_pixel + self.cfg.lambda_ssim * L_ssim
 
-        L_pixel_noised = self.mse_loss(noised_encoded_image, cover_image)
-        L_ssim_noised = self.ssim_loss(noised_encoded_image, cover_image)
+        visual_target_noised = noised_cover_image if self.has_noise else cover_image
+        L_pixel_noised = self.mse_loss(noised_encoded_image, visual_target_noised)
+        L_ssim_noised = self.ssim_loss(noised_encoded_image, visual_target_noised)
         L_visual_noised = self.cfg.lambda_pixel * L_pixel_noised + self.cfg.lambda_ssim * L_ssim_noised
 
         L_message = self.bce_with_logits_loss(message_pred, message)
 
-        disc_stego_input = noised_encoded_image if self.has_noise else encoded_image
-        stego_pred = self.steganalyzer(disc_stego_input.detach())
-        cover_pred = self.steganalyzer(cover_image)
+        disc_real_input, disc_stego_input = self._adversarial_inputs(
+            cover_image, encoded_image, noised_cover_image, noised_encoded_image
+        )
+        fake_logits_for_disc = self.steganalyzer(disc_stego_input.detach())
+        real_logits = self.steganalyzer(disc_real_input.detach())
+        L_D, _, discr_cover_bce, discr_encod_bce, disc_metrics = self._adversarial_losses_and_metrics(
+            real_logits, fake_logits_for_disc
+        )
 
-        discr_cover_bce = self.bce_with_logits_loss(cover_pred, torch.ones_like(cover_pred))
-        discr_encod_bce = self.bce_with_logits_loss(stego_pred, torch.zeros_like(stego_pred))
-        L_D = discr_cover_bce + discr_encod_bce
-
+        D_updated = 0.0
         if weights.get('adv', 0.0) > 0:
-            disc_threshold = getattr(self.cfg, 'discriminator_loss_threshold', None)
-            skip_disc = (disc_threshold is not None and L_D.item() < disc_threshold)
-            if not skip_disc:
-                self.optimizer_steganalyzer.zero_grad()
-                L_D.backward()
-                torch.nn.utils.clip_grad_norm_(self.steganalyzer.parameters(), max_norm=1.0)
-                self.optimizer_steganalyzer.step()
+            self.optimizer_steganalyzer.zero_grad()
+            L_D.backward()
+            torch.nn.utils.clip_grad_norm_(self.steganalyzer.parameters(), max_norm=1.0)
+            self.optimizer_steganalyzer.step()
+            D_updated = 1.0
 
+        self._set_requires_grad(self.steganalyzer, False)
+        steganalyzer_was_training = self.steganalyzer.training
+        self.steganalyzer.eval()
         stego_pred = self.steganalyzer(disc_stego_input)
-        L_adv = self.bce_with_logits_loss(stego_pred, torch.ones_like(stego_pred))
+        L_adv = self._gen_adv_loss(stego_pred)
+        if steganalyzer_was_training:
+            self.steganalyzer.train()
+        self._set_requires_grad(self.steganalyzer, True)
 
         feat_cover = self.content_recognizer(cover_image).detach()
         feat_encoded = self.content_recognizer(encoded_image)
@@ -387,15 +435,18 @@ class Trainer:
             'L_visual_noised': L_visual_noised.item(),
             'L_message': L_message.item(),
             'L_adv': L_adv.item(),
+            'L_D': L_D.item(),
             'discr_cover_bce': discr_cover_bce.item(),
             'discr_encod_bce': discr_encod_bce.item(),
             'L_privacy': L_privacy.item(),
             'L_residual_penalty': residual_penalty.item(),
-            'L_total': L_total.item(),
             'bit_accuracy': bit_accuracy,
             'escape_margin': escape_margin,
-            'prv_noise_ratio': prv_noise_ratio
+            'prv_noise_ratio': prv_noise_ratio,
+            'D_updated': D_updated,
+            'adv_weight': weights.get('adv', 0.0)
         }
+        losses.update(disc_metrics)
 
         for key, value in privacy_loss_dict.items():
             losses[f'privacy_{key}'] = value if isinstance(value, float) else value
@@ -475,18 +526,21 @@ class Trainer:
                 L_ssim = self.ssim_loss(encoded_image, cover_image)
                 L_visual = self.cfg.lambda_pixel * L_pixel + self.cfg.lambda_ssim * L_ssim
 
-                L_pixel_noised = self.mse_loss(noised_encoded_image, cover_image)
-                L_ssim_noised = self.ssim_loss(noised_encoded_image, cover_image)
+                visual_target_noised = noised_cover_image if self.has_noise else cover_image
+                L_pixel_noised = self.mse_loss(noised_encoded_image, visual_target_noised)
+                L_ssim_noised = self.ssim_loss(noised_encoded_image, visual_target_noised)
                 L_visual_noised = self.cfg.lambda_pixel * L_pixel_noised + self.cfg.lambda_ssim * L_ssim_noised
 
                 L_message = self.bce_with_logits_loss(message_pred, message)
 
-                disc_stego_input = noised_encoded_image if self.has_noise else encoded_image
+                disc_real_input, disc_stego_input = self._adversarial_inputs(
+                    cover_image, encoded_image, noised_cover_image, noised_encoded_image
+                )
                 stego_pred = self.steganalyzer(disc_stego_input)
-                cover_pred = self.steganalyzer(cover_image)
-                L_adv = self.bce_with_logits_loss(stego_pred, torch.ones_like(stego_pred))
-                discr_cover_bce = self.bce_with_logits_loss(cover_pred, torch.ones_like(cover_pred))
-                discr_encod_bce = self.bce_with_logits_loss(stego_pred, torch.zeros_like(stego_pred))
+                cover_pred = self.steganalyzer(disc_real_input)
+                L_D, L_adv, discr_cover_bce, discr_encod_bce, disc_metrics = self._adversarial_losses_and_metrics(
+                    cover_pred, stego_pred
+                )
 
                 feat_cover = self.content_recognizer(cover_image)
                 feat_encoded = self.content_recognizer(encoded_image)
@@ -516,14 +570,27 @@ class Trainer:
                     ('L_visual', L_visual),
                     ('L_pixel_noised', L_pixel_noised), ('L_ssim_noised', L_ssim_noised),
                     ('L_visual_noised', L_visual_noised),
-                    ('L_message', L_message), ('L_adv', L_adv),
+                    ('L_message', L_message), ('L_adv', L_adv), ('L_D', L_D),
                     ('discr_cover_bce', discr_cover_bce), ('discr_encod_bce', discr_encod_bce),
                     ('L_privacy', L_privacy), ('L_residual_penalty', residual_penalty),
-                    ('L_total', L_total), ('bit_accuracy', bit_accuracy)
+                    ('bit_accuracy', bit_accuracy)
                 ]:
                     if key not in total_losses:
                         total_losses[key] = 0
                     total_losses[key] += value.item()
+
+                for key, value in disc_metrics.items():
+                    if key not in total_losses:
+                        total_losses[key] = 0
+                    total_losses[key] += value
+
+                for key, value in [
+                    ('D_updated', 0.0), ('adv_weight', weights.get('adv', 0.0)),
+                    ('prv_noise_ratio', prv_noise_ratio)
+                ]:
+                    if key not in total_losses:
+                        total_losses[key] = 0
+                    total_losses[key] += value
 
                 num_batches += 1
 
@@ -591,7 +658,7 @@ class Trainer:
             info_parts.append(f'DINO: {self.dino_memory_bank.memory_count}')
         print(f'Memory Banks warmed up. [{", ".join(info_parts)}]')
 
-    def save_checkpoint(self, epoch, phase, is_best=False):
+    def save_checkpoint(self, epoch, phase):
         checkpoint = {
             'epoch': epoch,
             'phase': phase,
@@ -612,18 +679,3 @@ class Trainer:
 
         path = os.path.join(self.cfg.checkpoint_dir, f'checkpoint_phase{phase}_epoch{epoch}.pth')
         torch.save(checkpoint, path)
-
-        latest_path = os.path.join(self.cfg.checkpoint_dir, 'checkpoint.pth')
-        torch.save(checkpoint, latest_path)
-
-        if is_best:
-            best_path = os.path.join(self.cfg.checkpoint_dir, f'best_phase{phase}.pth')
-            torch.save(checkpoint, best_path)
-
-        checkpoint_files = [f for f in os.listdir(self.cfg.checkpoint_dir)
-                          if f.startswith(f'checkpoint_phase{phase}_epoch') and f.endswith('.pth')]
-
-        if len(checkpoint_files) > 5:
-            checkpoint_files.sort(key=lambda x: os.path.getmtime(os.path.join(self.cfg.checkpoint_dir, x)))
-            oldest_file = checkpoint_files[0]
-            os.remove(os.path.join(self.cfg.checkpoint_dir, oldest_file))
