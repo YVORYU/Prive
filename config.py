@@ -10,7 +10,7 @@ class Config:
 
     lr_encoder = 1e-3
     lr_decoder = 1e-3
-    lr_steganalyzer = 2e-4
+    lr_steganalyzer = 1e-4
 
     num_epochs_phase1 = 150
     num_epochs_phase2 = 100
@@ -21,6 +21,7 @@ class Config:
 
     lambda_pixel = 1.0
     lambda_ssim = 1.0
+    lambda_tv = 10.0
 
     msg_budget = 0.04
     prv_budget = 0.04
@@ -87,7 +88,8 @@ class Config:
                 'adv': adv,
                 'privacy': 0.0,
                 'noised': 1.0,
-                'residual_penalty': 0.5
+                'residual_penalty': 0.5,
+                'tv': 0.0
             }
         elif phase == 2:
             total = self.num_epochs_phase2
@@ -107,7 +109,8 @@ class Config:
                 'adv': self.phase2_adv,
                 'privacy': privacy,
                 'noised': 0.3,
-                'residual_penalty': 0.5
+                'residual_penalty': 0.5,
+                'tv': self.lambda_tv
             }
         else:
             raise ValueError(f'Invalid phase: {phase}')

@@ -19,7 +19,8 @@ class ConvBNRelu(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, message_length=30, n_channels=3, bilinear=False,
                  image_size=256, msg_budget=0.05, prv_budget=0.03,
-                 phase1_prv_noise_smooth_kernel=7):
+                 phase1_prv_noise_smooth_kernel=7,
+                 prv_residual_smooth_kernel=1, prv_residual_smooth_sigma=1.0):
         super(Encoder, self).__init__()
         self.message_length = message_length
         self.n_channels = n_channels
@@ -29,6 +30,8 @@ class Encoder(nn.Module):
         self.msg_budget = msg_budget
         self.prv_budget = prv_budget
         self.phase1_prv_noise_smooth_kernel = phase1_prv_noise_smooth_kernel
+
+        self._prv_smooth_kernel = None
 
         channels = 128
         num_blocks = 16
