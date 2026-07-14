@@ -79,11 +79,12 @@ python -m pytest CLIP/tests/test_consistency.py::test_consistency
 - `train.py` 是 CLI 入口。它解析 `new` 和 `continue` 命令，在 `experiments/<name>/` 下创建实验目录，写入 `config.json` 和 `train.log`，初始化 `Trainer`，按需加载 checkpoint，并运行阶段训练循环。
 - `trainer.py` 负责模型初始化、优化器、dataloader、训练/验证 step、checkpoint、TensorBoard 日志、CLIP/DINO memory bank，以及 Phase 2 冻结 `msg_head`、bit accuracy 下降时执行 decoder recovery 等阶段行为。
 - `data/dataset.py` 递归加载图像文件，并返回包含 `cover_image`、随机二进制 `message` 和 `image_path` 的 batch 字典。
-- `models/encoder.py` 实现双残差编码器。它将 message 扩展到空间维度，提取图像/消息共享特征，然后输出受预算约束的 `msg_residual`；在 Phase 2 还会输出受预算约束的 `prv_residual`。编码图像会被 clamp 到 `[-1, 1]`。
+- `models/encoder.py` 实现双残差编码器。它将 message 扩展到空间维度，提取图像/消息共享特征，然后输出受预算约束的 `msg_residual`；在 Phase 2 还会输出受预算约束的 `prv_residual`，并乘以梯度驱动的纹理掩码将扰动集中在纹理复杂区域。Phase 1 中 `prv_head` 冻结，注入经平滑和零均值单位方差归一化的随机噪声作为预适应。编码图像会被 clamp 到 `[-1, 1]`。
 - `models/decoder.py` 从编码图像预测 message logits；训练损失使用 `BCEWithLogitsLoss`，因此计算训练损失前不要额外加 sigmoid。
 - `models/steganalyzer.py` 是判别器式二分类器，使用 spectral-normalized 卷积层，输出 logits。
 - `models/content_recognizer.py` 封装冻结的 CLIP ViT-B/32 图像/文本特征提取，并对输出做归一化以用于 cosine similarity。
-- `losses/advanced_privacy_loss.py` 定义 `FeatureRedirectionLoss`，组合 CLIP/DINO escape loss，以及可选的 memory bank hard-negative redirection。
+- `losses/advanced_privacy_loss.py` 定义 `FeatureRedirectionLoss`，组合 CLIP/DINO escape loss（二次 Hinge + Softplus 预热），以及可选的 memory bank hard-negative redirection。
+- `trainer.py` 中的对抗训练采用 Hinge Loss（判别器，margin=1.0）+ Softplus 非饱和损失（生成器），并通过判别器准确率门控（`disc_acc_high=0.70`）控制更新。Phase 2 还会对隐私残差施加 FFT 高频能量惩罚（`lambda_fft=10.0`）。
 - `noise_layers/` 包含可微或随机信道噪声模块。`noise_argparser.py` 接受 `crop((hmin,hmax),(wmin,wmax))`、`cropout((hmin,hmax),(wmin,wmax))`、`dropout(keep_min,keep_max)`、`resize(min,max)`、`jpeg`、`quant` 等字符串；`trainer.py` 用 `+` 拆分组合配置，`Noiser` 每次 forward 随机选择一个激活噪声层。
 - `validation_script.py` 加载 checkpoint，并支持单张图像的编码、解码、判别器预测、CLIP/DINO/SSIM/PSNR 相似度检查。
 
@@ -94,7 +95,7 @@ python -m pytest CLIP/tests/test_consistency.py::test_consistency
 1. Phase 1 训练基础隐写能力和对抗能力。编码器使用 `msg_residual` 加上由 `Config.get_prv_noise_ratio` 渐进引入的随机隐私噪声；privacy loss 权重为 0。
 2. Phase 2 冻结 `encoder.msg_head`，通过 `prv_head` 训练隐私扰动，使用 `Config.get_escape_margin` 提供的渐进 privacy margin，并在验证 bit accuracy 低于 `Config.bit_accuracy_threshold` 时触发 decoder recovery。
 
-当前 `config.py` 中的重要默认值包括：`image_size=256`、`message_length=30`、`batch_size=8`、`num_epochs_phase1=150`、`num_epochs_phase2=150`、`msg_budget=0.04`、`prv_budget=0.06`、`use_clip_redirect=False`、`dino_weight=1.0`、`noise_config='identity'`。
+当前 `config.py` 中的重要默认值包括：`image_size=256`、`message_length=30`、`batch_size=8`、`num_epochs_phase1=150`、`num_epochs_phase2=100`、`msg_budget=0.04`、`prv_budget=0.04`、`use_clip_redirect=False`、`dino_weight=0.5`、`noise_config='identity'`。
 
 ## 生成输出
 

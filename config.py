@@ -21,10 +21,13 @@ class Config:
 
     lambda_pixel = 1.0
     lambda_ssim = 1.0
-    lambda_tv = 10.0
+    lambda_fft = 10.0
 
     msg_budget = 0.04
     prv_budget = 0.04
+
+    texture_mask_strength = 3.0
+    texture_mask_smooth_kernel = 5
 
     phase1_adv_start = 0.0
     phase1_adv_mid = 0.25
@@ -38,7 +41,7 @@ class Config:
     phase1_prv_noise_smooth_kernel = 7
 
     privacy_margin_start = 0.15
-    privacy_margin_end = 0.35
+    privacy_margin_end = 0.30
 
     use_clip_redirect = False
     clip_memory_size = 5000
@@ -89,7 +92,7 @@ class Config:
                 'privacy': 0.0,
                 'noised': 1.0,
                 'residual_penalty': 0.5,
-                'tv': 0.0
+                'fft': 0.0
             }
         elif phase == 2:
             total = self.num_epochs_phase2
@@ -110,7 +113,7 @@ class Config:
                 'privacy': privacy,
                 'noised': 0.3,
                 'residual_penalty': 0.5,
-                'tv': self.lambda_tv
+                'fft': self.lambda_fft
             }
         else:
             raise ValueError(f'Invalid phase: {phase}')

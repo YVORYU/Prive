@@ -20,7 +20,8 @@ class Encoder(nn.Module):
     def __init__(self, message_length=30, n_channels=3, bilinear=False,
                  image_size=256, msg_budget=0.05, prv_budget=0.03,
                  phase1_prv_noise_smooth_kernel=7,
-                 prv_residual_smooth_kernel=1, prv_residual_smooth_sigma=1.0):
+                 prv_residual_smooth_kernel=1, prv_residual_smooth_sigma=1.0,
+                 texture_mask_strength=5.0, texture_mask_smooth_kernel=5):
         super(Encoder, self).__init__()
         self.message_length = message_length
         self.n_channels = n_channels
@@ -30,6 +31,8 @@ class Encoder(nn.Module):
         self.msg_budget = msg_budget
         self.prv_budget = prv_budget
         self.phase1_prv_noise_smooth_kernel = phase1_prv_noise_smooth_kernel
+        self.texture_mask_strength = texture_mask_strength
+        self.texture_mask_smooth_kernel = texture_mask_smooth_kernel
 
         self._prv_smooth_kernel = None
 
@@ -64,6 +67,23 @@ class Encoder(nn.Module):
             nn.Conv2d(channels, 3, kernel_size=1)
         )
 
+    def _compute_texture_mask(self, cover_image):
+        with torch.no_grad():
+            gray = cover_image.mean(dim=1, keepdim=True)
+            grad_h = torch.abs(gray[:, :, 1:, :] - gray[:, :, :-1, :])
+            grad_w = torch.abs(gray[:, :, :, 1:] - gray[:, :, :, :-1])
+            grad_h = F.pad(grad_h, (0, 0, 0, 1))
+            grad_w = F.pad(grad_w, (0, 1, 0, 0))
+            grad = grad_h + grad_w
+            k = self.texture_mask_smooth_kernel
+            if k > 1:
+                if k % 2 == 0:
+                    k += 1
+                grad = F.avg_pool2d(grad, kernel_size=k, stride=1, padding=k // 2)
+            mask = torch.sigmoid(grad * self.texture_mask_strength)
+            mask = torch.clamp(mask, min=0.15, max=1.0)
+        return mask
+
     def forward(self, cover_image, message, phase=1, prv_noise_ratio=0.0):
         expanded_message = message.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.H, self.W)
 
@@ -95,6 +115,8 @@ class Encoder(nn.Module):
         else:
             prv_residual = self.prv_head(shared)
             prv_residual = self.prv_budget * torch.tanh(prv_residual)
+            texture_mask = self._compute_texture_mask(cover_image)
+            prv_residual = prv_residual * texture_mask
             encoded_image = cover_image + msg_residual + prv_residual
             residual_penalty = torch.mean(msg_residual ** 2) + torch.mean(prv_residual ** 2)
 

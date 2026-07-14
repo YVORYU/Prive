@@ -80,7 +80,9 @@ class Trainer:
             image_size=cfg.image_size,
             msg_budget=cfg.msg_budget,
             prv_budget=cfg.prv_budget,
-            phase1_prv_noise_smooth_kernel=cfg.phase1_prv_noise_smooth_kernel
+            phase1_prv_noise_smooth_kernel=cfg.phase1_prv_noise_smooth_kernel,
+            texture_mask_strength=cfg.texture_mask_strength,
+            texture_mask_smooth_kernel=cfg.texture_mask_smooth_kernel
         ).to(self.device)
         self.decoder = Decoder(message_length=cfg.message_length, n_channels=3).to(self.device)
         self.steganalyzer = Steganalyzer(n_channels=3, use_spectral_norm=True).to(self.device)
@@ -269,10 +271,18 @@ class Trainer:
             param.requires_grad = requires_grad
 
     @staticmethod
-    def _tv_loss(residual):
-        tv_h = torch.mean(torch.abs(residual[:, :, 1:, :] - residual[:, :, :-1, :]))
-        tv_w = torch.mean(torch.abs(residual[:, :, :, 1:] - residual[:, :, :, :-1]))
-        return tv_h + tv_w
+    def _fft_high_freq_loss(residual):
+        fft = torch.fft.fft2(residual, norm='ortho')
+        amplitude = torch.abs(fft)
+        amplitude = torch.fft.fftshift(amplitude, dim=(-2, -1))
+        H, W = residual.shape[-2], residual.shape[-1]
+        cy, cx = H // 2, W // 2
+        y = torch.arange(H, device=residual.device).float().unsqueeze(1)
+        x = torch.arange(W, device=residual.device).float().unsqueeze(0)
+        dist = torch.sqrt((y - cy) ** 2 + (x - cx) ** 2)
+        radius = min(H, W) // 4
+        mask = (dist > radius).float()
+        return torch.sqrt((amplitude * mask).mean() + 1e-8)
 
     def _disc_hinge_loss(self, real_logits, fake_logits):
         margin = getattr(self.cfg, 'disc_hinge_margin', 1.0)
@@ -410,18 +420,18 @@ class Trainer:
         )
 
         residual_penalty_weight = weights.get('residual_penalty', 0.05)
-        tv_weight = weights.get('tv', 0.0)
-        if tv_weight > 0 and prv_residual is not None:
-            L_tv = self._tv_loss(prv_residual)
+        fft_weight = weights.get('fft', 0.0)
+        if fft_weight > 0 and prv_residual is not None:
+            L_fft = self._fft_high_freq_loss(prv_residual)
         else:
-            L_tv = torch.tensor(0.0, device=self.device)
+            L_fft = torch.tensor(0.0, device=self.device)
         L_visual_weighted = weights['visual'] * (L_visual + weights['noised'] * L_visual_noised)
         L_non_visual = (weights['message'] * L_message +
                        weights['adv'] * L_adv +
                        residual_penalty_weight * residual_penalty)
         L_privacy_weighted = weights['privacy'] * L_privacy
-        L_tv_weighted = tv_weight * L_tv
-        L_total = L_visual_weighted + L_non_visual + L_privacy_weighted + L_tv_weighted
+        L_fft_weighted = fft_weight * L_fft
+        L_total = L_visual_weighted + L_non_visual + L_privacy_weighted + L_fft_weighted
 
         self.optimizer_encoder_decoder.zero_grad()
         L_total.backward()
@@ -452,7 +462,7 @@ class Trainer:
             'discr_encod_bce': discr_encod_bce.item(),
             'L_privacy': L_privacy.item(),
             'L_residual_penalty': residual_penalty.item(),
-            'L_tv': L_tv.item(),
+            'L_fft': L_fft.item(),
             'bit_accuracy': bit_accuracy,
             'escape_margin': escape_margin,
             'prv_noise_ratio': prv_noise_ratio,
@@ -569,17 +579,17 @@ class Trainer:
                 )
 
                 residual_penalty_weight = weights.get('residual_penalty', 0.05)
-                tv_weight = weights.get('tv', 0.0)
-                if tv_weight > 0 and prv_residual is not None:
-                    L_tv = self._tv_loss(prv_residual)
+                fft_weight = weights.get('fft', 0.0)
+                if fft_weight > 0 and prv_residual is not None:
+                    L_fft = self._fft_high_freq_loss(prv_residual)
                 else:
-                    L_tv = torch.tensor(0.0, device=self.device)
+                    L_fft = torch.tensor(0.0, device=self.device)
                 L_total = (weights['visual'] * (L_visual + weights['noised'] * L_visual_noised) +
                           weights['message'] * L_message +
                           weights['adv'] * L_adv +
                           weights['privacy'] * L_privacy +
                           residual_penalty_weight * residual_penalty +
-                          tv_weight * L_tv)
+                          fft_weight * L_fft)
 
                 message_pred_binary = (torch.sigmoid(message_pred) > 0.5).float()
                 bit_accuracy = (message_pred_binary == message).float().mean()
@@ -592,7 +602,7 @@ class Trainer:
                     ('L_message', L_message), ('L_adv', L_adv), ('L_D', L_D),
                     ('discr_cover_bce', discr_cover_bce), ('discr_encod_bce', discr_encod_bce),
                     ('L_privacy', L_privacy), ('L_residual_penalty', residual_penalty),
-                    ('L_tv', L_tv),
+                    ('L_fft', L_fft),
                     ('bit_accuracy', bit_accuracy)
                 ]:
                     if key not in total_losses:
@@ -699,3 +709,6 @@ class Trainer:
 
         path = os.path.join(self.cfg.checkpoint_dir, f'checkpoint_phase{phase}_epoch{epoch}.pth')
         torch.save(checkpoint, path)
+
+        latest_path = os.path.join(self.cfg.checkpoint_dir, 'checkpoint.pth')
+        torch.save(checkpoint, latest_path)
