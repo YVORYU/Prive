@@ -50,22 +50,18 @@ class Encoder(nn.Module):
     # 双残差编码器主类
     # 职责：将消息和隐私信息同时嵌入载体图像，输出编码图像以及对应的残差和正则项
 
-    def __init__(self, message_length=30, n_channels=3, bilinear=False,
+    def __init__(self, message_length=30, n_channels=3,
                  image_size=256, msg_budget=0.05, prv_budget=0.03,
                  phase1_prv_noise_smooth_kernel=7,
-                 prv_residual_smooth_kernel=1, prv_residual_smooth_sigma=1.0,
                  texture_mask_strength=5.0, texture_mask_smooth_kernel=5):
         # 构造函数：初始化编码器
         # 参数：
         #   message_length (int): 二进制消息位数，默认 30
         #   n_channels (int): 图像通道数，默认 3（RGB）
-        #   bilinear (bool): 是否使用双线性上采样（保留接口，当前未使用）
         #   image_size (int): 输入图像的空间尺寸（正方形），默认 256
         #   msg_budget (float): 消息残差的预算上界，控制嵌入强度
         #   prv_budget (float): 隐私残差的预算上界，控制扰动强度
         #   phase1_prv_noise_smooth_kernel (int): Phase 1 随机隐私噪声的平滑核大小
-        #   prv_residual_smooth_kernel (int): 隐私残差平滑核大小（保留接口）
-        #   prv_residual_smooth_sigma (float): 隐私残差平滑高斯 sigma（保留接口）
         #   texture_mask_strength (float): 纹理掩码 sigmoid 的缩放强度
         #   texture_mask_smooth_kernel (int): 纹理掩码梯度图的平滑核大小
         super(Encoder, self).__init__()
@@ -73,8 +69,6 @@ class Encoder(nn.Module):
         self.message_length = message_length
         # 保存图像通道数
         self.n_channels = n_channels
-        # 保存是否使用双线性上采样标志（保留接口）
-        self.bilinear = bilinear
         # 图像高度，等于 image_size
         self.H = image_size
         # 图像宽度，等于 image_size
@@ -89,9 +83,6 @@ class Encoder(nn.Module):
         self.texture_mask_strength = texture_mask_strength
         # 纹理掩码梯度图平滑核大小
         self.texture_mask_smooth_kernel = texture_mask_smooth_kernel
-
-        # 预留的隐私残差平滑核张量缓存（当前未使用，初始化为 None）
-        self._prv_smooth_kernel = None
 
         # 共享特征通道数
         channels = 128

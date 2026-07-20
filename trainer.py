@@ -14,7 +14,6 @@ import torch.nn.functional as F  # 函数式接口，提供 relu、normalize、i
 import torch.optim as optim  # 优化器模块，Adam 等
 import timm  # PyTorch Image Models，用于加载 DINOv2 ViT-S/14 模型
 from torch.utils.data import DataLoader  # 数据加载器，支持批量、打乱、多进程
-import numpy as np  # 数值计算（虽然本文件未直接使用，但保留以备扩展）
 from torch.utils.tensorboard import SummaryWriter  # TensorBoard 日志写入器
 from torchvision.utils import save_image, make_grid  # 图像保存与网格拼接工具
 
@@ -23,7 +22,6 @@ from models import Encoder, Decoder, Steganalyzer, ContentRecognizer  # 编码�
 from losses import SSIMLoss, FeatureRedirectionLoss  # SSIM 损失与 CLIP/DINO 特征偏移损失
 from data import SteganographyDataset  # 隐写数据集，递归加载图像并生成随机消息
 from noise_layers.noiser import Noiser  # 噪声合成器，按概率施加信道噪声
-import config  # 全局配置模块，定义 Config 类
 
 
 # 特征记忆库：用于存储历史载体图像的 CLIP/DINO 特征向量，
@@ -281,7 +279,6 @@ class Trainer:
 
         self.best_loss = float('inf')  # 记录历史最佳验证损失，用于 best checkpoint 判断
         self.phase2_msg_head_frozen = False  # 标记 Phase 2 中 msg_head 是否已被冻结
-        self.disc_train_counter = 0  # 判别器训练计数（用于调度，预留字段）
 
     # 构建训练与验证的 DataLoader
     # 返回: (train_loader, val_loader) 两个 DataLoader
@@ -824,19 +821,11 @@ class Trainer:
                 )
 
                 # 残差惩罚与 FFT 损失
-                residual_penalty_weight = weights.get('residual_penalty', 0.05)
                 fft_weight = weights.get('fft', 0.0)
                 if fft_weight > 0 and prv_residual is not None:
                     L_fft = self._fft_high_freq_loss(prv_residual)
                 else:
                     L_fft = torch.tensor(0.0, device=self.device)
-                # 验证用总损失（与 train_step 一致结构）
-                L_total = (weights['visual'] * (L_visual + weights['noised'] * L_visual_noised) +
-                          weights['message'] * L_message +
-                          weights['adv'] * L_adv +
-                          weights['privacy'] * L_privacy +
-                          residual_penalty_weight * residual_penalty +
-                          fft_weight * L_fft)
 
                 # 计算本 batch 的 bit accuracy
                 message_pred_binary = (torch.sigmoid(message_pred) > 0.5).float()

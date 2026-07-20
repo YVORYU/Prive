@@ -283,10 +283,6 @@ def run_training_loop(trainer, train_loader, val_loader, cfg, start_phase, start
             trainer.decoder.train()
             trainer.steganalyzer.train()
 
-            if hasattr(trainer, 'retrieval_escape_loss') and trainer.retrieval_escape_loss is not None:
-                # 若存在隐私逃逸损失模块，通知其当前 epoch（用于渐进调度）
-                trainer.retrieval_escape_loss.set_epoch(epoch)
-
             # 累积当前 epoch 各项损失
             epoch_losses = {}
             num_batches = 0
@@ -345,7 +341,7 @@ def run_training_loop(trainer, train_loader, val_loader, cfg, start_phase, start
                     recovery_steps = getattr(cfg, 'recovery_steps', 10)
                     # 在干净消息上重新训练 decoder
                     trainer.recovery_step(train_loader, num_batches=recovery_steps)
-                    print(f'  [RECOVERY] Done, decoder retrained on clean messages')
+                    print('  [RECOVERY] Done, decoder retrained on clean messages')
 
     print('Training completed!')
     # 关闭 TensorBoard writer

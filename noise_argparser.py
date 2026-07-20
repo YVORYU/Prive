@@ -14,11 +14,8 @@ import re  # 正则表达式，用于解析噪声配置字符串中的数值
 # 以下为各噪声层模块，每个模块都是一个可微或随机的信道噪声层
 from noise_layers.cropout import Cropout  # cropout 噪声：外围裁剪/填充
 from noise_layers.crop import Crop  # crop 噪声：中心裁剪
-from noise_layers.identity import Identity  # identity 噪声：恒等映射（无噪声）
 from noise_layers.dropout import Dropout  # dropout 噪声：随机丢弃像素
 from noise_layers.resize import Resize  # resize 噪声：随机缩放
-from noise_layers.quantization import Quantization  # quant 噪声：量化噪声
-from noise_layers.jpeg_compression import JpegCompression  # jpeg 噪声：JPEG 压缩
 
 
 def parse_pair(match_groups):
@@ -126,16 +123,6 @@ class NoiseArgParser(argparse.Action):
                                  help=help,
                                  metavar=metavar,
                                  )
-
-    @staticmethod
-    def parse_cropout_args(cropout_args):
-        # 占位方法：预留用于解析 cropout 参数（当前未实现，pass 保持空实现）
-        pass
-
-    @staticmethod
-    def parse_dropout_args(dropout_args):
-        # 占位方法：预留用于解析 dropout 参数（当前未实现，pass 保持空实现）
-        pass
 
     def __call__(self, parser, namespace, values,
                  option_string=None):

@@ -90,37 +90,43 @@ def idct_coeff(n, k, N):
         np.pi / N * (k + 1. / 2.) * n)) * np.sqrt(1 / (2. * N))
 
 
-def rgb2yuv(image_rgb, image_yuv_out):
+def rgb2yuv(image_rgb):
     # 将 RGB 图像转换为 YUV 色彩空间（使用 BT.601 标准系数）
     # JPEG 压缩在 YUV 空间进行，便于对亮度和色度分量分别处理
     # 参数:
     #   image_rgb: 输入 RGB 图像张量，形状 (batch, 3, H, W)
-    #   image_yuv_out: 输出 YUV 图像张量，形状与输入相同（原地写入）
+    # 返回:
+    #   YUV 图像张量，形状与输入相同（新建张量，保留梯度连接）
     r = image_rgb[:, 0, :, :]  # R 通道
     g = image_rgb[:, 1, :, :]  # G 通道
     b = image_rgb[:, 2, :, :]  # B 通道
     # Y 分量（亮度）：按 BT.601 标准加权
-    image_yuv_out[:, 0, :, :] = 0.299 * r + 0.587 * g + 0.114 * b
+    y = 0.299 * r + 0.587 * g + 0.114 * b
     # U 分量（色度蓝-黄）
-    image_yuv_out[:, 1, :, :] = -0.168736 * r - 0.331264 * g + 0.5 * b
+    u = -0.168736 * r - 0.331264 * g + 0.5 * b
     # V 分量（色度红-青）
-    image_yuv_out[:, 2, :, :] = 0.5 * r - 0.418688 * g - 0.081312 * b
+    v = 0.5 * r - 0.418688 * g - 0.081312 * b
+    # 在通道维度上堆叠，返回新张量（避免原地赋值切断梯度流）
+    return torch.stack([y, u, v], dim=1)
 
 
-def yuv2rgb(image_yuv, image_rgb_out):
+def yuv2rgb(image_yuv):
     # 将 YUV 图像转换回 RGB 色彩空间（使用 BT.601 标准系数）
     # 参数:
     #   image_yuv: 输入 YUV 图像张量，形状 (batch, 3, H, W)
-    #   image_rgb_out: 输出 RGB 图像张量（原地写入）
+    # 返回:
+    #   RGB 图像张量（新建张量，保留梯度连接）
     y = image_yuv[:, 0, :, :]  # Y 分量
     u = image_yuv[:, 1, :, :]  # U 分量
     v = image_yuv[:, 2, :, :]  # V 分量
     # R 通道
-    image_rgb_out[:, 0, :, :] = y + 1.402 * v
+    r = y + 1.402 * v
     # G 通道
-    image_rgb_out[:, 1, :, :] = y - 0.344 * u - 0.714 * v
+    g = y - 0.344 * u - 0.714 * v
     # B 通道
-    image_rgb_out[:, 2, :, :] = y + 1.772 * u
+    b = y + 1.772 * u
+    # 在通道维度上堆叠，返回新张量
+    return torch.stack([r, g, b], dim=1)
 
 
 class JpegCompression(nn.Module):
@@ -146,7 +152,6 @@ class JpegCompression(nn.Module):
         self.idct_conv_weights.unsqueeze_(1)
 
         self.yuv_keep_weighs = yuv_keep_weights  # 保存各通道保留系数个数（注意：原代码此处拼写为 weighs）
-        self.keep_coeff_masks = []  # 保留系数掩码列表（当前未直接使用）
 
         self.jpeg_mask = None  # 当前缓存的 JPEG 截断掩码
 
@@ -201,7 +206,8 @@ class JpegCompression(nn.Module):
         # 对每个通道独立进行卷积
         for channel in range(image.shape[1]):
             # 取出当前通道，并增加一个通道维度以适配 conv2d 输入
-            image_yuv_ch = image[:, channel, :, :].unsqueeze_(1)
+            # 使用非原地 unsqueeze 避免修改视图 strides 导致 autograd 版本冲突
+            image_yuv_ch = image[:, channel, :, :].unsqueeze(1)
             # 以步长 8 进行卷积，输出 64 个通道（对应 8x8 个 DCT 系数）
             image_conv = F.conv2d(image_yuv_ch, filters, stride=8)
             # 调整维度顺序：将通道维度移到最后 -> (batch, H', W', 64)
@@ -216,7 +222,8 @@ class JpegCompression(nn.Module):
                                                   image_conv.shape[3]*image_conv.shape[4])
 
             # 增加通道维度，以便后续按通道拼接
-            image_conv.unsqueeze_(1)
+            # 使用非原地 unsqueeze 避免原地修改破坏计算图
+            image_conv = image_conv.unsqueeze(1)
 
             # image_conv = F.conv2d()
             image_conv_channels.append(image_conv)
@@ -245,8 +252,7 @@ class JpegCompression(nn.Module):
         noised_image = nn.ZeroPad2d((0, pad_width, 0, pad_height))(noised_image)
 
         # 将 RGB 图像转换为 YUV 色彩空间
-        image_yuv = torch.empty_like(noised_image)
-        rgb2yuv(noised_image, image_yuv)
+        image_yuv = rgb2yuv(noised_image)
 
         # 断言补零后图像尺寸是 8 的倍数
         assert image_yuv.shape[2] % 8 == 0
@@ -268,8 +274,7 @@ class JpegCompression(nn.Module):
         # 对截断后的 DCT 系数进行逆 DCT 变换
         image_idct = self.apply_conv(image_dct_mask, 'idct')
         # 将 YUV 转换回 RGB
-        image_ret_padded = torch.empty_like(image_dct)
-        yuv2rgb(image_idct, image_ret_padded)
+        image_ret_padded = yuv2rgb(image_idct)
 
         # 去除补零部分，恢复原始尺寸
         noised_image = image_ret_padded[:, :, :image_ret_padded.shape[2]-pad_height, :image_ret_padded.shape[3]-pad_width].clone()

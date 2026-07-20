@@ -59,5 +59,9 @@ class Noiser(nn.Module):
         #   所选噪声层的输出
         # 随机选取一个噪声层的索引
         idx = np.random.randint(0, len(self.noise_layers))
+        # 转为 list：部分噪声层（如 Cropout）会对输入做原地赋值 noised_and_cover[0] = ...，
+        # 元组不可变会导致 TypeError，因此统一转为可变 list 传入
+        if isinstance(encoded_and_cover, tuple):
+            encoded_and_cover = list(encoded_and_cover)
         # 调用所选噪声层的 forward 方法
         return self.noise_layers[idx](encoded_and_cover)

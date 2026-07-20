@@ -471,7 +471,7 @@ class ValidationScript:
         print(f"SSIM: {ssim_value:.6f}")
         print(f"PSNR: {psnr:.2f} dB")
         # 打印隐私判断结论: 相似度越高，保护程度越低
-        print(f"\n隐私判断结论:")
+        print("\n隐私判断结论:")
         print(f"  - CLIP 特征相似度: {similarity_prob*100:.2f}%")
         print(f"  - CLIP 隐私保护程度: {(1-similarity_prob)*100:.2f}%")
         if dino_sim is not None:
@@ -535,9 +535,9 @@ class ValidationScript:
         )
 
         # 6. 判别器对原始图像做预测，得到原图被判为含密的概率
-        cover_prob, cover_logit = self.discriminator_predict(cover_image, "原始图像")
+        cover_prob, _ = self.discriminator_predict(cover_image, "原始图像")
         # 7. 判别器对编码图像做预测，得到隐写图被判为含密的概率
-        stego_prob, stego_logit = self.discriminator_predict(encoded_image, "隐写图像")
+        stego_prob, _ = self.discriminator_predict(encoded_image, "隐写图像")
 
         # 8. 计算 CLIP/DINO/SSIM/PSNR 等多维度隐私相似度指标
         privacy_results = self.privacy_similarity(cover_image, encoded_image)
@@ -669,7 +669,7 @@ class ValidationScript:
             print(f"DINO 欧氏距离: {privacy_results['dino_euclidean_distance']:.6f}")
         print(f"SSIM: {privacy_results['ssim']:.6f}")
         print(f"PSNR: {privacy_results['psnr']:.2f} dB")
-        print(f"\n结论:")
+        print("\n结论:")
         print(f"  - CLIP 相似概率: {privacy_results['similarity_probability']*100:.2f}%")
         print(f"  - CLIP 隐私保护程度: {(1-privacy_results['similarity_probability'])*100:.2f}%")
         # 若 DINOv2 启用，则额外打印 DINO 隐私指标
@@ -743,20 +743,20 @@ def main():
         # 完整验证模式: 未提供 checkpoint 时给出警告，仍可继续 (使用未训练模型)
         if args.checkpoint is None:
             print("警告: 完整验证模式需要检查点，使用未训练的模型进行验证...")
-        results = validator.run_full_validation(
+        validator.run_full_validation(
             image_path=args.image,
             message=args.message,
             output_dir=args.output_dir
         )
     elif args.mode == 'discriminator':
         # 仅判别器预测模式
-        prob, logit = validator.run_discriminator_only(image_path=args.image)
+        prob, _ = validator.run_discriminator_only(image_path=args.image)
     elif args.mode == 'decode':
         # 仅解码模式
         message_str, decoded_prob = validator.run_decode_only(image_path=args.image)
     else:
         # 相似度判断模式 (此时 args.cover 已确保存在)
-        privacy_results = validator.run_similarity_only(cover_image_path=args.cover, stego_image_path=args.image)
+        validator.run_similarity_only(cover_image_path=args.cover, stego_image_path=args.image)
 
 
 # 脚本直接执行入口: 调用 main 函数

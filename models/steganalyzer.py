@@ -6,9 +6,7 @@
 # 架构：多层卷积下采样 + 全局平均池化 + 全连接层，最终输出单标量 logit。
 # ==============================================================================
 
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class Steganalyzer(nn.Module):

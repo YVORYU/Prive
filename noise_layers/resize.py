@@ -1,6 +1,5 @@
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from noise_layers.crop import random_float
 # 本模块实现缩放（Resize）噪声层
 # 主要功能是：将噪声图像按随机比例先缩放再缩放回原尺寸，模拟图像缩放处理造成的失真

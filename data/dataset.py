@@ -6,8 +6,6 @@
 
 # 导入 os 模块，用于目录遍历与路径拼接
 import os
-# 导入 random 模块（保留导入，便于后续扩展随机数据增强）
-import random
 # 导入 PyTorch 主模块，用于张量操作（生成随机 message 等）
 import torch
 # 从 torch.utils.data 导入 Dataset 基类，用于自定义数据集

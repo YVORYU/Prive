@@ -6,9 +6,7 @@
 # 架构：多层 ConvBNRelu 堆叠 + 自适应平均池化 + 全连接层，将图像压缩为消息位 logits。
 # ==============================================================================
 
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class ConvBNRelu(nn.Module):

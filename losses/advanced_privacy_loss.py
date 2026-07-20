@@ -52,14 +52,6 @@ class FeatureRedirectionLoss(nn.Module):
         self.clip_max_target_sim = clip_max_target_sim
         # 保存 DINOv2 redirect 控制项的相似度上限
         self.dino_max_target_sim = dino_max_target_sim
-        # 当前训练 epoch，可由外部通过 set_epoch 设置（当前实现未直接使用，预留给调度）
-        self.current_epoch = 0
-
-    # 设置当前 epoch，便于后续基于训练进度做 margin/weight 调度
-    # 参数：epoch - 当前训练轮次
-    def set_epoch(self, epoch):
-        # 更新内部记录的 epoch
-        self.current_epoch = epoch
 
     # 计算 escape loss：将编码特征推离载体特征
     # 参数：
