@@ -93,9 +93,34 @@ def save_config(config_path, cfg):
         'dino_redirect_weight': cfg.dino_redirect_weight,
         'dino_redirect_margin': cfg.dino_redirect_margin,
         'dino_max_target_sim': cfg.dino_max_target_sim,
+        'clip_redirect_target_sim': cfg.clip_redirect_target_sim,
+        'dino_redirect_target_sim': cfg.dino_redirect_target_sim,
+        'clip_redirect_exclude_sim': cfg.clip_redirect_exclude_sim,
+        'dino_redirect_exclude_sim': cfg.dino_redirect_exclude_sim,
+        'dino_escape_margin_start': cfg.dino_escape_margin_start,
+        'dino_escape_margin_end': cfg.dino_escape_margin_end,
+        'msg_clean_ratio_start': cfg.msg_clean_ratio_start,
+        'msg_clean_ratio_end': cfg.msg_clean_ratio_end,
+        'privacy_noised_ratio': cfg.privacy_noised_ratio,
+        'privacy_noised_ratio_sprint': getattr(cfg, 'privacy_noised_ratio_sprint', 0.0),
+        'phase2_sprint_epochs': cfg.phase2_sprint_epochs,
+        'phase2_sprint_visual': cfg.phase2_sprint_visual,
+        'phase2_sprint_privacy': cfg.phase2_sprint_privacy,
+        # 必须持久化：continue 恢复配置依赖 config.json，缺失会使精修段静默失效
+        'phase2_refine_epochs': getattr(cfg, 'phase2_refine_epochs', 0),
+        'prv_head_lr_mult': cfg.prv_head_lr_mult,
+        'distill_inner_steps': getattr(cfg, 'distill_inner_steps', 0),
+        'distill_lr': getattr(cfg, 'distill_lr', 0.1),
+        'distill_weight': getattr(cfg, 'distill_weight', 0.0),
+        'distill_w_privacy': getattr(cfg, 'distill_w_privacy', 12.0),
+        'distill_w_message': getattr(cfg, 'distill_w_message', 10.0),
+        'distill_w_visual': getattr(cfg, 'distill_w_visual', 15.0),
         'clip_weight': cfg.clip_weight,
         'dino_weight': cfg.dino_weight,
         'dino_model_path': cfg.dino_model_path,
+        # 结构/频域约束配置
+        'prv_lowres_size': cfg.prv_lowres_size,
+        'fft_high_freq_radius_ratio': cfg.fft_high_freq_radius_ratio,
         # 恢复触发阈值
         'bit_accuracy_threshold': cfg.bit_accuracy_threshold,
         'recovery_steps': cfg.recovery_steps,
@@ -108,6 +133,24 @@ def save_config(config_path, cfg):
     # 以 UTF-8 编码、4 空格缩进写入 JSON
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config_dict, f, indent=4)
+
+
+def load_encoder_state_compatible(encoder, state_dict):
+    # 加载编码器权重，自动跳过形状不匹配的项。
+    # 背景：prv_head 输入从 128 通道扩为 256 通道（新增 prv_trunk 独立支路），
+    # 旧 checkpoint 的 prv_head 卷积权重形状不匹配；这些层与新增的 prv_trunk
+    # 保持新初始化、由 Phase 2 重新训练，消息通路（conv_layers/after_concat_layer/
+    # msg_head）与 decoder 的权重完整复用，消息解码能力不受影响。
+    # 参数：
+    #   encoder - Encoder 模型实例
+    #   state_dict - checkpoint 中的 encoder_state_dict
+    model_state = encoder.state_dict()
+    compatible = {k: v for k, v in state_dict.items()
+                  if k in model_state and model_state[k].shape == v.shape}
+    skipped = [k for k in state_dict if k not in compatible]
+    if skipped:
+        print(f"[Checkpoint] 跳过 {len(skipped)} 个与新结构不兼容的编码器权重（隐私支路相关，Phase 2 重训）: {skipped[:6]}")
+    encoder.load_state_dict(compatible, strict=False)
 
 
 def setup_logger(log_file, cfg, append=False):
@@ -153,9 +196,30 @@ def setup_logger(log_file, cfg, append=False):
             'phase1_prv_noise_smooth_kernel': cfg.phase1_prv_noise_smooth_kernel,
             'privacy_margin_start': cfg.privacy_margin_start,
             'privacy_margin_end': cfg.privacy_margin_end,
+            'dino_escape_margin_start': cfg.dino_escape_margin_start,
+            'dino_escape_margin_end': cfg.dino_escape_margin_end,
             'use_clip_redirect': cfg.use_clip_redirect,
             'clip_redirect_weight': cfg.clip_redirect_weight,
             'dino_redirect_weight': cfg.dino_redirect_weight,
+            'clip_redirect_target_sim': cfg.clip_redirect_target_sim,
+            'dino_redirect_target_sim': cfg.dino_redirect_target_sim,
+            'clip_redirect_exclude_sim': cfg.clip_redirect_exclude_sim,
+            'dino_redirect_exclude_sim': cfg.dino_redirect_exclude_sim,
+            'msg_clean_ratio_start': cfg.msg_clean_ratio_start,
+            'msg_clean_ratio_end': cfg.msg_clean_ratio_end,
+            'privacy_noised_ratio': cfg.privacy_noised_ratio,
+            'privacy_noised_ratio_sprint': getattr(cfg, 'privacy_noised_ratio_sprint', 0.0),
+            'phase2_sprint_epochs': cfg.phase2_sprint_epochs,
+            'phase2_sprint_visual': cfg.phase2_sprint_visual,
+            'phase2_sprint_privacy': cfg.phase2_sprint_privacy,
+            'phase2_refine_epochs': getattr(cfg, 'phase2_refine_epochs', 0),
+            'prv_head_lr_mult': cfg.prv_head_lr_mult,
+            'distill_inner_steps': getattr(cfg, 'distill_inner_steps', 0),
+            'distill_lr': getattr(cfg, 'distill_lr', 0.1),
+            'distill_weight': getattr(cfg, 'distill_weight', 0.0),
+            'prv_lowres_size': cfg.prv_lowres_size,
+            'fft_high_freq_radius_ratio': cfg.fft_high_freq_radius_ratio,
+            'noise_config': cfg.noise_config,
             'bit_accuracy_threshold': cfg.bit_accuracy_threshold,
             'num_epochs_phase1': cfg.num_epochs_phase1,
             'num_epochs_phase2': cfg.num_epochs_phase2,
@@ -271,10 +335,21 @@ def run_training_loop(trainer, train_loader, val_loader, cfg, start_phase, start
             # Phase 1 首轮：预热 memory bank（收集若干 batch 填充 CLIP/DINO 特征库）
             trainer.warmup_memory_bank(train_loader, num_batches=getattr(cfg, 'memory_warmup_batches', 50))
 
+        if phase == 2 and phase_start_epoch == 1:
+            # 直入 Phase 2（--epochs-phase1 0 热启动）时 memory bank 未经预热，
+            # redirect 损失将无 hard negative 可检索；若 checkpoint 未携带 bank 数据则补预热
+            clip_count = trainer.clip_memory_bank.memory_count if trainer.clip_memory_bank is not None else 0
+            dino_count = trainer.dino_memory_bank.memory_count if trainer.dino_memory_bank is not None else 0
+            if clip_count == 0 and dino_count == 0:
+                trainer.warmup_memory_bank(train_loader, num_batches=getattr(cfg, 'memory_warmup_batches', 50))
+
         if phase == 2 and not trainer.phase2_msg_head_frozen:
             # Phase 2 进入前若 msg_head 尚未冻结，则冻结它，仅训练 prv_head + decoder
             trainer.freeze_msg_head()
+            sprint_epochs = getattr(cfg, 'phase2_sprint_epochs', 0)
             print('Phase 2: msg_head frozen, training prv_head + decoder only')
+            if sprint_epochs > 0:
+                print(f'Phase 2 两段式：Sprint（纯逃逸冲刺，decoder 冻结）{sprint_epochs} 轮 -> Balance（恢复正常组合）{cfg.num_epochs_phase2 - sprint_epochs} 轮')
 
         # 从起始轮次训练到总轮数
         for epoch in range(phase_start_epoch, num_epochs + 1):
@@ -283,6 +358,11 @@ def run_training_loop(trainer, train_loader, val_loader, cfg, start_phase, start
             trainer.decoder.train()
             trainer.steganalyzer.train()
 
+            # 调度用相对轮次（本次运行的阶段内进度），而非绝对轮号。
+            # 否则从旧 checkpoint（如 phase2 epoch 100）热启动重训 Phase 2 时，
+            # epoch 恒大于 sprint_epochs，Sprint/Balance/权重三分段永远不会触发
+            sched_epoch = epoch - phase_start_epoch + 1
+
             # 累积当前 epoch 各项损失
             epoch_losses = {}
             num_batches = 0
@@ -290,7 +370,7 @@ def run_training_loop(trainer, train_loader, val_loader, cfg, start_phase, start
             # 遍历训练集每个 batch
             for batch_idx, batch in enumerate(train_loader):
                 # 执行单步训练，返回损失字典
-                losses = trainer.train_step(batch, phase, epoch)
+                losses = trainer.train_step(batch, phase, sched_epoch)
                 # 累加各项损失到 epoch 统计
                 for key, value in losses.items():
                     if key not in epoch_losses:
@@ -308,7 +388,7 @@ def run_training_loop(trainer, train_loader, val_loader, cfg, start_phase, start
             # 是否在该 epoch 保存可视化样本
             save_vis = epoch % cfg.save_interval == 0
             # 在验证集上评估
-            val_losses = trainer.validate(val_loader, phase, epoch, save_vis)
+            val_losses = trainer.validate(val_loader, phase, sched_epoch, save_vis)
             # 写入 epoch 级日志
             log_epoch_losses(log_file, epoch, epoch_losses, val_losses, phase)
 
@@ -322,26 +402,59 @@ def run_training_loop(trainer, train_loader, val_loader, cfg, start_phase, start
             for key, value in val_losses.items():
                 trainer.writer.add_scalar(f'Phase{phase}/Val/{key}', value, epoch)
 
-            # 判断是否为当前最佳（以验证消息损失为准）
-            is_best = val_losses['L_message'] < trainer.best_loss
+            # 判断是否为当前最佳（多目标准则）：
+            #   Phase 1 以验证消息损失为准（先学好隐写/解码能力）；
+            #   Phase 2 在 bit_accuracy 达标（≥ 阈值）的约束下最小化 clip_sim + dino_sim，
+            #   未达标时加大惩罚项，保证选出的 checkpoint 确权与隐私同时最优
+            if phase == 1:
+                best_score = val_losses['L_message']
+            else:
+                # 优先使用传播场景（含噪）相似度作为逃逸判定标准；不存在时回退干净指标
+                clip_sim = val_losses.get('clip_sim_noised', val_losses.get('clip_sim', 2.0))
+                dino_sim = val_losses.get('dino_sim_noised', val_losses.get('dino_sim', 2.0))
+                best_score = clip_sim + dino_sim
+                if val_losses.get('bit_accuracy', 0.0) < getattr(cfg, 'bit_accuracy_threshold', 0.90):
+                    best_score += 10.0  # 解码未达标的 checkpoint 一律排在后面
+            # best 准则按阶段不同（Phase 1: L_message；Phase 2: clip+dino）且数值不可比——
+            # L_message 收敛后约 0.1~0.3，而 sim 之和约 1.4~1.9，不重置则 Phase 2 的
+            # best 分数永远高于 Phase 1 遗留值，best 会冻结在 Phase 1 不再更新。
+            # 检测到准则所属阶段变化时重置历史最优（continue 续训同阶段则保留）
+            if trainer.best_loss_phase != phase:
+                trainer.best_loss = float('inf')
+                trainer.best_loss_phase = phase
+            is_best = best_score < trainer.best_loss
             if is_best:
-                # 更新最佳损失记录
-                trainer.best_loss = val_losses['L_message']
+                # 更新最佳记录并额外保存一份 best checkpoint
+                trainer.best_loss = best_score
+                trainer.save_checkpoint(epoch, phase,
+                                        extra_path=os.path.join(cfg.checkpoint_dir, 'checkpoint_best.pth'))
             if epoch % cfg.save_interval == 0:
                 # 按保存间隔写 checkpoint
                 trainer.save_checkpoint(epoch, phase)
 
             if phase == 2:
-                # Phase 2：检查验证比特准确率是否低于阈值，触发 decoder recovery
-                val_bit_acc = val_losses.get('bit_accuracy', 1.0)
-                threshold = getattr(cfg, 'bit_accuracy_threshold', 0.90)
-                if val_bit_acc < threshold:
-                    print(f'  [RECOVERY] bit_accuracy={val_bit_acc:.4f} < {threshold}, running recovery steps...')
-                    # 获取恢复步数
-                    recovery_steps = getattr(cfg, 'recovery_steps', 10)
-                    # 在干净消息上重新训练 decoder
-                    trainer.recovery_step(train_loader, num_batches=recovery_steps)
-                    print('  [RECOVERY] Done, decoder retrained on clean messages')
+                # Sprint 段（纯逃逸冲刺）：decoder 冻结、消息目标关闭，
+                # bit_acc 暂时下降是预期行为，跳过 recovery 且明确标注日志
+                sprint_epochs = getattr(cfg, 'phase2_sprint_epochs', 0)
+                in_refine = cfg.is_phase2_refine_segment(sched_epoch)
+                if sched_epoch <= sprint_epochs:
+                    print(f'  [SPRINT] epoch {sched_epoch}/{sprint_epochs}: privacy-only sprint (bit_acc drop expected, recovery skipped)')
+                elif in_refine:
+                    # Refine 终段：decoder 冻结是精修配方的设计语义（残差自适应
+                    # 既有解码器），recovery 重训 decoder 会使消息锚的目标漂移；
+                    # 学生目标含 message 权重 10，bit_acc 应由锚自身维持
+                    print(f'  [REFINE] epoch {sched_epoch}: escape-only refine (message anchor active, recovery skipped)')
+                else:
+                    # Balance 段：检查验证比特准确率是否低于阈值，触发 decoder recovery
+                    val_bit_acc = val_losses.get('bit_accuracy', 1.0)
+                    threshold = getattr(cfg, 'bit_accuracy_threshold', 0.90)
+                    if val_bit_acc < threshold:
+                        print(f'  [RECOVERY] bit_accuracy={val_bit_acc:.4f} < {threshold}, running recovery steps...')
+                        # 获取恢复步数
+                        recovery_steps = getattr(cfg, 'recovery_steps', 10)
+                        # 在干净消息上重新训练 decoder
+                        trainer.recovery_step(train_loader, num_batches=recovery_steps)
+                        print('  [RECOVERY] Done, decoder retrained on clean messages')
 
     print('Training completed!')
     # 关闭 TensorBoard writer
@@ -357,9 +470,9 @@ def main():
 
     # ===== new 子命令：启动新实验 =====
     new_run_parser = subparsers.add_parser('new', help='starts a new run')
-    # 数据集根目录（必填）
-    new_run_parser.add_argument('--data-dir', '-d', required=True, type=str,
-                                help='The directory where data is stored (required).')
+    # 数据集根目录（默认 dataset1，可用 -d 覆盖）
+    new_run_parser.add_argument('--data-dir', '-d', type=str, default='./dataset1',
+                                help='The directory where data is stored (default: ./dataset1).')
     # 训练子目录名
     new_run_parser.add_argument('--train-dir', type=str, default='train',
                                 help='Subdirectory name for training data (default: train).')
@@ -447,6 +560,29 @@ def main():
                                 help='Number of data loading workers.')
     new_run_parser.add_argument('--save-interval', type=int, default=config.Config.save_interval,
                                 help='Save checkpoint every N epochs.')
+    # Phase 2 Sprint 段轮数（纯逃逸冲刺）
+    new_run_parser.add_argument('--sprint-epochs', type=int, default=config.Config.phase2_sprint_epochs,
+                                help='Number of Phase 2 sprint (privacy-only) epochs.')
+    # Phase 2 终段精修轮数（val/refine_encode.py 同配方收尾）
+    new_run_parser.add_argument('--refine-epochs', type=int, default=config.Config.phase2_refine_epochs,
+                                help='Number of final Phase 2 refine epochs (refine_encode-style objective; '
+                                     'warm-start a pure refine run with --refine-epochs == --epochs-phase2).')
+    # 方案 C 内环蒸馏参数（--distill-steps 0 可关闭蒸馏）
+    new_run_parser.add_argument('--distill-steps', type=int, default=config.Config.distill_inner_steps,
+                                help='Inner-loop refinement steps per batch for teacher distillation (0 disables).')
+    new_run_parser.add_argument('--distill-weight', type=float, default=config.Config.distill_weight,
+                                help='Weight of the distillation loss (student vs teacher residual).')
+    # 隐私残差预算：逃逸深度近似随预算平方增长（cos 相似度下降 ∝ 特征位移²），
+    # 当前默认 0.04 下 PSNR 42.8dB/SSIM 0.971 仍有充足视觉余量，可按需放大
+    new_run_parser.add_argument('--prv-budget', type=float, default=config.Config.prv_budget,
+                                help='Privacy residual budget (amplitude upper bound of prv_residual).')
+    # CLIP escape margin：二次 Hinge 在 sim < (1-margin) 后梯度归零，margin 决定逃逸地板。
+    # CPU 逐图精修实测（60 步，bit_acc 全程 100%）：budget 0.08 下 margin 0.30/0.40/0.50
+    # 分别对应 clip_sim 0.575/0.547/0.440（PSNR 39.9/39.4/39.0）——margin 是第一杠杆
+    new_run_parser.add_argument('--privacy-margin-end', type=float, default=config.Config.privacy_margin_end,
+                                help='Final CLIP escape margin (escape target sim = 1 - margin).')
+    new_run_parser.add_argument('--dino-margin-end', type=float, default=config.Config.dino_escape_margin_end,
+                                help='Final DINO escape margin (DINO target sim = 1 - margin).')
 
     # ===== continue 子命令：从已有实验目录恢复训练 =====
     continue_parser = subparsers.add_parser('continue', help='continue a previous run')
@@ -503,6 +639,17 @@ def main():
         cfg.lambda_pixel = args.lambda_pixel
         cfg.lambda_ssim = args.lambda_ssim
 
+        # Phase 2 调度与蒸馏
+        cfg.phase2_sprint_epochs = args.sprint_epochs
+        cfg.phase2_refine_epochs = args.refine_epochs
+        cfg.distill_inner_steps = args.distill_steps
+        cfg.distill_weight = args.distill_weight
+        # 隐私残差预算（CLI 可放大逃逸深度，Encoder/教师内环均从该值构建约束链）
+        cfg.prv_budget = args.prv_budget
+        # 逃逸 margin 终值：Sprint/Refine 段直接取该值；教师内环目标同源联动
+        cfg.privacy_margin_end = args.privacy_margin_end
+        cfg.dino_escape_margin_end = args.dino_margin_end
+
         # IO 配置
         cfg.num_workers = args.num_workers
         cfg.save_interval = args.save_interval
@@ -540,29 +687,36 @@ def main():
             if os.path.exists(checkpoint_path):
                 # 加载 checkpoint 到对应设备
                 checkpoint = torch.load(checkpoint_path, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-                # 恢复编码器、解码器、隐写分析器权重
-                trainer.encoder.load_state_dict(checkpoint['encoder_state_dict'])
+                # 恢复编码器（跳过与新结构不匹配的隐私支路权重）、解码器、隐写分析器权重
+                load_encoder_state_compatible(trainer.encoder, checkpoint['encoder_state_dict'])
                 trainer.decoder.load_state_dict(checkpoint['decoder_state_dict'])
                 trainer.steganalyzer.load_state_dict(checkpoint['steganalyzer_state_dict'])
-                # 恢复优化器状态
-                trainer.optimizer_encoder_decoder.load_state_dict(checkpoint['optimizer_encoder_decoder'])
-                trainer.optimizer_steganalyzer.load_state_dict(checkpoint['optimizer_steganalyzer'])
+                # 恢复优化器状态；新增 prv_trunk 参数会使旧 checkpoint 的参数组
+                # 尺寸不匹配（ValueError），此时使用全新 Adam 状态（Adam 预热很快，可接受）
+                try:
+                    trainer.optimizer_encoder_decoder.load_state_dict(checkpoint['optimizer_encoder_decoder'])
+                    trainer.optimizer_steganalyzer.load_state_dict(checkpoint['optimizer_steganalyzer'])
+                except ValueError:
+                    print('[Checkpoint] 优化器状态与新结构不匹配（新增 prv_trunk 参数），改用全新 Adam 状态')
                 # 恢复 CLIP memory bank（若存在）
                 if trainer.clip_memory_bank is not None and 'clip_memory_bank' in checkpoint:
                     trainer.clip_memory_bank.load_state_dict(checkpoint['clip_memory_bank'])
                 # 恢复 DINO memory bank（若存在）
                 if trainer.dino_memory_bank is not None and 'dino_memory_bank' in checkpoint:
                     trainer.dino_memory_bank.load_state_dict(checkpoint['dino_memory_bank'])
-                # 恢复最佳损失记录
-                trainer.best_loss = checkpoint.get('best_loss', float('inf'))
-                # 恢复 msg_head 冻结状态
-                trainer.phase2_msg_head_frozen = checkpoint.get('phase2_msg_head_frozen', False)
-                if trainer.phase2_msg_head_frozen:
-                    trainer.freeze_msg_head()
-                # 从断点的下一轮继续
-                start_epoch = checkpoint['epoch'] + 1
-                start_phase = checkpoint['phase']
-                print(f"Resuming from Phase {start_phase}, Epoch {start_epoch}")
+                # 权重初始化语义：new 命令的训练计划（阶段/轮数）完全由本次 CLI 参数决定，
+                # 从 Phase 1 第 1 轮起算。checkpoint 的绝对轮号不能带过来——例如旧
+                # Phase 2 epoch 100 会使 start_epoch=101，Phase 2 循环 range(101, N) 为空，
+                # 一轮都不会训练。断点续训请用 continue 子命令。
+                # best_loss 也不继承：旧值是 Phase 1 L_message 准则，与 Phase 2 的
+                # clip_sim+dino_sim best 判定不可比，继承会让 best 永远不触发。
+                trainer.best_loss = float('inf')
+                trainer.phase2_msg_head_frozen = False
+                start_epoch = 1
+                start_phase = 1
+                print(f"[Init] Weights loaded from {args.continue_from_folder} "
+                      f"(source: phase {checkpoint['phase']} epoch {checkpoint['epoch']}); "
+                      f"fresh plan: phase1={cfg.num_epochs_phase1}, phase2={cfg.num_epochs_phase2}")
             else:
                 # checkpoint 不存在则从零开始
                 print(f"Checkpoint not found at {checkpoint_path}, starting from scratch")
@@ -601,21 +755,26 @@ def main():
         if os.path.exists(checkpoint_path):
             # 加载 checkpoint 到对应设备
             checkpoint = torch.load(checkpoint_path, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-            # 恢复编码器、解码器、隐写分析器权重
-            trainer.encoder.load_state_dict(checkpoint['encoder_state_dict'])
+            # 恢复编码器（跳过与新结构不匹配的隐私支路权重）、解码器、隐写分析器权重
+            load_encoder_state_compatible(trainer.encoder, checkpoint['encoder_state_dict'])
             trainer.decoder.load_state_dict(checkpoint['decoder_state_dict'])
             trainer.steganalyzer.load_state_dict(checkpoint['steganalyzer_state_dict'])
-            # 恢复优化器状态
-            trainer.optimizer_encoder_decoder.load_state_dict(checkpoint['optimizer_encoder_decoder'])
-            trainer.optimizer_steganalyzer.load_state_dict(checkpoint['optimizer_steganalyzer'])
+            # 恢复优化器状态；结构变更导致参数组尺寸不匹配时改用全新 Adam 状态
+            try:
+                trainer.optimizer_encoder_decoder.load_state_dict(checkpoint['optimizer_encoder_decoder'])
+                trainer.optimizer_steganalyzer.load_state_dict(checkpoint['optimizer_steganalyzer'])
+            except ValueError:
+                print('[Checkpoint] 优化器状态与新结构不匹配（新增 prv_trunk 参数），改用全新 Adam 状态')
             # 恢复 CLIP memory bank（若存在）
             if trainer.clip_memory_bank is not None and 'clip_memory_bank' in checkpoint:
                 trainer.clip_memory_bank.load_state_dict(checkpoint['clip_memory_bank'])
             # 恢复 DINO memory bank（若存在）
             if trainer.dino_memory_bank is not None and 'dino_memory_bank' in checkpoint:
                 trainer.dino_memory_bank.load_state_dict(checkpoint['dino_memory_bank'])
-            # 恢复最佳损失记录
+            # 恢复最佳损失记录（旧格式 checkpoint 无 best_loss_phase 字段时置 None，
+            # 首轮按当前阶段准则重置重判，避免跨准则比较）
             trainer.best_loss = checkpoint.get('best_loss', float('inf'))
+            trainer.best_loss_phase = checkpoint.get('best_loss_phase', None)
             # 恢复 msg_head 冻结状态
             trainer.phase2_msg_head_frozen = checkpoint.get('phase2_msg_head_frozen', False)
             if trainer.phase2_msg_head_frozen:

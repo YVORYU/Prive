@@ -1,2532 +1,1123 @@
 # PrivSteg 技术文档 —— 基于深度学习的隐私保护图像隐写系统
 
+> 本文档与当前代码实现同步（2026-09-11 重写版）。当文档与代码不一致时，以代码为准。
+> 快速上手请看 [README.md](README.md)；仓库工作约定见 [AGENTS.md](AGENTS.md)；
+> 论文写作素材（研究背景、相关工作综述、设计理念叙事、指标形式化、实验设计与参考文献）见 [docs/PAPER_MATERIAL.md](docs/PAPER_MATERIAL.md)。
+
 ## 目录
 
-- [1. 项目概述](#1-项目概述)
-- [2. 系统架构总览](#2-系统架构总览)
-- [3. 项目文件结构](#3-项目文件结构)
-- [4. 核心配置模块 (config.py)](#4-核心配置模块-configpy)
-- [5. 数据处理模块 (data/)](#5-数据处理模块-data)
-- [6. 模型架构模块 (models/)](#6-模型架构模块-models)
-  - [6.1 编码器 (Encoder)](#61-编码器-encoder)
-  - [6.2 解码器 (Decoder)](#62-解码器-decoder)
-  - [6.3 隐写分析器 (Steganalyzer)](#63-隐写分析器-steganalyzer)
-  - [6.4 内容识别器 (ContentRecognizer)](#64-内容识别器-contentrecognizer)
-- [7. 损失函数模块 (losses/)](#7-损失函数模块-losses)
-  - [7.1 SSIM损失 (SSIMLoss)](#71-ssim损失-ssimloss)
-  - [7.2 特征重定向损失 (FeatureRedirectionLoss)](#72-特征重定向损失-featureredirectionloss)
-- [8. 噪声层模块 (noise_layers/)](#8-噪声层模块-noise_layers)
-  - [8.1 噪声组合器 (Noiser)](#81-噪声组合器-noiser)
-  - [8.2 Identity恒等映射](#82-identity恒等映射)
-  - [8.3 随机裁剪 (Crop)](#83-随机裁剪-crop)
-  - [8.4 裁剪填充 (Cropout)](#84-裁剪填充-cropout)
-  - [8.5 像素丢弃 (Dropout)](#85-像素丢弃-dropout)
-  - [8.6 缩放变换 (Resize)](#86-缩放变换-resize)
-  - [8.7 JPEG压缩 (JpegCompression)](#87-jpeg压缩-jpegcompression)
-  - [8.8 量化噪声 (Quantization)](#88-量化噪声-quantization)
-- [9. 训练系统 (trainer.py & train.py)](#9-训练系统-trainerpy--trainpy)
-  - [9.1 Trainer类详解](#91-trainer类详解)
-  - [9.2 两阶段训练策略](#92-两阶段训练策略)
-  - [9.3 编码器头部冻结策略](#93-编码器头部冻结策略)
-  - [9.4 解码器恢复机制](#94-解码器恢复机制)
-  - [9.5 训练流程 (train.py)](#95-训练流程-trainpy)
-  - [9.6 记忆库预热](#96-记忆库预热)
-- [10. 验证脚本 (validation_script.py)](#10-验证脚本-validation_scriptpy)
-- [11. CLIP与DINOv2视觉模型](#11-clip与dinov2视觉模型)
-- [12. 核心算法原理深度剖析](#12-核心算法原理深度剖析)
-  - [12.1 双残差隐写编码原理](#121-双残差隐写编码原理)
-  - [12.2 对抗训练原理](#122-对抗训练原理)
-  - [12.3 隐私保护的多模态特征逃逸机制](#123-隐私保护的多模态特征逃逸机制)
-  - [12.4 记忆库驱动的硬负样本挖掘](#124-记忆库驱动的硬负样本挖掘)
-  - [12.5 渐进逃逸边界机制](#125-渐进逃逸边界机制)
-- [13. 完整数据流图](#13-完整数据流图)
-- [14. 使用指南](#14-使用指南)
+1. [项目概述](#1-项目概述)
+2. [研究背景与威胁模型](#2-研究背景与威胁模型)
+3. [系统架构总览](#3-系统架构总览)
+4. [项目文件结构](#4-项目文件结构)
+5. [核心配置模块 (`config.py`)](#4-核心配置模块-configpy)
+6. [数据处理模块 (`data/`)](#5-数据处理模块-data)
+7. [模型架构模块 (`models/`)](#6-模型架构模块-models)
+8. [损失函数模块 (`losses/`)](#7-损失函数模块-losses)
+9. [噪声层模块 (`noise_layers/`)](#8-噪声层模块-noise_layers)
+10. [训练系统 (`trainer.py` & `train.py`)](#9-训练系统-trainerpy--trainpy)
+11. [验证与评估工具链 (`val/`)](#10-验证与评估工具链-val)
+12. [核心算法原理](#11-核心算法原理)
+13. [使用指南](#12-使用指南)
+14. [附录A：关键超参数速查表](#附录a关键超参数速查表)
+15. [附录B：输出文件清单](#附录b输出文件清单)
+16. [附录C：术语表](#附录c术语表)
 
 ---
 
 ## 1. 项目概述
 
-**PrivSteg（Privacy-Preserving Steganography）** 是一个基于深度学习的**隐私保护图像隐写系统**。该项目的核心目标是在载体图像（Cover Image）中嵌入秘密消息（Secret Message），同时满足以下四个关键约束：
+### 1.1 问题定义
 
-| 约束维度 | 技术手段 | 目标 |
-|---------|---------|------|
-| **不可感知性** | 像素级重建 + SSIM | 编码后图像与原图视觉上无法区分 |
-| **鲁棒性** | 多种噪声层模拟真实信道干扰 | 经过噪声攻击后仍能准确提取消息 |
-| **抗检测性** | GAN对抗训练 + SpectralNorm隐写分析器 | 隐写图像能骗过隐写检测器 |
-| **隐私保护** | CLIP/DINO特征逃逸 + 有向重定向 | 编码前后语义特征空间距离足够大 |
+PrivSteg 解决的是**发布侧隐私保护隐写**问题——一张图像同时要完成三个互相牵制的目标：
 
-### 核心创新点
+- **功能目标（可解码）**：在载体图像中嵌入 30 bit 二进制消息（水印/溯源），消息在 uint8 往返（PNG 保存重载）与信道噪声（JPEG 压缩 / 缩放 / 量化）下可靠解码，比特准确率 ≥ 0.90 为硬约束。
+- **隐私目标（不可检索）**：使编码图像在 CLIP ViT-B/32 与 DINOv2 ViT-S/14 特征空间中偏离原载体，令攻击者通过**以图搜图（CBIR 内容检索）**无法把发布图关联回原始载体。
+- **视觉目标（不可感知）**：扰动幅度受预算约束（深挖配方下 PSNR ~39 dB、SSIM ~0.95），肉眼不可辨。
 
-1. **双残差编码器架构**：编码器采用消息头（msg_head）和隐私头（prv_head）的双头设计，分别生成预算约束的消息残差和隐私残差，实现消息嵌入与隐私保护的解耦
-2. **纹理感知隐私扰动**：Phase 2 中隐私残差乘以梯度驱动的纹理掩码，将扰动集中在纹理复杂区域，提升视觉不可感知性
-3. **两阶段渐进式训练**：先学习基础隐写能力 + 渐进对抗 → 再引入隐私保护，配合头部冻结策略确保阶段间能力不退化
-4. **预算约束残差**：通过 `msg_budget` 和 `prv_budget` 参数配合 `tanh` 激活，严格控制残差幅度
-5. **多模态特征逃逸**：同时利用CLIP（ViT-B/32）和DINOv2（ViT-S/14）两种预训练模型的语义特征空间进行隐私约束
-6. **CLIP/DINO 有向重定向**：不仅将编码图像推离原图，还通过记忆库硬负样本将其"拉向"其他无关图像，实现语义伪装
-7. **渐进逃逸边界**：逃逸margin从0.15线性增长到0.30，避免隐私损失突然激增导致训练崩溃
-8. **频域正则化**：对隐私残差施加 FFT 高频能量惩罚，抑制易被频域分析器捕捉的高频痕迹
-9. **Hinge 对抗 + 准确率门控**：判别器使用 Hinge Loss 并按准确率门控更新，生成器使用 Softplus 非饱和损失
-10. **解码器恢复机制**：当Phase 2比特准确率下降时，在干净消息残差上重新训练解码器，确保消息提取能力不退化
+三目标的张力是本项目的核心矛盾：消息嵌入要求残差承载可解码结构，隐私逃逸要求特征大幅偏离，感知约束又把两个残差的总能量钉死在极小预算内。
 
----
+### 1.2 三层系统分工
 
-## 2. 系统架构总览
+系统由三层组成，各层解决"逐图优化"这一非凸问题在不同成本预算下的近似：
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        PrivSteg 系统架构                              │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│   ┌──────────┐     ┌──────────────┐     ┌──────────────┐           │
-│   │ Cover    │────▶│   Encoder    │────▶│ Encoded      │           │
-│   │ Image    │     │ (Dual-Head)  │     │ Image        │           │
-│   └──────────┘     └──────┬───────┘     └──────┬───────┘           │
-│                           ↑ message              │                   │
-│                    (30-bit secret)               ▼                   │
-│                                            ┌──────────┐            │
-│                                            │  Noiser  │            │
-│                                            │(噪声层)   │            │
-│                                            └────┬─────┘            │
-│                                                 │                   │
-│                                    ┌────────────┼────────────┐      │
-│                                    ▼            ▼            ▼      │
-│                              ┌──────────┐ ┌────────┐ ┌─────────┐   │
-│                              │ Decoder  │ │ Steg-   │ │Content  │   │
-│                              │ (消息恢复)│ │ Analyzer│ │Recogniz.│   │
-│                              └────┬─────┘ └────┬───┘ └────┬────┘   │
-│                                   │             │          │        │
-│                                   ▼             ▼          ▼        │
-│                              Message_pred   Real/Fake   Feature    │
-│                              (30 bits)     判定结果     Vectors     │
-│                                                                     │
-│   ┌──────────────────────────────────────────────────────────┐     │
-│   │                Privacy Protection Layer                   │     │
-│   │  ┌─────────────┐  ┌─────────────┐                        │     │
-│   │  │ CLIP ViT-B/32│  │ DINOv2 ViT-S│                       │     │
-│   │  │ (冻结)        │  │ /14 (冻结)   │                       │     │
-│   │  └──────┬───────┘  └──────┬──────┘                        │     │
-│   │         │                 │                                │     │
-│   │         └────────┬────────┘                                │     │
-│   │                  ▼                                         │     │
-│   │         FeatureRedirectionLoss                             │     │
-│   │    (多模态特征逃逸 + 二次Hinge + 有向重定向)                  │     │
-│   └──────────────────────────────────────────────────────────┘     │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
+| 层 | 机制 | 成本 | CLIP sim（相对原载体） |
+| --- | --- | --- | --- |
+| **网络** | 一次前向完成编码 | 零额外成本 | ~0.85-0.95（摊销求解器的固有鸿沟） |
+| **训练内蒸馏** | 每个 train step 内环跑 10 步逐图优化得到教师残差，蒸进权重 | 训练期 2~4× 单步耗时 | 缩小摊销鸿沟 |
+| **编码期逐图精修** | 部署时对单图跑 30~60 步 Adam 直接求解 | CPU 每图 ~1 分钟 / GPU 秒级 | 0.44~0.55（深挖配方） |
+
+精修发生在**编码端**（一次性成本），解码端零成本——这是"编码慢/解码快"架构下的标准选择：发布者对图像付出的成本可以摊销在发布流程里，接收方解码仍是一次前向。
+
+### 1.3 核心创新点
+
+1. **双残差解耦架构**：消息头（`msg_head`）与隐私头（`prv_head`）分离，消息嵌入与隐私逃逸互不干扰；热启动重训隐私支路时消息通路完整复用。
+2. **隐私独立支路（`prv_trunk`）**：空洞卷积支路（dilation 1/3/9/27，感受野 81×81）直接从载体图像提特征，绕开只为消息目标训练且全程冻结的共享层（信息瓶颈），修复小感受野算不出空间结构化逐图攻击模式的容量瓶颈。
+3. **低分辨率残差约束**：隐私残差先池化到 96×96 再双三次上采样回全分辨率——96 网格 ≈ 2.7px/格，恰好覆盖 CLIP ViT-B/32（patch 16×16）最敏感的 patch 尺度中频段，同时结构性消除高频条纹。
+4. **纹理感知扰动**：逐图分位数归一化纹理掩码（q05/q95 → [0.15, 1.0]），扰动集中在人眼不敏感的纹理复杂区。
+5. **Phase 2 三段调度**：Sprint（纯逃逸冲刺）→ Balance（多目标平衡）→ Refine（终段精修配方），配合分阶段冻结与判别器门控；针对"Adam 在多目标、逐图方向不一致下梯度信噪比失效"这一核心瓶颈。
+6. **内环逐图优化蒸馏**：把探针级逃逸方向（逐图精修 60 步 clip_sim 0.94→0.55~0.65）蒸进网络单次前向。
+7. **部署期逐图精修不劣化保证**：以网络原始输出为初始候选，只在比特 100% 正确的状态里选最优，隐私逃逸不以牺牲解码为代价。
+8. **色度低频事后投影**：精修收敛后剔除隐私残差的 8×8 网格低频色度分量——针对 PSNR/SSIM 失明的"发灰/蒙层"感知劣化的结构化修复（见 11.8）。
+
+### 1.4 实测效果摘要
+
+- **逐图精修杠杆**（同一 checkpoint、60 步、bit_acc 全程 100%）：margin 是第一杠杆——0.30/0.40/0.50（budget 0.08）对应 CLIP sim 0.575/0.547/0.440；预算是第二杠杆——budget 0.04/0.06/0.08（margin 0.30）对应 0.634/0.603/0.575；视觉权重 15→8 无影响。margin 0.50 + budget 0.08 时 PSNR 38.95 / SSIM 0.957。
+- **检索逃逸**（20 图库、深挖配方）：基线 top-1 命中 100%（攻击者一击必中），精修后逃逸率 66.7%。
+- **色度投影**（单图实测）：clip_sim 0.438→0.467（仍在 margin 0.50 目标内）、低频色度 −91%、PSNR +0.5 dB、SSIM +0.001、bit 100%。
+- **热启动复用**：直入 Phase 2 首轮 val bit_acc 即 0.925（消息通路完整复用）。
 
 ---
 
-## 3. 项目文件结构
+## 2. 研究背景与威胁模型
+
+### 2.1 应用场景
+
+可溯源图像发布：机构或个人需要在公开分享的图像中嵌入水印/溯源载荷（版权、真伪、泄漏溯源），同时不希望该图像被**以图搜图**类内容检索（Google Lens、百度识图、电商平台同款检索、社交平台近重复去重）与原始载体或其他已发布图像关联。
+
+### 2.2 威胁模型（CBIR 攻击者）
+
+- **攻击者能力**：掌握现代通用特征提取器（本文以 CLIP ViT-B/32 为代表；DINOv2 ViT-S/14 作为第二种自监督特征对冲），对图像提取 L2 归一化特征后与图库做余弦相似度排序（以图搜图）。
+- **攻击者目标**：给定发布图（编码图），在图库中找回原始载体（top-k 命中）。
+- **防御者目标**：编码图对原载体的特征相似度足够低，低到与图库中最强干扰物的相似度之下（攻击者排错第一名），且这一偏离要能抵抗 JPEG/缩放/量化信道（图像上传过程必然发生转码）。
+- **防御者约束**：消息必须可被授权解码器恢复（uint8 往返 + 信道噪声下 bit_acc ≥ 0.90）；扰动必须不可感知（预算 + 纹理掩码 + 频段结构化约束）。
+
+两点威胁建模决策值得强调：
+
+1. **攻击面选在特征空间而非像素空间**——CBIR 系统的现实实现是深度特征检索，逐像素哈希只在完全一致的复制场景生效；因此防御的有效判据是特征余弦相似度下降与检索排名恶化，而非 PSNR 类像素指标。
+2. **双特征空间对冲**——攻击者可能改用自监督特征（DINOv2）做近重复检测，单逃 CLIP 不够；CLIP（语义对齐）与 DINOv2（细粒度纹理）的判别机理不同，需分别设 margin 与重定向标定。
+
+### 2.3 相关工作简述
+
+完整综述与参考文献（含 DOI）见 [docs/PAPER_MATERIAL.md](docs/PAPER_MATERIAL.md)。简述：
+
+- **深度学习隐写/水印**（HiDDeN ECCV 2018、StegaStamp CVPR 2020、MBRS ACM MM 2021 及 DL 隐写综述）：解决"消息如何在失真信道下可靠嵌入/提取"，不约束编码图在检索系统中的可检索性。
+- **特征反演**（Mahendran & Vedaldi CVPR 2015、Dosovitskiy & Brox CVPR 2016）：证明深度特征可被反演回图像——即"特征相似 = 内容可关联"的隐私风险有理论依据。
+- **防御性对抗扰动**（Fawkes USENIX Security 2020 等 cloaking 工作）：在数据侧加对抗扰动保护隐私，但目标通常是单个人脸识别模型，且不要求嵌入可解码消息。
+- **检索系统对抗攻击**（AP-GAN 2020、CIKM 2021 deep-hashing 攻击）：证明 CBIR/哈希检索可被对抗样本欺骗，但均为单向攻击视角，未与"消息仍可解码"的多目标兼容。
+- **摊销优化**（Amos, Foundations and Trends in ML 2023）：本系统"网络一次前向 + 逐图精修"正是 amortize-then-refine 结构，训练内蒸馏对应"教师指导摊销器学习"。
+
+**本工作的差异化定位**：据我们所知，同时满足"消息可靠解码 + 信道鲁棒 + 不可感知 + CBIR 检索逃逸"四约束的可训练图像隐写系统此前未被研究；本系统给出的双残差架构、摊销-精修三层结构与特征空间标定的逃逸配方是该组合问题的首个完整解。
+
+---
+
+## 3. 系统架构总览
+
+```
+                        ┌──────────────────────────────────────────┐
+                        │                Encoder                   │
+ cover ──────┬─────────►│ shared(16×ConvBNRelu,128) ─┐            │
+ (B,3,H,W)  │          │   │                         │ msg_head  │
+ [-1,1]      │          │   ▼ 融合(161→128)            │   ↓       │
+             │          │ cat[msg⊕feat⊕cover]          │ msg_budget×tanh
+             │          │   │                         └────┬──────┘
+             │          │   │              prv_trunk(dil 1/3/9/27)◄── cover
+             │          │   ▼                         ┌────┴──────┐
+             │          │ prv_head(cat[shared,trunk]) │           │
+             │          │   ↓ 96×96低通→上采样→tanh×budget→×纹理掩码      │
+             │          └──────────┬──────────────────┘           │
+             │                     │ msg_residual + prv_residual │
+             └─────────────────────►+ ──► clamp[-1,1] ──► encoded_image
+                                   │
+        ┌──────────────────────────┼──────────────────────────────┐
+        ▼                          ▼                              ▼
+   Decoder(BCE)            Noiser(随机选一层)                CLIP/DINOv2(冻结)
+   消息 logits             jpeg/resize/quant/...             特征余弦相似度
+        │                          │                              │
+        ▼                          ▼                              ▼
+   bit_accuracy              含噪分支(escape锚定)            escape+redirect
+                              └──────────┬───────────────────────┘
+                                         ▼
+                                FeatureRedirectionLoss
+                         (二次Hinge逃逸 + 硬负样本有向重定向)
+```
+
+训练数据流（Phase 2）：
+
+1. `SteganographyDataset` 返回 `{cover_image, message, image_path}`。
+2. `Encoder` 输出 `encoded_image`、`residual_penalty`、`msg_residual`、`prv_residual`。
+3. **消息双分支**：干净编码图与含噪编码图分别过 decoder，干净分支权重由 `get_msg_clean_ratio` 调度。
+4. **隐私双分支**：干净分支计算 escape+redirect（主力），含噪分支仅 escape（锚定传播场景），按 `get_privacy_noised_ratio` 加权。
+5. 视觉损失只算干净分支（含噪视觉权重恒为 0，防止把信道失真归咎于残差）。
+6. Phase 2 每个 train step 额外执行**内环蒸馏**：冻结网络 → 10 步 Adam 优化 96×96 教师残差 → 能量归一化 MSE 蒸给学生。
+7. 验证时记录干净/含噪两套指标（`bit_accuracy` / `bit_accuracy_clean`、`clip_sim(_noised)`、`dino_sim(_noised)`），best checkpoint 用含噪指标判定（传播场景优先）。
+
+---
+
+## 4. 项目文件结构
 
 ```
 PrivSteg/
-├── config.py                     # 全局配置类，定义所有超参数和阶段权重
-├── train.py                      # 主入口：命令行解析、实验管理、训练循环调度
-├── trainer.py                    # Trainer核心类：模型初始化、前向传播、损失计算、优化
-├── noise_argparser.py            # 噪声层命令行参数解析器
-├── validation_script.py          # 验证脚本：编码/解码/检测/隐私评估
-├── requirements.txt              # 依赖列表
-│
-├── data/
-│   ├── __init__.py
-│   └── dataset.py                # SteganographyDataset 数据集定义
-│
+├── config.py                  # 全局配置（超参数、损失权重、阶段调度函数）
+├── train.py                   # 训练入口（new/continue、热启动、CLI、checkpoint 兼容加载）
+├── trainer.py                 # 训练器（阶段冻结、内环蒸馏、recovery、记忆库、验证）
+├── noise_argparser.py         # 噪声层命令行参数解析（argparse Action）
+├── README.md                  # 项目说明（快速上手）
+├── AGENTS.md                  # 仓库工作约定（供 AI 编码助手）
+├── TECHNICAL_DOC.md           # 本文档
+├── docs/                      # 补充文档（PAPER_MATERIAL.md 论文写作素材）
+├── val/                        # 验证与评估脚本目录（从项目根运行）
+│   ├── validation_script.py   # 单图验证（编码+精修+解码+判别器+相似度+可视化报告）
+│   ├── refine_encode.py       # 独立逐图精修（不训练网络，试探逃逸天花板）
+│   ├── baseline_validation.py # 单图基线验证（网络直出，无精修，无 report.html）
+│   ├── batch_eval.py          # 批量定量评估（精修版：统计/鲁棒性/uint8 往返，断点续跑）
+│   ├── batch_baseline.py      # 批量基线评估（网络直出，速度约 20~30 倍，断点续跑）
+│   ├── retrieval_eval.py      # CBIR 检索逃逸评估（精修版，以图搜图攻击测试）
+│   ├── retrieval_baseline.py  # CBIR 检索逃逸基线评估（网络直出）
+│   ├── run_full_validation.py # 全链路一键验证编排（冒烟→单图→基线→精修→汇总）
+│   ├── visual_report.py       # 单图验证可视化报告生成器
+│   └── eval_visualizer.py     # 批量/检索评估可视化报告生成器
 ├── models/
-│   ├── __init__.py               # 模型统一导出：Encoder, Decoder, Steganalyzer, ContentRecognizer
-│   ├── encoder.py                # 编码器：双残差头（msg_head + prv_head）消息/隐私嵌入网络
-│   ├── decoder.py                # 解码器：CNN消息提取网络
-│   ├── steganalyzer.py           # 隐写分析器：CNN+SpectralNorm二分类器
-│   └── content_recognizer.py     # 内容识别器：CLIP ViT-B/32 特征提取（冻结）
-│
+│   ├── encoder.py             # 编码器（双残差头 + prv_trunk 独立支路 + 纹理掩码）
+│   ├── decoder.py             # 解码器（CNN + 全连接消息提取）
+│   ├── steganalyzer.py        # 隐写分析器（判别器，SpectralNorm）
+│   └── content_recognizer.py  # 内容识别器（冻结 CLIP ViT-B/32）
 ├── losses/
-│   ├── __init__.py               # 损失统一导出：SSIMLoss, FeatureRedirectionLoss
-│   ├── ssim_loss.py              # 结构相似性(SSIM)损失
-│   └── advanced_privacy_loss.py  # 特征重定向损失（多模态逃逸 + 有向重定向）
-│
+│   ├── ssim_loss.py           # SSIM 损失
+│   └── advanced_privacy_loss.py  # 特征逃逸 + 有向重定向损失（CLIP + DINOv2）
 ├── noise_layers/
-│   ├── noiser.py                 # 噪声层组合器（随机选择激活）
-│   ├── identity.py               # 恒等映射（无操作）
-│   ├── crop.py                   # 随机裁剪
-│   ├── cropout.py                # 裁剪替换（局部区域用原图替换）
-│   ├── dropout.py                # 随机像素丢弃
-│   ├── resize.py                 # 随机缩放
-│   ├── jpeg_compression.py       # JPEG压缩（DCT域量化）
-│   └── quantization.py           # 傅里叶四舍五入量化
-│
-└── output/                       # 验证输出目录（示例图像）
+│   ├── noiser.py              # 噪声层组合器（每次 forward 随机选择激活）
+│   ├── identity.py            # 恒等映射（空配置兜底）
+│   ├── crop.py / cropout.py    # 裁剪类噪声
+│   ├── dropout.py / resize.py  # 丢弃/缩放噪声
+│   ├── jpeg_compression.py    # JPEG 压缩噪声（DCT 域量化，卷积实现可微）
+│   └── quantization.py        # 傅里叶近似量化噪声
+├── data/
+│   └── dataset.py             # 隐写数据集（图像加载 + 随机消息生成）
+└── CLIP/                      # vendored OpenAI CLIP 包（独立 setup 与测试）
 ```
+
+注意：`val/` 是**验证脚本目录**，与数据集根下的 `train/`/`val/` 数据子目录是两回事。所有 val 脚本启动时会自动把项目根加入 `sys.path` 并把工作目录切到项目根，因此从任何目录启动，相对路径（checkpoint、`./models/dinov2_vits14_pretrain.pth`、输出目录）行为都一致。val 脚本间的相互导入（如 `from validation_script import ValidationScript`）依赖**脚本模式**（`python val/xxx.py`），不支持包式导入 `import val.xxx`。
 
 ---
 
-## 4. 核心配置模块 (`config.py`)
+## 5. 核心配置模块 (`config.py`)
 
-### 4.1 配置类定义
+`Config` 类用类属性集中管理全部配置。以下按功能分组列出**当前默认值**（深挖配方已全部设为代码默认值）。
 
-```python
-class Config:
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-```
-
-`Config` 类采用**类属性**方式集中管理所有超参数，避免全局变量污染。所有参数在类定义时直接赋值默认值。
-
-### 4.2 图像与消息参数
+### 5.1 设备、数据与 IO
 
 | 参数 | 默认值 | 说明 |
-|------|-------|------|
-| `image_size` | `256` | 输入图像分辨率（正方形，256×256） |
-| `message_length` | `30` | 秘密消息比特长度（每个bit为0或1的浮点数） |
-| `batch_size` | `8` | 训练批次大小 |
+| --- | --- | --- |
+| `device` | cuda 可用则 cuda，否则 cpu | 计算设备 |
+| `data_dir` | `None` | 数据集根目录（CLI `--data-dir`/`-d` 默认 `./dataset1`） |
+| `train_dir` / `val_dir` | `'train'` / `'val'` | 数据子目录名 |
+| `num_workers` | `4` | DataLoader 进程数 |
+| `save_interval` | `10` | 每 N 轮保存 checkpoint |
+| `checkpoint_dir` / `log_dir` | `'checkpoints'` / `'logs'` | 训练时改为实验绝对路径 |
 
-**设计考量**：
-- `image_size=256`：平衡计算资源消耗与特征表达能力。编码器的消息扩展操作需要将1×30的消息张量扩展到256×256的空间维度。
-- `message_length=30`：约3.75字节的隐藏容量。对于图像隐写来说属于较低容量，但有利于保持高不可感知性和强隐私保护。
-
-### 4.3 学习率配置
-
-| 参数 | 默认值 | 说明 |
-|------|-------|------|
-| `lr_encoder` | `1e-3` | 编码器学习率 |
-| `lr_decoder` | `1e-3` | 解码器学习率 |
-| `lr_steganalyzer` | `1e-4` | 隐写分析器学习率 |
-
-**设计分析**：
-- 编码器和解码器使用相同的学习率（`1e-3`），因为它们共享同一个Adam优化器（`optimizer_encoder_decoder`），作为生成器端协同训练。
-- 隐写分析器使用更低的学习率（`1e-4`，为生成器的1/10），因为判别器任务（区分微小像素差异）比生成任务更容易过拟合，降低学习率有助于维持对抗平衡。
-
-### 4.4 两阶段训练轮次
+### 5.2 图像与消息
 
 | 参数 | 默认值 | 说明 |
-|------|-------|------|
-| `num_epochs_phase1` | `150` | Phase 1: 基础隐写 + 渐进对抗训练 |
-| `num_epochs_phase2` | `100` | Phase 2: 隐私保护训练 |
+| --- | --- | --- |
+| `image_size` | `256` | 图像 resize 尺寸 |
+| `message_length` | `30` | 消息位数 |
+| `batch_size` | `35` | 批大小（A100 口径；本地 CPU 冒烟请显式传 `--batch-size 1`） |
+| `lr_encoder` / `lr_decoder` | `1e-3` | 编码器/解码器学习率 |
+| `lr_steganalyzer` | `1e-4` | 判别器学习率 |
+| `prv_head_lr_mult` | `5.0` | 隐私支路参数组学习率倍增 |
 
-总计 **250 epochs** 的训练过程。
-
-### 4.5 损失权重参数
-
-| 参数 | 默认值 | 说明 |
-|------|-------|------|
-| `lambda_pixel` | `1.0` | MSE像素损失权重 |
-| `lambda_ssim` | `1.0` | SSIM结构相似性损失权重 |
-| `lambda_fft` | `10.0` | FFT高频能量惩罚权重（仅Phase 2生效） |
-
-> 注：`message`、`adv`、`privacy`、`visual`、`noised`、`residual_penalty`、`fft` 等阶段权重不再作为独立类属性存在，而是由 `get_phase_weights(phase, epoch)` 方法根据阶段和epoch动态返回（见4.12节）。
-
-**视觉损失组成公式**：
-
-$$L_{visual} = \lambda_{pixel} \cdot L_{pixel} + \lambda_{ssim} \cdot L_{ssim}$$
-
-代入默认值：
-
-$$L_{visual} = 1.0 \cdot L_{MSE} + 1.0 \cdot L_{SSIM}$$
-
-两种视觉损失等权组合，分别从像素级绝对误差和结构级相似性两个角度约束图像质量：
-- **MSE**：像素级绝对误差
-- **SSIM**：结构级相似性（亮度、对比度、结构）
-
-### 4.6 残差预算参数
+### 5.3 两阶段训练轮数与恢复
 
 | 参数 | 默认值 | 说明 |
-|------|-------|------|
-| `msg_budget` | `0.04` | 消息残差预算，控制消息嵌入的最大幅度 |
-| `prv_budget` | `0.04` | 隐私残差预算，控制隐私扰动的最大幅度 |
-| `texture_mask_strength` | `3.0` | 纹理掩码 sigmoid 斜率，控制掩码对比度 |
-| `texture_mask_smooth_kernel` | `5` | 纹理掩码梯度平滑核大小 |
+| --- | --- | --- |
+| `num_epochs_phase1` | `150` | Phase 1 轮数 |
+| `num_epochs_phase2` | `100` | Phase 2 轮数 |
+| `bit_accuracy_threshold` | `0.90` | 触发 decoder recovery / best 判定的阈值 |
+| `recovery_steps` | `10` | recovery 重训 decoder 的 batch 数 |
 
-**预算约束机制**：编码器的双头输出通过 `budget * tanh(raw_output)` 进行约束，`tanh` 将输出限制在 `[-1, 1]`，乘以预算系数后残差幅度被严格控制在 `[-budget, budget]` 范围内。
-
-- `msg_budget=0.04`：消息残差最大幅度为像素值范围的4%（约±0.04），确保视觉不可感知
-- `prv_budget=0.04`：隐私残差最大幅度同样为4%，与消息预算一致；配合纹理掩码将扰动集中在纹理区域以提升隐私效果
-
-**纹理掩码机制**：Phase 2 中隐私残差在叠加前会乘以纹理掩码。掩码通过对载体图像灰度图计算梯度幅值、均值滤波平滑后经 `sigmoid(grad × strength)` 生成，取值范围 [0.15, 1.0]，使扰动集中在边缘和纹理复杂区域。
-
-### 4.7 隐私保护参数
+### 5.4 对抗（判别器）
 
 | 参数 | 默认值 | 说明 |
-|------|-------|------|
-| `privacy_margin_start` | `0.15` | Phase 2起始逃逸margin |
-| `privacy_margin_end` | `0.30` | Phase 2结束逃逸margin |
-| `clip_weight` | `1.0` | CLIP特征逃逸损失权重 |
-| `dino_weight` | `0.5` | DINOv2特征逃逸损失权重 |
-| `dino_model_path` | `'./models/dinov2_vits14_pretrain.pth'` | DINOv2模型权重路径 |
+| --- | --- | --- |
+| `disc_acc_high` | `0.70` | 判别器准确率门控上限（超过则暂停更新） |
+| `disc_hinge_margin` | `1.0` | 判别器 Hinge Loss margin |
+| `discriminator_loss_threshold` | `0.6` | 遗留兼容参数 |
+| `phase1_adv_start/mid/end` | 均 `0.0` | Phase 1 三段对抗权重 |
+| `phase2_adv` | `0.0` | Phase 2 对抗权重 |
 
-**渐进逃逸边界**：`privacy_margin_start` 和 `privacy_margin_end` 定义了逃逸margin的线性插值范围，通过 `get_escape_margin()` 方法实现渐进式隐私约束。起始值 0.15 比旧的 0.05 更高，在训练初期就提供足够的逃逸约束。
+> 当前场景不依赖隐写分析对抗，各阶段 adv 权重均为 0：判别器仅作监控指标，不向编码器回传梯度。判别器失效时 L_adv 只会向残差注入额外高频伪影，需要时可重新调高。
 
-**CLIP/DINO 权重平衡**：`dino_weight=0.5` 低于 `clip_weight=1.0`，因为 DINOv2 的细粒度纹理特征对微小扰动更敏感，降低其权重避免隐私损失主导训练而损害视觉质量。
-
-### 4.8 CLIP/DINO 有向重定向参数
+### 5.5 视觉与残差预算
 
 | 参数 | 默认值 | 说明 |
-|------|-------|------|
-| `use_clip_redirect` | `False` | 是否启用CLIP/DINO有向重定向（默认关闭） |
-| `clip_memory_size` | `5000` | CLIP特征记忆库容量 |
-| `clip_hard_negative_k` | `5` | CLIP硬负样本Top-K数量 |
-| `clip_redirect_margin` | `0.35` | CLIP重定向margin |
-| `clip_max_target_sim` | `0.55` | CLIP最大允许相似度上限（防止特征坍塌） |
-| `clip_redirect_weight` | `0.6` | CLIP重定向损失权重 |
-| `dino_redirect_weight` | `0.3` | DINO重定向损失权重 |
-| `dino_redirect_margin` | `0.3` | DINO重定向margin |
-| `dino_max_target_sim` | `0.55` | DINO最大允许相似度上限 |
+| --- | --- | --- |
+| `lambda_pixel` / `lambda_ssim` | `1.0` / `1.0` | MSE / SSIM 权重 |
+| `lambda_fft` | `50.0` | FFT 高频能量惩罚权重（仅 Balance 段生效） |
+| `msg_budget` | `0.04` | 消息残差预算（tanh 幅度） |
+| `prv_budget` | `0.08` | 隐私残差预算（深挖配方；CLI `--prv-budget` 可调） |
+| `prv_lowres_size` | `96` | 隐私残差低分辨率约束尺寸 |
+| `fft_high_freq_radius_ratio` | `0.25` | FFT 高频判定半径（奈奎斯特半径的比例；256 图约 r=32） |
 
-### 4.9 检索攻击者参数（预留）
+`prv_budget=0.08` 的依据：逃逸深度近似随预算平方增长（cos 下降 ∝ 特征位移²），0.04→0.08 实测精修 clip_sim 0.634→0.575，PSNR 42.8→39.9 仍在视觉高质量区间。
 
-| 参数 | 默认值 | 说明 |
-|------|-------|------|
-| `use_retrieval_attacker` | `False` | 是否启用检索攻击者（当前已禁用） |
-| `attacker_feature_dim` | `512` | 攻击者输出特征维度（预留） |
-| `attacker_memory_size` | `1000` | 攻击者记忆库容量（预留） |
-| `memory_warmup_batches` | `50` | 记忆库预热批次数 |
-
-### 4.10 恢复机制参数
+### 5.6 纹理掩码
 
 | 参数 | 默认值 | 说明 |
-|------|-------|------|
-| `bit_accuracy_threshold` | `0.90` | 比特准确率阈值，低于此值触发解码器恢复 |
-| `recovery_steps` | `10` | 恢复训练的批次数 |
+| --- | --- | --- |
+| `texture_mask_smooth_kernel` | `5` | 掩码梯度图平滑核 |
+| `texture_mask_strength` | `3.0` | 遗留兼容参数，不参与计算（掩码由分位数归一化决定） |
 
-### 4.11 其他参数
+掩码实际映射：`mask = 0.15 + 0.85 × clip((grad − q05)/(q95 − q05), 0, 1)`，即 [0.15, 1.0]。下限 0.15 的依据：探针实测下限 0.05 时 CLIP 逃逸天花板 sim≈0.72，贴边目标 0.70 无余量。
+
+### 5.7 Phase 1 哑隐私噪声（预适应）
 
 | 参数 | 默认值 | 说明 |
-|------|-------|------|
-| `data_dir` | `None` | 数据集根目录（命令行指定） |
-| `train_dir` | `'train'` | 训练集子目录名 |
-| `val_dir` | `'val'` | 验证集子目录名 |
-| `checkpoint_dir` | `'checkpoints'` | 检查点保存目录 |
-| `log_dir` | `'logs'` | 日志目录 |
-| `num_workers` | `4` | 数据加载工作线程数 |
-| `save_interval` | `10` | 检查点保存间隔（epoch数） |
-| `noise_config` | `'identity'` | 噪声层配置字符串 |
-| `discriminator_loss_threshold` | `0.6` | 判别器损失阈值（遗留兼容参数） |
-| `disc_acc_high` | `0.70` | 判别器准确率达到此值时暂停更新 |
-| `disc_hinge_margin` | `1.0` | 判别器 Hinge Loss 的 margin |
-| `phase1_adv_start` | `0.0` | Phase 1 前段对抗权重 |
-| `phase1_adv_mid` | `0.25` | Phase 1 中段对抗权重 |
-| `phase1_adv_end` | `0.75` | Phase 1 后段对抗权重 |
-| `phase2_adv` | `0.5` | Phase 2 对抗权重 |
-| `phase1_prv_noise_start` | `0.50` | Phase 1 隐私噪声开始比例 |
-| `phase1_prv_noise_end` | `0.90` | Phase 1 隐私噪声达到上限比例 |
-| `phase1_prv_noise_max_ratio` | `0.50` | Phase 1 隐私噪声最大比例 |
-| `phase1_prv_noise_power` | `2.0` | Phase 1 隐私噪声幂律指数 |
-| `phase1_prv_noise_smooth_kernel` | `7` | Phase 1 隐私噪声平滑核大小 |
+| --- | --- | --- |
+| `phase1_prv_noise_start` | `0.80` | 前 80% 轮次不注入噪声（随机噪声会淹没 msg 信号、阻碍消息通路冷启动） |
+| `phase1_prv_noise_end` | `0.95` | 噪声达到最大比例的轮次比例 |
+| `phase1_prv_noise_max_ratio` | `0.30` | 最大注入比例（相对 prv_budget） |
+| `phase1_prv_noise_power` | `2.0` | ramp 幂次 |
+| `phase1_prv_noise_smooth_kernel` | `7` | 噪声平滑核 |
 
-### 4.12 阶段权重函数 `get_phase_weights(phase, epoch)`
+### 5.8 消息/隐私双分支
 
-这是整个系统的**核心调度逻辑**，决定了不同训练阶段的损失权重分配。当前实现采用**两阶段**训练，且部分权重在阶段内**渐进变化**。对抗权重 `adv` 不再依赖 `lambda_adv` 倍率，而是直接由 `phase1_adv_*` / `phase2_adv` 配置指定。
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `msg_clean_ratio_start` / `msg_clean_ratio_end` | `0.80` / `0.50` | Phase 1 干净分支权重线性退火区间，Phase 2 固定 end |
+| `privacy_noised_ratio` | `0.3` | 隐私含噪分支权重（Phase 1 / Balance 段） |
+| `privacy_noised_ratio_sprint` | `0.0` | Sprint / Refine 段含噪分支权重（只用干净分支梯度） |
 
-#### Phase 1 — 基础隐写 + 渐进对抗训练（150 epochs）
+### 5.9 Phase 2 三段调度
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `phase2_sprint_epochs` | `40` | Sprint 段轮数（Phase 2 开头；CLI `--sprint-epochs`） |
+| `phase2_sprint_visual` | `1.5` | Sprint 视觉轻锚权重 |
+| `phase2_sprint_privacy` | `12.0` | Sprint 隐私权重 |
+| `phase2_refine_epochs` | `30` | Refine 终段轮数（Phase 2 末尾；CLI `--refine-epochs`） |
+
+Sprint 段 40（原 20）的依据：20 轮实测边际收益尚未衰减完（10→20 轮仍降 0.5pt），且新增结构（prv_trunk）从零初始化需要更长冲刺期收敛。
+
+### 5.10 内环蒸馏
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `distill_inner_steps` | `10` | 内环教师优化步数（0 关闭；CLI `--distill-steps`） |
+| `distill_lr` | `0.1` | 内环 Adam 学习率 |
+| `distill_weight` | `25.0` | 蒸馏损失权重（默认 25：蒸馏梯度是残差空间的直接回归、高信噪比，escape 梯度须穿过整个 CLIP 网络且信噪比低，提权让干净信号主导更新方向） |
+| `distill_w_privacy` / `distill_w_message` / `distill_w_visual` | `12.0` / `10.0` / `15.0` | 教师目标各项权重（与 `val/refine_encode.py` 验证配方一致；Refine 段同时作为学生目标权重） |
+
+### 5.11 Escape Margin（逃逸边界）
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `privacy_margin_start` / `privacy_margin_end` | `0.10` / `0.50` | CLIP escape margin 渐进区间（CLI `--privacy-margin-end`；深挖配方 0.50） |
+| `dino_escape_margin_start` / `dino_escape_margin_end` | `0.06` / `0.20` | DINO escape margin 渐进区间（CLI `--dino-margin-end`；深挖配方 0.20） |
+
+margin 是第一逃逸杠杆：二次 Hinge 在 sim < (1−margin) 后梯度归零，margin 即逃逸地板。CPU 逐图精修实测（budget 0.08、60 步、bit_acc 100%）：margin 0.30/0.40/0.50 对应 clip_sim 0.575/0.547/0.440（PSNR 39.9/39.4/39.0）。0.50 远低于实测 hard negative 均值 0.73，CBIR top-1 易主余量充足；Sprint/Refine 段直接取该值，教师内环目标同源联动。DINO 视角下目标是脱离 near-duplicate 区 ~0.90，其 hard negative 极远（mean≈0.47），目标 sim 0.80（margin 0.20）精修代价很小、与 CLIP 逃逸不冲突。
+
+### 5.12 CLIP / DINO 有向重定向
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `use_clip_redirect` | `True` | 启用记忆库硬负样本重定向 |
+| `clip_memory_size` | `5000` | 记忆库容量（CLIP 与 DINO 各一） |
+| `clip_hard_negative_k` | `5` | 每次采样 hard negative 数 |
+| `clip_redirect_target_sim` / `dino_redirect_target_sim` | `0.85` / `0.60` | 重定向目标相似度 |
+| `clip_max_target_sim` / `dino_max_target_sim` | `0.90` / `0.65` | 重定向相似度上限（control loss） |
+| `clip_redirect_exclude_sim` / `dino_redirect_exclude_sim` | `0.92` / `0.87` | hard negative 排除阈值（自身/近重复；CLIP p99≈0.92、DINO p99≈0.87） |
+| `clip_redirect_weight` / `dino_redirect_weight` | `3.0` / `0.6` | 重定向损失权重 |
+| `clip_weight` / `dino_weight` | `1.0` / `0.5` | CLIP / DINO 逃逸总权重 |
+| `clip_redirect_margin` / `dino_redirect_margin` | `0.35` / `0.3` | 遗留参数（redirect 目标现由 `*_redirect_target_sim` 控制） |
+| `dino_model_path` | `'./models/dinov2_vits14_pretrain.pth'` | DINOv2 权重路径 |
+
+> redirect 目标按特征空间分别标定，必须明显高于该空间典型 hard negative 相似度（CLIP≈0.73，p90≈0.83；DINO≈0.47）才有实质拉力——target 0.80 时 relu(0.80−0.78)≈0.02，redirect 占隐私损失不到 1%，形同虚设；target 0.85 提供 ~0.07 的持续拉力，redirect 成为指路的第二引擎。target < exclude > max 的层次必须保持（0.85 < 0.90 < 0.92）。
+
+### 5.13 色度低频投影（精修事后处理）
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `refine_chroma_projection` | `True` | 精修收敛后剔除 prv 低频色度蒙层（CLI `--refine-chroma-projection 1/0`） |
+
+动机与机制见 11.8 节。所有含精修的 val 脚本均以 `--refine-chroma-projection`（或 `--chroma-projection`）同口径透传。
+
+### 5.14 噪声与记忆库
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `noise_config` | `'jpeg+resize(0.8,1.2)+quant'` | 噪声层配置（CLI `--noise` 覆盖；`'identity'` 表示无噪声） |
+| `memory_warmup_batches` | `50` | Phase 1 开始时记忆库预热批次数 |
+
+### 5.15 阶段权重函数
+
+**`get_phase_weights(phase, epoch)`** —— 返回 `{visual, message, adv, privacy, noised, residual_penalty, fft}` 权重字典（`epoch` 为**阶段内相对轮次**）：
+
+- **Phase 1**：`visual=10, message=15, adv=三段(0/0/0), privacy=0, noised=0, residual_penalty=0.5, fft=0`。
+- **Phase 2 Refine 终段**（优先判定）：`visual=distill_w_visual(15), message=distill_w_message(10), privacy=distill_w_privacy(12), adv=0, noised=0, residual_penalty=0, fft=0`。
+- **Phase 2 Sprint 段**（`epoch <= phase2_sprint_epochs`）：`visual=1.5, message=0, privacy=12, adv=0, noised=0, residual_penalty=0, fft=0`。
+- **Phase 2 Balance 段**（其余轮次，按剩余轮数三等分）：
+  - 前 1/3：`privacy=4, message=20`
+  - 中 1/3：`privacy=8, message=15`
+  - 后 1/3：`privacy=12, message=10`
+  - 固定：`visual=15, adv=0, noised=0, residual_penalty=0.5, fft=50`
+
+privacy 权重 4/8/12 的依据：privacy 梯度须穿过整个 CLIP/DINO 网络才能到达残差（∂sim/∂残差极小），而 visual/message 对残差是逐像素直接的（∂≈1），实测 1.5/2.5/3.5 的权重无法补偿 1~2 个数量级的雅可比差距，平衡点会被钉死在 sim≈0.97（privacy 占损失 88% 但 sim 几乎不降）。
+
+**`get_escape_margin(phase, epoch)` / `get_dino_escape_margin(phase, epoch)`**：Phase 1 恒 0；Phase 2 的 Refine/Sprint 段直接取 end 值；其余（Balance）在前 50% 轮次内从 start 线性渐进到 end，后半程稳定在 end（若全程渐进，训练将一直追逐不断远去的 hinge 目标——实测 margin 到最后一个 epoch 才到达 end，模型从未在最终目标下稳定优化过）。
+
+**`get_privacy_noised_ratio(phase, epoch)`**：Sprint 与 Refine 段返回 `privacy_noised_ratio_sprint`（0），其余返回 `privacy_noised_ratio`（0.3）。
+
+**`get_msg_clean_ratio(phase, epoch)`**：Phase 1 从 0.80 线性退火到 0.50；Phase 2 固定 0.50。
+
+**`get_prv_noise_ratio(epoch)`**：Phase 1 哑噪声注入比例。前 80% 轮次为 0；80%~95% 轮次按幂次 2.0 渐进到最大比例 0.30；之后恒 0.30。
+
+**`is_phase2_refine_segment(epoch)`**：`refine > 0 and epoch > num_epochs_phase2 - refine`。判定优先级 Refine > Sprint > Balance——热启动纯精修（`--epochs-phase2 N --refine-epochs N`）时全部轮次命中 Refine 而非被 Sprint 声明。
+
+---
+
+## 6. 数据处理模块 (`data/`)
+
+`data/dataset.py` 定义 `SteganographyDataset(root_dir, image_size=256, message_length=30)`：
+
+- 用 `os.walk` 递归扫描 `root_dir`，支持 `.png` / `.jpg` / `.jpeg` / `.bmp`。
+- 默认 transform：`Resize((image_size, image_size))` → `ToTensor()` → `Normalize([0.5]*3, [0.5]*3)`（映射到 `[-1, 1]`）。
+- `__getitem__` 返回字典：
 
 ```python
 {
-    'visual': 10.0,        # 高权重：优先学习图像重建
-    'message': 10.0,       # 高权重：优先学习消息编解码
-    'adv': 渐进,            # phase1_adv_start -> phase1_adv_mid -> phase1_adv_end
-    'privacy': 0.0,        # 关闭：不进行隐私保护
-    'noised': 1.0,         # 含噪声图像的视觉损失权重
-    'residual_penalty': 0.5,# 中等：限制修改幅度
-    'fft': 0.0             # 关闭：Phase 1 不施加频域正则
+    'cover_image': Tensor[3, H, W],          # [-1, 1]
+    'message':     Tensor[message_length],   # torch.randint(0, 2, ...).float()
+    'image_path':  str,
 }
 ```
 
-**adv 渐进策略**：将Phase 1的150个epoch均分为3段：
-- 第1-50 epoch：`adv = phase1_adv_start` (默认0.0)
-- 第51-100 epoch：`adv = phase1_adv_mid` (默认0.25)
-- 第101-150 epoch：`adv = phase1_adv_end` (默认0.75)
+---
 
-**目标**：让编码器先学会将消息嵌入图像且保持视觉质量，解码器学会准确提取消息；前1/3完全不引入对抗约束，中段引入轻量对抗，后段提升对抗强度为Phase 2做准备。
+## 7. 模型架构模块 (`models/`)
 
-#### Phase 2 — 隐私保护训练（100 epochs）
+### 7.1 编码器 (Encoder)
 
-```python
-{
-    'visual': 10.0,         # 保持高视觉权重
-    'message': 渐进,         # 20.0 -> 15.0 -> 10.0
-    'adv': 0.5,             # 固定对抗权重 (phase2_adv)
-    'privacy': 渐进,         # 2.0 -> 4.0 -> 5.0
-    'noised': 0.3,          # 降低含噪声损失权重
-    'residual_penalty': 0.5,# 保持中等残差惩罚
-    'fft': 10.0             # 开启FFT高频惩罚 (lambda_fft)
-}
-```
+编码器实现**双残差**架构，`forward(cover_image, message, phase, prv_noise_ratio)` 返回 `(encoded_image, residual_penalty, msg_residual, prv_residual)`。
 
-**message 渐进策略**：将Phase 2的100个epoch均分为3段：
-- 第1-33 epoch：`message = 20.0`（高权重保护消息能力）
-- 第34-66 epoch：`message = 15.0`
-- 第67-100 epoch：`message = 10.0`
+#### 共享层
 
-**privacy 渐进策略**：
-- 第1-33 epoch：`privacy = 2.0`
-- 第34-66 epoch：`privacy = 4.0`
-- 第67-100 epoch：`privacy = 5.0`
+- 16 个 `ConvBNRelu`（3→128 → 15×(128→128)），每个为 `Conv2d(3×3, bias=False) + BatchNorm2d + ReLU`。
+- 消息空间扩展：`message (B, L)` → `unsqueeze` 后 `expand` 到 `(B, L, H, W)`。
+- 融合层：`cat[expanded_message, features, cover_image]`（通道 30+128+3=161）→ `ConvBNRelu(161, 128)`。
 
-**目标**：在保证隐写能力和对抗性的基础上，由浅入深地引入隐私保护约束和频域正则，使编码图像在语义特征空间中逐渐远离原始图像。消息权重从20.0逐步降至10.0，与隐私权重从2.0升至5.0形成此消彼长的关系，确保在增强隐私保护时消息提取能力不退化。Phase 2 始终保持 `visual=10.0` 的高权重，防止隐私训练损害视觉质量。
+#### 消息头（msg_head）
 
-### 4.13 渐进逃逸边界函数 `get_escape_margin(phase, epoch)`
+`ConvBNRelu(128→128) → ConvBNRelu(128→128) → Conv2d(1×1, 128→3)`，输出经 `msg_budget × tanh` 得 `msg_residual`。Phase 2 起全程冻结。
+
+#### 隐私独立支路（prv_trunk）
 
 ```python
-def get_escape_margin(self, phase, epoch):
-    if phase == 1:
-        return 0.0
-    total = self.num_epochs_phase2
-    progress = min(1.0, (epoch - 1) / max(1, total - 1))
-    return self.privacy_margin_start + (self.privacy_margin_end - self.privacy_margin_start) * progress
+ConvBNRelu(3, 128)                       # dilation 1
+ConvBNRelu(128, 128, dilation=3)
+ConvBNRelu(128, 128, dilation=9)
+ConvBNRelu(128, 128, dilation=27)
 ```
 
-- **Phase 1**：返回 `0.0`，不进行隐私逃逸约束
-- **Phase 2**：线性插值从 `privacy_margin_start`（0.15）到 `privacy_margin_end`（0.30）
+- 直接以载体图像为输入（不经过共享层），输出 128 通道特征与共享特征拼接。
+- 感受野 81×81，解决 5×5 小感受野算不出空间结构化逐图攻击模式的容量瓶颈。
+- 绕开只为消息目标训练且全程冻结的共享层（信息瓶颈）。
+- Phase 1 与 `prv_head` 一起冻结；Phase 2 解冻，与 `prv_head` 共用 `prv_head_lr_mult`（×5）加速参数组。
 
-**直觉解释**：逃逸margin决定了编码图像特征需要与原图特征保持的最小距离。较小的margin意味着更严格的逃逸要求（需要更低的相似度）。从0.15开始，模型在训练初期就需要显著地推离原图特征；随着训练推进，margin增大到0.30，要求特征之间保持更大的距离。较高的起始margin（相比旧版的0.05）确保隐私约束从一开始就生效，避免模型在初期"偷懒"。
+#### 隐私头（prv_head）
 
-### 4.14 隐私噪声比例函数 `get_prv_noise_ratio(epoch)`
+输入 `cat[shared_features, prv_trunk(cover)]`（128+128=256 通道）：`ConvBNRelu(256→128) → ConvBNRelu(128→128) → Conv2d(1×1, 128→3)`。
 
-```python
-def get_prv_noise_ratio(self, epoch):
-    total = self.num_epochs_phase1
-    start = total * self.phase1_prv_noise_start
-    end = total * self.phase1_prv_noise_end
-    if epoch < start:
-        return 0.0
-    elif epoch >= end:
-        return self.phase1_prv_noise_max_ratio
-    else:
-        progress = (epoch - start) / max(1, (end - start))
-        return self.phase1_prv_noise_max_ratio * (progress ** self.phase1_prv_noise_power)
+> 兼容性提示：旧结构 checkpoint 的 `prv_head` 首层输入为 128 通道，新增 `prv_trunk` 后为 256 通道，形状不匹配。`train.py` 的 `load_encoder_state_compatible` 与 `val/validation_script.py` 会自动跳过不兼容权重（隐私支路由 Phase 2 重训，消息通路完整复用）。
+
+#### 隐私残差约束链（顺序固定）
+
+```
+prv_head 输出 (B,3,H,W)
+  → F.adaptive_avg_pool2d 到 (96, 96)          # 结构性低通
+  → F.interpolate 双三次上采样回 (H, W)
+  → prv_budget × tanh                           # 预算约束
+  → × texture_mask                              # 纹理掩码加权
+prv_residual
 ```
 
-此函数仅在 **Phase 1** 中使用，控制编码器中虚拟隐私噪声（dummy_prv）的比例：
+编码图像：`clamp(cover + msg_residual + prv_residual, -1, 1)`。
 
-- **前50% epochs**（默认 epoch 1-75）：`ratio = 0.0`，不添加虚拟隐私噪声
-- **50%-90% epochs**（默认 epoch 76-135）：`ratio` 按 `phase1_prv_noise_power=2.0` 的幂律从0增长到 `max_ratio=0.5`
-- **后10% epochs**（默认 epoch 136-150）：`ratio = 0.5`，保持半量虚拟隐私噪声
+96×96 的依据：CLIP ViT-B/32 patch 为 16×16 像素，对 patch 尺度中频结构（32~96 周期/图）最敏感；48×48 低通（<24 周期）恰好把残差约束在 CLIP 最不敏感的频段（实测 privacy 损失占 88% 但 sim 几乎不降）；96 网格 ≈ 2.7px/格，上采样后仍结构性消除 >96 周期的高频条纹，FFT 惩罚兜底不变。
 
-**设计目的**：Phase 1中隐私头（prv_head）被冻结，但为了让编码器在Phase 2开始时不至于对隐私残差完全陌生，通过添加与 `prv_budget` 同尺度（但比例上限为0.5）的随机噪声来"预适应"共享特征层。噪声在注入前会经过 `avg_pool2d` 平滑和零均值单位方差归一化处理，再通过 `tanh` 约束幅度，使Phase 2解冻prv_head时过渡更平滑。幂律增长（power=2.0）使噪声在初期引入得更温和。
+#### 纹理掩码（不参与反向传播）
+
+1. `cover` 转灰度，计算垂直/水平梯度；
+2. 以 `texture_mask_smooth_kernel`（默认 5）均值池化平滑；
+3. **逐图**计算分位数 `q05` / `q95`，归一化 `(grad − q05)/(q95 − q05)` 并 clamp 到 [0, 1]；
+4. 映射 `mask = 0.15 + 0.85 × g_norm`，输出 `(B, 1, H, W)`，取值 [0.15, 1.0]。
+
+#### Phase 1 哑隐私噪声（预适应）
+
+Phase 1 中 `prv_residual = None`，注入经平滑与归一化的随机噪声：
+
+```
+randn → avg_pool 平滑(核7) → 逐样本零均值 → 逐样本单位方差
+     → prv_budget × prv_noise_ratio × tanh(noise)
+```
+
+编码图像 = `cover + msg_residual + dummy_prv`。注入比例由 `get_prv_noise_ratio(epoch)` 调度（前 80% 轮次为 0，之后渐进到 0.30）。设计意图：让消息通路在"图像上存在与隐私残差同分布的干扰"这一前提下预适应，Phase 2 换成真实隐私残差时解码通路不发生分布突变。
+
+### 7.2 解码器 (Decoder)
+
+`ConvBNRelu(3→64) → 7×ConvBNRelu(64→64) → ConvBNRelu(64→30) → AdaptiveAvgPool2d(1,1) → Linear(30, 30)`。
+
+输出消息 logits `(B, message_length)`，**未经 sigmoid**——训练损失使用 `BCEWithLogitsLoss`（sigmoid 内置以提升数值稳定性），计算损失前不要额外加 sigmoid。
+
+### 7.3 隐写分析器 (Steganalyzer)
+
+判别器式二分类器，默认启用 SpectralNorm：
+
+```
+Conv(3→64)  → Conv(64→64)  → MaxPool(2)
+Conv(64→128) → Conv(128→128) → MaxPool(2)
+Conv(128→256) → Conv(256→256) → MaxPool(2)
+Conv(256→512) → Conv(512→512) → AdaptiveAvgPool(1,1)
+FC: Linear(512→256) + LeakyReLU(0.2) + Linear(256→1)
+```
+
+输出 logits `(B, 1)`，配合 Hinge Loss（margin=1.0）使用。当前配置（各阶段 adv 权重 0）仅作监控。
+
+### 7.4 内容识别器 (ContentRecognizer) 与 DINOv2
+
+**CLIP ViT-B/32**（`content_recognizer.py`）：
+
+- `clip.load('ViT-B/32')`，全部参数冻结，`eval()` 模式。
+- 前向：双线性插值到 224×224 → `[-1,1]` 映射到 `[0,1]` → CLIP 均值 `[0.481, 0.458, 0.408]` / 标准差 `[0.269, 0.261, 0.275]` 归一化 → `encode_image` → L2 归一化。
+- 输出 512 维归一化特征；`encode_text` 同样输出 L2 归一化文本特征。
+
+**DINOv2 ViT-S/14**（`trainer.py` / `val/validation_script.py` 中加载）：
+
+- `timm.create_model('vit_small_patch14_dinov2.lvd142m', pretrained=False, num_classes=0, img_size=224)`。
+- 权重从 `Config.dino_model_path`（`./models/dinov2_vits14_pretrain.pth`）加载；`pos_embed` 形状不一致时做 2D 插值后以 `strict=False` 加载；**权重文件缺失时警告并使用随机初始化**。
+- 冻结、eval；推理均值 `[0.485, 0.456, 0.406]` / 标准差 `[0.229, 0.224, 0.225]`，输出 384 维特征。
+- 仅当 `dino_weight > 0` 时启用。
 
 ---
 
-## 5. 数据处理模块 (`data/`)
+## 8. 损失函数模块 (`losses/`)
 
-### 5.1 SteganographyDataset 类
+### 8.1 SSIM 损失 (`ssim_loss.py`)
 
-**文件位置**: [dataset.py](data/dataset.py)
+标准结构相似性损失，与 MSE 共同构成视觉损失 `L_visual = lambda_pixel × MSE + lambda_ssim × (1 − SSIM)`。
 
-```python
-class SteganographyDataset(Dataset):
-    def __init__(self, root_dir, image_size=256, message_length=30, transform=None):
-```
+### 8.2 特征重定向损失 (`advanced_privacy_loss.py`)
 
-#### 5.1.1 数据集初始化流程
+`FeatureRedirectionLoss` 组合三类损失，CLIP 与 DINO 各自独立计算：
 
-1. **图像路径收集**：递归遍历 `root_dir` 目录，筛选支持格式（`.png`, `.jpg`, `.jpeg`, `.bmp`）
-2. **图像预处理Pipeline**：
-   ```
-   Resize(256×256) → ToTensor() → Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5])
-   ```
-
-   归一化到 `[-1, 1]` 区间，与编码器输出范围一致。
-
-3. **消息生成**：每个样本随机生成 `message_length`（30）维的二进制向量，每维为0或1的浮点数。
-
-#### 5.1.2 `__getitem__` 返回格式
+**Escape（逃逸）损失** —— 主项为二次 Hinge，预热项为 Softplus：
 
 ```python
-return {
-    'cover_image': image,      # shape: [3, 256, 256], range: [-1, 1]
-    'message': message,        # shape: [30], values: {0.0, 1.0}
-    'image_path': image_path   # str: 原始图像路径
-}
+sim   = cosine(feat_encoded, feat_cover)          # 逐样本
+diff  = sim - (1 - margin)
+loss  = mean(relu(diff) ** 2) * 25.0             # 二次 Hinge（放大 25×）
+      + mean(softplus(diff)) * 0.1               # Softplus 预热（小偏离也有梯度）
 ```
 
-**设计要点**：
-- 消息是**每次访问时随机生成**的，而非预先固定。这意味着同一张图像在不同epoch会携带不同的秘密消息，增强了泛化能力。
-- 使用 `torch.randint(0, 2, ...)` 保证消息的均匀分布。
+margin 越大，逃逸目标 `sim < 1 − margin` 越激进；`sim` 低于目标后梯度归零（这是 margin 成为第一杠杆的结构原因，见 11.9）。
+
+**Redirect（有向重定向）损失** —— 记忆库硬负样本方向：
+
+```python
+sim_to_neg    = cosine(feat_encoded, hard_negatives)      # (B, k)
+hardest_neg   = 每样本取最相似负样本
+sim_to_hardest = cosine(feat_encoded, hardest_neg)
+redirect_loss = mean(relu(target_sim - sim_to_hardest))     # 线性 Hinge 拉升
+control_loss  = mean(relu(sim_to_hardest - max_target_sim)) # 防过头
+```
+
+把特征推向语义相近但不同的目标，防止逃逸后落入其他敏感区域；`control_loss` 计入总损失。
+
+**总损失组装**：`total = clip_weight × clip_escape (+ clip_redirect_weight × (clip_redirect + clip_control)) + dino_weight × dino_escape (+ dino_redirect_weight × (dino_redirect + dino_control))`，返回 `(loss, loss_dict)`。escape margin 由训练侧通过 `Config.get_escape_margin` / `get_dino_escape_margin` 每步传入（构造函数默认值仅为兜底）。
+
+### 8.3 训练侧损失组装（`trainer.py`）
+
+**隐私双分支**（噪声层雅可比会毒化 CLIP 梯度——quant 傅里叶近似梯度在 1~21 倍震荡、jpeg 近似劣质，只在含噪图上算会完全推不动）：
+
+- 干净分支：escape + redirect（主力方向）；
+- 含噪分支：仅 escape（锚定传播场景鲁棒性）；
+- 融合：`L_privacy = (1 − noised_ratio) × L_clean + noised_ratio × L_noised`。
+
+**消息双分支**：干净编码图 + 含噪编码图分别过 decoder，`L_message = clean_ratio × BCE(clean) + (1 − clean_ratio) × BCE(noised)`；`clean_ratio` 由 `get_msg_clean_ratio` 调度（Phase 1 从 0.8 退火到 0.5 保冷启动——仅含噪单分支会让随机初始化的微弱信号被信道摧毁、L_message 锁死在 ln2）。
+
+**含噪视觉权重恒为 0**（所有阶段）：含噪视觉损失会把信道失真归咎于残差，与消息目标直接对抗，同样导致躺平。
+
+**FFT 高频能量惩罚**（仅 Balance 段）：
+
+```python
+fft        = torch.fft.fft2(residual, norm='ortho')
+amplitude  = |fft| → fftshift                     # 零频移到中心
+radius     = max(1, int((min(H,W)//2) × 0.25))    # 256 图约 r=32
+L_fft      = mean(amplitude × (dist > radius))    # 半径外线性幅值均值 × lambda_fft(50)
+```
+
+实现说明（代码中的修复点）：原半径 `min(H,W)//4` 只覆盖 r>64 的极高频，周期 4~8px 的可见条纹（r=32~64）完全豁免，现半径由 `fft_high_freq_radius_ratio` 控制；原 `sqrt(mean(A))` 形态梯度随违规增大而递减（病态），现改为 `mean(A)` 线性形式，梯度恒定、与违规程度成正比。
+
+**内环蒸馏损失**：`L_distill = mse(prv_residual, teacher) / (teacher.pow(2).mean() + 1e-7)`——能量归一化 MSE。依据：原始残差空间 MSE 量级 ~1e-5（残差 RMS ~0.015），加权后完全不可见；归一化后师生相对平方误差 ~0.4，加权 25 后与其他损失项同量级且以高信噪比的直接回归信号主导残差更新方向。
 
 ---
 
-## 6. 模型架构模块 (`models/`)
+## 9. 噪声层模块 (`noise_layers/`)
 
-### 6.1 编码器 (Encoder)
-
-**文件位置**: [encoder.py](models/encoder.py)
-
-#### 6.1.1 架构设计
-
-编码器采用**双残差头（Dual-Residual Head）架构**，核心思想是将消息嵌入和隐私保护解耦为两个独立的残差路径：
+`noise_argparser.py` 提供自定义 argparse Action，接受 `+` 分隔的组合字符串：
 
 ```
-Cover Image [B, 3, 256, 256]     Message [B, 30]
-       │                              │
-       ▼                              ▼
-┌──────────────────────┐     message expand: [B,30] → [B,30,256,256]
-│ ConvBNRelu(3→128)    │  ← 第1层：初步特征提取
-├──────────────────────┤
-│ ConvBNRelu(128→128)×15│ ← 第2-16层：深层特征学习（128通道）
-├──────────────────────┤
-│ Concat: [msg; feat; cover] │  ← 特征拼接
-│ ConvBNRelu(161→128)  │  ← 融合层：(30+128+3)=161通道 → 128通道
-├──────────────────────┤
-│        shared features [B, 128, 256, 256]                        │
-├──────────┬───────────┤
-│  msg_head│  prv_head │  ← 双头分支
-│  Conv(128→128,k=3)  │  Conv(128→128,k=3)
-│  +BN+ReLU           │  +BN+ReLU
-│  Conv(128→128,k=3)  │  Conv(128→128,k=3)
-│  +BN+ReLU           │  +BN+ReLU
-│  Conv(128→3,k=1)    │  Conv(128→3,k=1)
-├──────────┴───────────┤
-│ msg_residual = 0.04*tanh(msg_head)  ← 消息残差（预算约束）       │
-│ prv_residual = 0.04*tanh(prv_head)  ← 隐私残差（预算约束）       │
-├──────────────────────┤
-│ Phase 1: encoded = cover + msg_residual + dummy_prv_noise        │
-│ Phase 2: encoded = cover + msg_residual + prv_residual*texture_mask │
-├──────────────────────┤
-│ torch.clamp(encoded, -1, 1)  ← 输出范围[-1, 1]                  │
-└──────────────────────┘
-       │
-       ▼
-Encoded Image [B, 3, 256, 256]
-Returns: (encoded_image, residual_penalty, msg_residual, prv_residual)
+crop((hmin,hmax),(wmin,wmax))    随机裁剪（对编码图与原图施加相同窗口）
+cropout((hmin,hmax),(wmin,wmax)) 窗口外用原图像素替换
+dropout(keep_min,keep_max)        逐像素二值掩码，0 处用原图替换
+resize(min,max)                  先缩放再缩放回（双线性，可微）
+jpeg                             DCT 域量化压缩
+quant                            傅里叶级数近似 round 量化
 ```
 
-#### 6.1.2 详细组件解析
+`Noiser` 每次前向**随机选择一个**激活噪声层（空配置时退化为 `Identity`）。所有层接收并返回 `(noised_image, cover_image)` 二元组。
 
-**ConvBNRelu 基础块**：
+| 噪声层 | 可微性 | 实现要点 |
+| --- | --- | --- |
+| Identity | 可微 | 恒等映射 |
+| Crop / Cropout / Dropout | 不可微（离散选择） | 随机窗口/掩码，混合原图像素 |
+| Resize | 可微 | `F.interpolate` 双线性 |
+| JpegCompression | 可微 | RGB→YUV → 卷积实现 DCT → Zigzag 保留低频（`yuv_keep_weights=(25,9,9)`）→ IDCT → RGB |
+| Quantization | 可微 | 傅里叶级数近似 round（`N=10` 项，`weights[n]=(−1)^(n+1)/(π(n+1))`） |
 
-```python
-class ConvBNRelu(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-```
-
-- **3×3卷积 + padding=1**：保持空间尺寸不变（same convolution）
-- **bias=False + BatchNorm**：BatchNorm已包含偏置项，去掉冗余bias减少参数
-- **ReLU(inplace=True)**：原地操作节省显存
-
-**消息扩展机制**：
-
-```python
-expanded_message = message.unsqueeze(-1).unsqueeze(-1)  # [B, 30] → [B, 30, 1, 1]
-expanded_message = expanded_message.expand(-1, -1, self.H, self.W)  # → [B, 30, 256, 256]
-```
-
-将一维消息向量（30维）**空间广播**为与图像相同分辨率的特征图。这种设计的含义是：消息的每一位信息被均匀地"涂抹"在整个图像空间上，类似于数字水印中的扩频技术。
-
-**特征融合拼接**：
-
-```python
-concat = torch.cat([expanded_message, features, cover_image], dim=1)
-# 拼接后通道数: 30(message) + 128(features) + 3(cover) = 161
-shared = self.after_concat_layer(concat)  # 161 → 128
-```
-
-拼接三种信息：
-1. **expanded_message**：原始消息信号
-2. **features**：经过16层卷积处理的图像特征（128通道）
-3. **cover_image**：原始载体图像（残差连接，保留低频信息）
-
-**双头架构**：
-
-```python
-self.msg_head = nn.Sequential(
-    nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
-    nn.BatchNorm2d(128),
-    nn.ReLU(inplace=True),
-    nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
-    nn.BatchNorm2d(128),
-    nn.ReLU(inplace=True),
-    nn.Conv2d(128, 3, kernel_size=1)
-)
-
-self.prv_head = nn.Sequential(
-    nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
-    nn.BatchNorm2d(128),
-    nn.ReLU(inplace=True),
-    nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
-    nn.BatchNorm2d(128),
-    nn.ReLU(inplace=True),
-    nn.Conv2d(128, 3, kernel_size=1)
-)
-```
-
-两个头结构完全对称，各包含2个3×3卷积层和1个1×1输出层。关键区别在于：
-- **msg_head**：生成消息嵌入残差，Phase 1解冻训练，Phase 2冻结
-- **prv_head**：生成隐私扰动残差，Phase 1冻结，Phase 2解冻训练
-
-**预算约束残差**：
-
-```python
-msg_residual = self.msg_budget * torch.tanh(msg_head(shared))  # budget=0.04
-prv_residual = self.prv_budget * torch.tanh(prv_head(shared))  # budget=0.04
-```
-
-`tanh` 将原始输出限制在 `[-1, 1]`，乘以预算系数后：
-- `msg_residual ∈ [-0.04, 0.04]`
-- `prv_residual ∈ [-0.04, 0.04]`
-
-这种设计确保了残差幅度有严格上界，不会因为训练过程中的梯度更新而无限增长。
-
-**纹理掩码计算**（`_compute_texture_mask`）：
-
-Phase 2 中隐私残差在叠加前会乘以一个纹理掩码，将扰动集中在纹理复杂区域：
-
-```python
-def _compute_texture_mask(self, cover_image):
-    gray = cover_image.mean(dim=1, keepdim=True)
-    grad_x = gray[:, :, :, 1:] - gray[:, :, :, :-1]
-    grad_y = gray[:, :, 1:, :] - gray[:, :, :-1, :]
-    grad_mag = torch.sqrt(grad_x.pow(2).sum(...) + grad_y.pow(2).sum(...))
-    grad_mag = avg_pool2d(grad_mag, kernel_size=texture_mask_smooth_kernel, ...)
-    mask = torch.sigmoid(grad_mag * texture_mask_strength)
-    mask = torch.clamp(mask, min=0.15, max=1.0)
-    return mask
-```
-
-掩码取值范围 [0.15, 1.0]：平滑区域权重最低为0.15（仍保留少量扰动），边缘和纹理区域权重最高为1.0（全量扰动）。
-
-**阶段感知前向传播**：
-
-```python
-def forward(self, cover_image, message, phase=1, prv_noise_ratio=0.0):
-    # ... 共享层计算 ...
-    
-    if phase == 2 and not self.msg_head[0].weight.requires_grad:
-        with torch.no_grad():
-            msg_residual = self.msg_head(shared)
-            msg_residual = self.msg_budget * torch.tanh(msg_residual)
-    else:
-        msg_residual = self.msg_head(shared)
-        msg_residual = self.msg_budget * torch.tanh(msg_residual)
-    
-    if phase == 1:
-        # 生成随机噪声并平滑、归一化
-        noise = torch.randn_like(cover_image)
-        noise = avg_pool2d(noise, kernel_size=phase1_prv_noise_smooth_kernel, ...)
-        noise = noise - noise.mean()
-        noise = noise / (noise.std() + 1e-6)
-        dummy_prv = self.prv_budget * prv_noise_ratio * torch.tanh(noise)
-        encoded_image = cover_image + msg_residual + dummy_prv
-        residual_penalty = torch.mean(msg_residual ** 2) + torch.mean(dummy_prv ** 2)
-    else:
-        prv_residual = self.prv_head(shared)
-        prv_residual = self.prv_budget * torch.tanh(prv_residual)
-        prv_residual = prv_residual * texture_mask  # 纹理掩码加权
-        encoded_image = cover_image + msg_residual + prv_residual
-        residual_penalty = torch.mean(msg_residual ** 2) + torch.mean(prv_residual ** 2)
-    
-    encoded_image = torch.clamp(encoded_image, -1, 1)
-    return encoded_image, residual_penalty, msg_residual, prv_residual
-```
-
-**关键设计点**：
-1. **Phase 1**：prv_head被冻结，使用经平滑和零均值单位方差归一化的随机噪声代替隐私残差（`dummy_prv`），其幅度由 `prv_noise_ratio` 控制，再通过 `tanh` 约束
-2. **Phase 2**：prv_residual 乘以纹理掩码，将扰动集中在纹理复杂区域；当msg_head被冻结时，使用 `torch.no_grad()` 计算消息残差，避免不必要的梯度计算
-3. **输出裁剪**：使用 `torch.clamp` 而非 `tanh` 进行最终范围约束，因为残差已经通过预算约束限制了幅度
-4. **返回值**：除了编码图像和残差惩罚外，还返回 `msg_residual` 和 `prv_residual`，供解码器恢复机制使用
-
-#### 6.1.3 参数量估算
-
-| 层 | 输入通道 | 输出通道 | 卷积核 | 参数量 |
-|---|---------|---------|--------|--------|
-| conv_layers[0] | 3 | 128 | 3×3 | 3×128×9 = 3,456 |
-| conv_layers[1-15] | 128 | 128 | 3×3 | 15×128×128×9 = 2,211,840 |
-| after_concat_layer | 161 | 128 | 3×3 | 161×128×9 = 185,472 |
-| msg_head Conv1 | 128 | 128 | 3×3 | 128×128×9 = 147,456 |
-| msg_head Conv2 | 128 | 128 | 3×3 | 128×128×9 = 147,456 |
-| msg_head Conv3 | 128 | 3 | 1×1 | 128×3×1 = 384 |
-| prv_head Conv1 | 128 | 128 | 3×3 | 128×128×9 = 147,456 |
-| prv_head Conv2 | 128 | 128 | 3×3 | 128×128×9 = 147,456 |
-| prv_head Conv3 | 128 | 3 | 1×1 | 128×3×1 = 384 |
-| **总计** | | | | **~2,991,360** |
-
-> 注：以上未计入BatchNorm参数（每个BN层有2个可训练参数：weight和bias）。
+默认配置 `'jpeg+resize(0.8,1.2)+quant'`：溯源水印必须在失真信道上训练才具备实际鲁棒性。
 
 ---
 
-### 6.2 解码器 (Decoder)
+## 10. 训练系统 (`trainer.py` & `train.py`)
 
-**文件位置**: [decoder.py](models/decoder.py)
+### 10.1 Trainer 初始化
 
-#### 6.2.1 架构设计
+- 模型：`Encoder` / `Decoder` / `Steganalyzer`（SpectralNorm）/ `ContentRecognizer`（冻结 CLIP）；`dino_weight > 0` 时额外加载 DINOv2。
+- **单个 Adam 优化器三个参数组**：
+  1. 编码器非隐私参数（共享层、msg_head）——`lr_encoder`；
+  2. `prv_head` / `prv_trunk` 参数——`lr_encoder × prv_head_lr_mult`（×5）；
+  3. decoder 参数——`lr_decoder`。
+- 判别器独立 Adam（`lr_steganalyzer`）。
+- `use_clip_redirect=True` 时创建 CLIP 记忆库（512 维）；DINO 启用时另建 384 维记忆库（容量均 `clip_memory_size=5000`）。
 
-解码器是一个**纯CNN特征提取 + 全连接分类**网络：
+### 10.2 Phase 1（默认 150 轮）：基础隐写
 
-```
-Encoded Image [B, 3, 256, 256]
-       │
-       ▼
-┌──────────────────────┐
-│ ConvBNRelu(3→64)     │  ← 第1层
-├──────────────────────┤
-│ ConvBNRelu(64→64) ×7 │  ← 第2-8层：深层特征
-├──────────────────────┤
-│ ConvBNRelu(64→30)    │  ← 特征降维到消息长度
-├──────────────────────┤
-│ AdaptiveAvgPool2d(1×1)│  ← 全局平均池化
-├──────────────────────┤
-│ Linear(30→30)        │  ← 全连接层（logits输出）
-└──────────────────────┘
-       │
-       ▼
-Message Prediction [B, 30]  (raw logits, 未经过sigmoid)
-```
+- 冻结：`prv_head` + `prv_trunk`；训练：共享层 + `msg_head` + decoder。
+- 编码图 = 原图 + 消息残差 + 渐进哑隐私噪声（见 7.1）。
+- 权重：`message=15, visual=10, privacy=0, adv=0, residual_penalty=0.5, fft=0`。
+- 判别器仅在 `adv > 0` 且 `D_acc < disc_acc_high(0.70)` 时更新；adv=0 时纯监控。
+- 开始时记忆库预热 `memory_warmup_batches=50` 个 batch（只入库不训练），避免训练初期记忆库为空导致 hard negative mining 失效。
 
-#### 6.2.2 关键设计细节
+### 10.3 Phase 2（默认 100 轮）：三段调度
 
-**全局平均池化（GAP）**：
+`msg_head` 与共享层**全程冻结**（不再按 epoch 分段解冻）。三段判定优先级：**Refine > Sprint > Balance**（均以**本次运行的阶段内相对轮次** `sched_epoch` 计算）。
 
-```python
-layers.append(nn.AdaptiveAvgPool2d(output_size=(1, 1)))
-```
+| 段 | 轮次（默认） | decoder | message | visual | privacy | fft / residual_penalty | 含噪分支 | margin |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **Sprint** | 第 1~40 轮 | 冻结 | 0 | 1.5 | 12 | 清零 | 0 | 直接取 end 值 |
+| **Balance** | 第 41~70 轮 | 解冻 | 20/15/10 | 15 | 4/8/12 | 50 / 0.5 | 0.3 | 前 50% 轮渐进到 end |
+| **Refine** | 第 71~100 轮 | 冻结 | 10 | 15 | 12 | 清零 | 0 | 直接取 end 值 |
 
-将 `[B, 30, H, W]` 压缩为 `[B, 30, 1, 1]`，然后squeeze得到 `[B, 30]`。GAP的优势：
-- 大幅减少全连接层参数量
-- 具有平移不变性
-- 对输入尺寸有一定适应性
+**Sprint 段**（纯逃逸冲刺）设计依据：天花板探针证明同约束下直接优化 60 步即可把 clip_sim 压到 0.64，而正常 Phase 2 的 20000 步停在 0.946——瓶颈是 Adam 在多目标、逐图方向不一致下的信噪比失效（Adam 对梯度尺度不变，加大损失权重无效）。反作用力全部清零：`residual_penalty`（收缩残差直接对冲逃逸梯度）、`fft`（压中频削弱 CLIP 敏感的逃逸方向）、`message`（纯逃逸）、含噪分支（劣质噪声雅可比会稀释本就微弱的逃逸信号）。Sprint 段 bit_acc 暂时下降是预期行为，不触发 recovery、不参与 best 判定惩罚。
 
-**线性输出层**：
+**Balance 段**（多目标平衡）：恢复正常组合，decoder 解冻恢复解码，privacy 权重三段递增 4/8/12（补偿雅可比失衡），recovery 机制兜底。
 
-```python
-self.linear = nn.Linear(message_length, message_length)
-```
+**Refine 终段**：切换为 `val/refine_encode.py` 已验证配方目标（visual 15 / message 10 / privacy 12，反作用力清零），margin 固定 end 值，redirect 关闭（redirect 与 escape 方向对冲）。与 Sprint 的本质差异：Sprint 靠蒸馏教师间接保解码（message=0），Refine 由学生目标直接保解码（message=10，decoder 冻结——残差自适应既有解码器而非解码器迁就残差），因此终段可放心压 clip_sim 而不会把 bit_acc 打穿阈值。热启动纯精修 = `--epochs-phase2 30`（refine=N 全覆盖时无需显式传 `--refine-epochs`）。
 
-输出**原始logits**（非概率），配合 `BCEWithLogitsLoss` 使用，数值稳定性更好。
+### 10.4 冻结策略汇总
 
-#### 6.2.3 参数量估算
+| 阶段/段 | 共享层 | msg_head | decoder | prv_head / prv_trunk |
+| --- | --- | --- | --- | --- |
+| Phase 1 | 解冻 | 解冻 | 解冻 | 冻结 |
+| Phase 2 Sprint | 冻结 | 冻结 | 冻结 | 解冻 |
+| Phase 2 Balance | 冻结 | 冻结 | 解冻 | 解冻 |
+| Phase 2 Refine | 冻结 | 冻结 | 冻结 | 解冻 |
 
-| 层 | 输入通道 | 输出通道 | 卷积核 | 参数量 |
-|---|---------|---------|--------|--------|
-| conv_layers[0] | 3 | 64 | 3×3 | 1,728 |
-| conv_layers[1-7] | 64 | 64 | 3×3 | 258,048 |
-| 最后一层 ConvBNRelu | 64 | 30 | 3×3 | 17,280 |
-| AdaptiveAvgPool2d | - | - | - | 0 |
-| Linear | 30 | 30 | - | 930 |
-| **总计** | | | | **~277,986** |
+### 10.5 内环逐图优化蒸馏（`_refine_teacher_residual`）
 
----
+Phase 2 全程启用（`distill_inner_steps > 0` 时；可用 `--distill-steps 0` 关闭）：
 
-### 6.3 隐写分析器 (Steganalyzer)
+1. 冻结全部网络参数；
+2. **优化变量**：96×96 低分辨率残差场 `delta`，从网络当前输出热启动——
+   `ratio = (prv_residual / (budget × texture_mask + ε)).clamp(−0.95, 0.95)`，`delta = avg_pool(atanh(ratio), 96)`；
+3. **教师目标**（与逐图精修脚本验证配方一致）：
+   - escape-only 隐私损失（无 redirect），margin 固定取 `privacy_margin_end` / `dino_escape_margin_end`；
+   - 消息双分支 BCE（0.5 干净 + 0.5 含噪）；
+   - 视觉 `MSE + SSIM`；
+   - 加权 `distill_w_privacy × L_priv + distill_w_message × L_msg + distill_w_visual × L_vis`；
+   - 约束链与训练同构：`interpolate(delta → H×W) → budget × tanh → × texture_mask → clamp`；
+4. 跑 `distill_inner_steps`（10）步 Adam（`distill_lr=0.1`）得到教师残差；
+5. 学生损失：`distill_weight(25) × 能量归一化 MSE(prv_residual, teacher)`，把探针级逃逸方向蒸进单次前向。
 
-**文件位置**: [steganalyzer.py](models/steganalyzer.py)
+代价：Phase 2 单步耗时约 2~4 倍。Sprint 段蒸馏教师含消息 BCE，起到保解码锚的作用。
 
-#### 6.3.1 架构设计
+### 10.6 Decoder Recovery
 
-隐写分析器是一个**二分类CNN**，用于判断输入图像是否为隐写图像：
+- **触发**：仅 Balance 段（Sprint/Refine 明确跳过并打日志），当验证 `bit_accuracy < bit_accuracy_threshold`（0.90）。
+- **恢复**：冻结编码器与隐私支路，用临时 Adam（`lr_decoder × 0.5`）在**含隐私残差的完整编码图 + 信道噪声**上重训 decoder `recovery_steps`（10）个 batch——与实际解码分布一致。
 
-```
-Input Image [B, 3, 256, 256]
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ SpectralNorm(Conv2d(3→64, 3×3))     │  + BN + LeakyReLU(0.2)
-│ SpectralNorm(Conv2d(64→64, 3×3))    │  + BN + LeakyReLU(0.2) + MaxPool(2)  → [128×128]
-│ SpectralNorm(Conv2d(64→128, 3×3))   │  + BN + LeakyReLU(0.2)
-│ SpectralNorm(Conv2d(128→128, 3×3))  │  + BN + LeakyReLU(0.2) + MaxPool(2)  → [64×64]
-│ SpectralNorm(Conv2d(128→256, 3×3))  │  + BN + LeakyReLU(0.2)
-│ SpectralNorm(Conv2d(256→256, 3×3))  │  + BN + LeakyReLU(0.2) + MaxPool(2)  → [32×32]
-│ SpectralNorm(Conv2d(256→512, 3×3))  │  + BN + LeakyReLU(0.2)
-│ SpectralNorm(Conv2d(512→512, 3×3))  │  + BN + LeakyReLU(0.2)
-│ AdaptiveAvgPool2d(1×1)              │                                  → [1×1]
-└─────────────────────────────────────┘
-       │
-       ▼
-Flatten → [B, 512]
-       │
-       ▼
-┌──────────────────────┐
-│ Linear(512→256)      │
-│ LeakyReLU(0.2)       │
-│ Linear(256→1)        │  → logit output
-└──────────────────────┘
-       │
-       ▼
-Output: [B, 1]  (正值为stego, 负值为cover)
-```
+### 10.7 记忆库（FeatureMemoryBank）
 
-#### 6.3.2 Spectral Normalization（谱归一化）
+- **先查询后入库**：每个 train step 先用干净分支编码特征查询 hard negatives，计算完隐私损失后再把当前 batch 的载体特征入库（避免检索到自身）。
+- 检索 top-`clip_hard_negative_k`（5）个，按空间分别用 `clip/dino_redirect_exclude_sim`（0.92/0.87）排除相似度过高的近重复候选。
+- Refine 段关闭 redirect（不查询、不入库相关目标）。
 
-```python
-if use_spectral_norm:
-    conv = lambda c_in, c_out, **kwargs: nn.utils.spectral_norm(
-        nn.Conv2d(c_in, c_out, **kwargs))
-```
+### 10.8 Best Checkpoint 判定
 
-**SpectralNorm的作用**：对卷积层的权重矩阵 $W$ 施加谱范数约束（即最大奇异值 $\sigma(W) \le 1$），从而满足Lipschitz连续性条件。这对GAN训练至关重要：
+| 阶段 | 准则 |
+| --- | --- |
+| Phase 1 | 验证 `L_message` 最小 |
+| Phase 2 | `clip_sim_noised + dino_sim_noised` 最小（无含噪指标时回退干净指标）；`bit_accuracy < 0.90` 时加 10.0 惩罚分 |
 
-$$\|Wx\|_2 \le \|W\|_2 \cdot \|x\|_2 \le 1 \cdot \|x\|_2$$
+命中时额外保存 `checkpoints/checkpoint_best.pth`。两阶段准则数值不可比（L_message 收敛后 ~0.1-0.3 而 sim 和 ~1.4-1.9），检测到准则所属阶段切换时重置 `best_loss`（`Trainer.best_loss_phase` 记录当前最优的归属阶段，随 checkpoint 持久化；`continue` 续训同阶段则保留历史最优，旧格式 checkpoint 缺该字段时首轮按当前阶段准则重判）——否则从头训练时 Phase 2 的 best 分数永远高于 Phase 1 遗留值，best 会冻结在 Phase 1 整个 Phase 2 不更新。
 
-**为什么隐写分析器需要SpectralNorm？**
-- 隐写分析本质上是一个**敏感的二分类任务**（区分极其微小的像素差异）
-- 没有SpectralNorm约束时，判别器可能通过放大梯度来"作弊"，导致训练不稳定
-- SN限制了梯度的传播幅度，使对抗训练更加稳定
+### 10.9 轮次语义：相对轮次 vs 绝对轮号
 
-#### 6.3.3 激活函数选择：LeakyReLU
+- 训练循环把**阶段内相对轮次**（本次运行从第 1 轮起算）传给 `train_step` / `validate` / 权重调度函数（`train.py run_training_loop` 的 `sched_epoch`）——从旧 checkpoint 热启动重训 Phase 2 时 Sprint/Balance/Refine 能正确触发。
+- checkpoint 保存与日志使用**绝对轮号**；`continue` 子命令恢复时从 `epoch + 1` 续跑。
 
-```python
-nn.LeakyReLU(0.2, inplace=True)
-```
+### 10.10 热启动与断点续训
 
-使用LeakyReLU（负斜率0.2）而非标准ReLU的原因：
-- 隐写分析需要捕获**微小异常信号**，这些信号可能分布在负值区域
-- LeakyReLU允许负方向的小梯度流动，避免"死亡神经元"
+- `new --continue-from-folder`：**纯权重初始化**。训练计划由本次 CLI 参数决定，从 Phase 1 第 1 轮起算；`best_loss` 不继承、`phase2_msg_head_frozen` 复位。绝不携带 checkpoint 的绝对轮号（否则旧 Phase 2 epoch 100 会使 Phase 2 循环为空）。
+- `load_encoder_state_compatible`：跳过与新结构形状不兼容的编码器权重（如旧 `prv_head` 128→256 通道变化），消息通路完整复用，隐私支路重训。
+- 直入 Phase 2 时若 checkpoint 未携带记忆库则自动补预热。
+- 断点续训（携带绝对轮号）使用 `continue` 子命令。
 
-#### 6.3.4 渐进式下采样
+### 10.11 判别器训练
 
-空间维度变化：`256 → 128 → 64 → 32 → 1×1`
-
-每两个卷积块后接一个 `MaxPool2d(2)`，共3次下采样。这种渐进式设计使得网络能够：
-- 浅层捕获局部纹理细节（对隐写痕迹敏感）
-- 深层捕获全局统计特性
-
-#### 6.3.5 双层全连接头
-
-```python
-self.fc_layers = nn.Sequential(
-    nn.Linear(512, 256),
-    nn.LeakyReLU(0.2, inplace=True),
-    nn.Linear(256, 1)
-)
-```
-
-相比单层线性输出，双层FC提供了更强的非线性判别能力，中间的LeakyReLU激活使网络能学习更复杂的决策边界。
+- 损失：Hinge Loss（margin=`disc_hinge_margin`=1.0）；生成器侧为 Softplus 非饱和损失。
+- 门控：仅 `adv > 0` 且 `D_acc < disc_acc_high`（0.70）时更新；梯度裁剪 `clip_grad_norm_(1.0)`。
+- 当前所有阶段 `adv=0`：判别器仅监控，不回传梯度。
 
 ---
 
-### 6.4 内容识别器 (ContentRecognizer)
+## 11. 验证与评估工具链 (`val/`)
 
-**文件位置**: [content_recognizer.py](models/content_recognizer.py)
+所有脚本统一从项目根运行：`python val/<脚本名>.py ...`。脚本启动时自动把项目根加入 `sys.path` 并切换工作目录到项目根，相对路径行为与脚本在项目根时完全一致。图表与 HTML 报告文本统一使用英文（matplotlib 默认 DejaVu Sans 含完整英文字形，任何平台无需额外字体文件）。
 
-#### 6.4.1 架构概述
-
-内容识别器是对 **OpenAI CLIP ViT-B/32** 模型的封装，用于提取图像的**高层语义特征向量**：
-
-```python
-class ContentRecognizer(nn.Module):
-    def __init__(self, device='cuda', model_name='ViT-B/32'):
-        self.clip_model, _ = clip.load(model_name, device=self._device)
-        for param in self.clip_model.parameters():
-            param.requires_grad = False
-```
-
-#### 6.4.2 前向传播流程
-
-```python
-def forward(self, image):
-    image_resized = F.interpolate(image, size=(224, 224), mode='bilinear', align_corners=False)
-    image_resized = (image_resized + 1) / 2
-    image_resized = (image_resized - self.clip_mean) / self.clip_std
-    image_features = self.clip_model.encode_image(image_resized)
-    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-    return image_features  # shape: [B, 512]
-```
-
-**输出特征维度**：ViT-B/32 的视觉编码器输出 **512维** 特征向量。
-
-#### 6.4.3 文本编码方法
-
-```python
-def encode_text(self, text):
-    tokens = clip.tokenize(text, truncate=True).to(self._device)
-    with torch.no_grad():
-        text_features = self.clip_model.encode_text(tokens)
-    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-    return text_features
-```
-
-`encode_text()` 方法提供了CLIP文本编码器的访问接口，可用于图文跨模态相似度评估等扩展任务。
-
-#### 6.4.4 为什么使用CLIP？
-
-CLIP（Contrastive Language-Image Pre-training）通过4亿图文对的大规模对比学习训练，具有以下优势：
-- **语义丰富性**：512维特征空间编码了丰富的语义信息（物体、场景、属性等）
-- **通用性**：零样本迁移能力强，无需针对特定数据集微调
-- **冻结使用**：无需训练，仅作特征提取器，不增加可训练参数
-
-#### 6.4.5 设备迁移处理
-
-```python
-def to(self, *args, **kwargs):
-    module = super().to(*args, **kwargs)
-    if len(args) > 0:
-        self._device = args[0] if isinstance(args[0], torch.device) else torch.device(args[0])
-    elif 'device' in kwargs:
-        self._device = kwargs['device'] if isinstance(kwargs['device'], torch.device) else torch.device(kwargs['device'])
-    self.clip_model = self.clip_model.to(self._device)
-    return module
-```
-
-由于CLIP模型是外部实例化的，需要重写 `to()` 方法确保设备同步。
-
----
-
-## 7. 损失函数模块 (`losses/`)
-
-### 7.1 SSIM损失 (SSIMLoss)
-
-**文件位置**: [ssim_loss.py](losses/ssim_loss.py)
-
-#### 7.1.1 数学原理
-
-SSIM（Structural Similarity Index）从**亮度(luminance)、对比度(contrast)、结构(structure)**三个维度衡量两幅图像的相似性：
-
-$$SSIM(x,y) = \frac{(2\mu_x\mu_y + C_1)(2\sigma_{xy} + C_2)}{(\mu_x^2 + \mu_y^2 + C_1)(\sigma_x^2 + \sigma_y^2 + C_2)}$$
-
-其中：
-- $\mu_x, \mu_y$：局部均值
-- $\sigma_x^2, \sigma_y^2$：局部方差
-- $\sigma_{xy}$：局部协方差
-- $C_1 = 0.01^2$, $C_2 = 0.03^2$：稳定常数，防止分母为零
-
-**SSIM取值范围**：`[-1, 1]`，值越大表示越相似。
-
-**SSIM Loss**：$L_{SSIM} = 1 - SSIM(x,y)$
-
-#### 7.1.2 实现细节
-
-**高斯窗口生成**：
-
-```python
-def gaussian(self, window_size, sigma):
-    gauss = torch.Tensor([
-        torch.exp(torch.tensor(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)))
-        for x in range(window_size)
-    ])
-    return gauss / gauss.sum()
-```
-
-生成一维高斯核（$\sigma=1.5$），然后外积得到二维窗口：
-
-```python
-_2D_window = _1D_window.mm(_1D_window.t())
-```
-
-**滑动窗口卷积计算局部统计量**：
-
-```python
-mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
-mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
-
-sigma1_sq = F.conv2d(img1*img1, window, ...) - mu1_sq
-sigma2_sq = F.conv2d(img2*img2, window, ...) - mu2_sq
-sigma12 = F.conv2d(img1*img2, window, ...) - mu1_mu2
-```
-
-使用 `groups=channel` 对每个通道独立应用高斯窗口，高效计算局部统计量。
-
-**参数设置**：
-- `window_size=11`：11×11的高斯窗口，覆盖足够的邻域上下文
-- `size_average=True`：对所有空间位置取平均，返回标量损失
-
----
-
-### 7.2 特征重定向损失 (FeatureRedirectionLoss)
-
-**文件位置**: [advanced_privacy_loss.py](losses/advanced_privacy_loss.py)
-
-这是系统中**唯一的隐私损失类**，整合了多模态特征逃逸和有向重定向功能。
-
-#### 7.2.1 设计动机
-
-单一模态的隐私保护可能存在盲区。FeatureRedirectionLoss支持**多模态联合特征逃逸**，并引入了**有向重定向（Directed Escape）**机制：
-
-$$L_{total} = w_{clip} \cdot L_{escape}^{CLIP} + w_{redirect}^{clip} \cdot L_{redirect}^{CLIP} + w_{dino} \cdot L_{escape}^{DINO} + w_{redirect}^{dino} \cdot L_{redirect}^{DINO}$$
-
-其中每个模态支持两种损失：
-- **逃逸损失**（escape_loss）：使用二次 Hinge + Softplus 预热将编码图像推离原图
-- **重定向损失**（redirect_loss）：通过硬负样本将编码图像"拉向"其他无关图像
-
-#### 7.2.2 类定义
-
-```python
-class FeatureRedirectionLoss(nn.Module):
-    def __init__(self, clip_weight=1.0, dino_weight=0.5, escape_margin=0.5,
-                 clip_redirect_weight=0.6, dino_redirect_weight=0.3,
-                 clip_redirect_margin=0.35, dino_redirect_margin=0.3,
-                 clip_max_target_sim=0.55, dino_max_target_sim=0.55):
-```
-
-**Trainer中的实际初始化参数**：
-
-| 参数 | 类默认值 | Trainer实际值 | 说明 |
-|------|---------|-------------|------|
-| `clip_weight` | 1.0 | `cfg.clip_weight` (1.0) | CLIP逃逸损失权重 |
-| `dino_weight` | 0.5 | `cfg.dino_weight` (0.5) | DINO逃逸损失权重 |
-| `escape_margin` | 0.5 | `cfg.privacy_margin_start` (0.15) | 初始逃逸margin |
-| `clip_redirect_weight` | 0.6 | `cfg.clip_redirect_weight` (0.6) | CLIP重定向权重 |
-| `dino_redirect_weight` | 0.3 | `cfg.dino_redirect_weight` (0.3) | DINO重定向权重 |
-| `clip_redirect_margin` | 0.35 | `cfg.clip_redirect_margin` (0.35) | CLIP重定向margin |
-| `dino_redirect_margin` | 0.3 | `cfg.dino_redirect_margin` (0.3) | DINO重定向margin |
-| `clip_max_target_sim` | 0.55 | `cfg.clip_max_target_sim` (0.55) | CLIP最大相似度 |
-| `dino_max_target_sim` | 0.55 | `cfg.dino_max_target_sim` (0.55) | DINO最大相似度 |
-
-#### 7.2.3 逃逸损失 (escape_loss)
-
-当前实现采用**二次 Hinge + Softplus 预热**的组合形式，替代了早期的纯 Softplus：
-
-$$L_{escape} = 25 \cdot \text{mean}\left(\text{relu}(\text{cos\_sim} - (1 - margin))^2\right) + 0.1 \cdot \text{mean}\left(\text{softplus}(\text{cos\_sim} - (1 - margin))\right)$$
-
-```python
-def escape_loss(self, feat_cover, feat_encoded, margin):
-    sim = F.cosine_similarity(feat_encoded, feat_cover, dim=1)
-    diff = sim - (1 - margin)
-    hinge_sq = torch.mean(F.relu(diff) ** 2) * 25.0
-    warmup = torch.mean(F.softplus(diff)) * 0.1
-    loss = hinge_sq + warmup
-    return loss, sim.mean().item()
-```
-
-**直觉解释**：
-- 当 `cos_sim > (1-margin)`（违反逃逸约束）时：二次 Hinge 项 `25 × relu(diff)²` 施加强梯度，惩罚与违反程度的平方成正比，强力推动特征分离
-- 当 `cos_sim ≈ (1-margin)`（接近约束边界）时：Softplus 预热项 `0.1 × softplus(diff)` 提供温和的连续梯度，避免在边界处梯度突变为零
-- 当 `cos_sim << (1-margin)`（已满足逃逸）时：两项均趋近0，不再施加推力
-
-相比纯 Softplus Loss，二次 Hinge 对违反约束的样本施加更激进的梯度（平方增长），使模型更快地将违反约束的特征推开；而 0.1 权重的 Softplus 预热保证了在约束边界附近梯度处处非零，避免优化停滞。系数 25.0 确保二次项在典型违反值（diff≈0.1）时产生与旧版 Softplus 相当的损失量级。
-
-#### 7.2.4 重定向损失 (redirect_loss)
-
-$$L_{redirect} = \text{mean}\left(\text{log1p}\left(\exp\left((1 - m_{redirect}) - \text{sim}(f_{encoded}, f_{hardest\_neg})\right)\right)\right)$$
-
-$$L_{control} = \text{mean}\left(\text{relu}\left(\text{sim}(f_{encoded}, f_{hardest\_neg}) - s_{max}\right)\right)$$
-
-```python
-def redirect_loss(self, feat_encoded, hard_negatives, margin, max_target_sim):
-    sim_to_neg = F.cosine_similarity(feat_encoded.unsqueeze(1), hard_negatives, dim=2)
-    hardest_idx = sim_to_neg.argmax(dim=1)
-    hardest_neg = hard_negatives[torch.arange(feat_encoded.size(0)), hardest_idx]
-    sim_to_hardest = F.cosine_similarity(feat_encoded, hardest_neg, dim=1)
-    redirect_target = 1 - margin
-    redirect_loss = torch.mean(torch.log1p(torch.exp(redirect_target - sim_to_hardest)))
-    control_loss = torch.mean(F.relu(sim_to_hardest - max_target_sim))
-    return redirect_loss, control_loss
-```
-
-**关键设计**：
-1. **硬负样本选择**：从Top-K负样本中选择与编码特征最相似的1个（hardest negative），而非随机选择
-2. **重定向项**（Softplus Loss）：推动编码特征**靠近**最难的负样本（相似度 > `1-margin`）
-3. **控制项**（Hinge Loss）：防止过度接近（相似度 < `max_target_sim`），避免特征坍塌
-
-**注意**：重定向项也使用Softplus Loss而非Hinge Loss，确保梯度处处可导。
-
-#### 7.2.5 前向传播
-
-```python
-def forward(self, clip_cover, clip_encoded, dino_cover=None, dino_encoded=None,
-            clip_hard_negatives=None, dino_hard_negatives=None, escape_margin=None):
-```
-
-计算流程：
-1. 计算CLIP逃逸损失 → 加权加入总损失
-2. 如有CLIP硬负样本 → 计算CLIP重定向损失 + 控制损失 → 加权加入总损失
-3. 如有DINO特征 → 计算DINO逃逸损失 → 加权加入总损失
-4. 如有DINO硬负样本 → 计算DINO重定向损失 + 控制损失 → 加权加入总损失
-
-返回 `(total_loss, loss_dict)`，其中 `loss_dict` 包含 `clip_escape`、`clip_redirect`、`clip_control`、`dino_escape`、`dino_redirect`、`dino_control`、`total_privacy_loss` 等，便于训练监控。
-
-#### 7.2.6 模态互补性
-
-| 模态 | 模型 | 特征维度 | 优势 |
-|------|------|---------|------|
-| CLIP | ViT-B/32 | 512 | 语义理解、图文对齐 |
-| DINOv2 | ViT-S/14 | 384 | 自监督视觉特征、细粒度纹理 |
-
-默认配置 `clip_weight=1.0`、`dino_weight=0.5`，CLIP 权重高于 DINOv2，因为 DINOv2 的细粒度纹理特征对微小扰动更敏感，降低其权重避免隐私损失主导训练而损害视觉质量。
-
-#### 7.2.7 set_epoch 方法
-
-```python
-def set_epoch(self, epoch):
-    self.current_epoch = epoch
-```
-
-每个epoch开始时由训练循环调用，记录当前epoch信息，可用于未来实现epoch感知的损失调度。
-
----
-
-## 8. 噪声层模块 (`noise_layers/`)
-
-噪声层用于**模拟真实世界中的信道干扰**，测试隐写系统的鲁棒性。训练时随机选择一种噪声施加于编码图像。
-
-### 8.1 噪声组合器 (Noiser)
-
-**文件位置**: [noiser.py](noise_layers/noiser.py)
-
-```python
-class Noiser(nn.Module):
-    def forward(self, encoded_and_cover):
-        idx = np.random.randint(0, len(self.noise_layers))
-        return self.noise_layers[idx](encoded_and_cover)
-```
-
-**核心行为**：每次前向传播时，**均匀随机**选择一个噪声层执行。这相当于数据增强中的RandomAugment策略，迫使模型对所有类型的噪声都具有鲁棒性。
-
-当没有配置任何噪声层时，自动添加Identity（恒等映射）层。
-
-Noiser还支持字符串占位符：
-- `'JpegPlaceholder'` → 自动替换为 `JpegCompression(device)`
-- `'QuantizationPlaceholder'` → 自动替换为 `Quantization(device)`
-
-### 8.2 Identity恒等映射
-
-**文件位置**: [identity.py](noise_layers/identity.py)
-
-```python
-class Identity(nn.Module):
-    def forward(self, noised_and_cover):
-        return noised_and_cover
-```
-
-**用途**：作为默认/基准噪声层，或用于消融实验。
-
-### 8.3 随机裁剪 (Crop)
-
-**文件位置**: [crop.py](noise_layers/crop.py)
-
-#### 8.3.1 算法流程
-
-```
-输入: noised_image [B,3,H,W], cover_image [B,3,H,W]
-参数: height_ratio_range=(hmin, hmax), width_ratio_range=(wmin, wmax)
-
-1. random_float(hmin, hmax) → 保留高度比例 rh ∈ [hmin, hmax]
-2. random_float(wmin, wmax) → 保留宽度比例 rw ∈ [wmin, wmax]
-3. remaining_h = round(rh * H), remaining_w = round(rw * W)
-4. h_start = rand(0, H - remaining_h), w_start = rand(0, W - remaining_w)
-5. 裁剪: image[:, :, h_start:h_end, w_start:w_end]
-
-输出: (cropped_noised, cropped_cover)  # 两图同步裁剪
-```
-
-#### 8.3.2 示例
-
-若 `height_ratio_range=(0.7, 0.9)`，`width_ratio_range=(0.7, 0.9)`，图像大小256×256：
-- 可能保留 `179×205` 到 `230×230` 的区域
-- 裁剪掉边缘部分，模拟图像被部分截断的场景
-
-### 8.4 裁剪替换 (Cropout)
-
-**文件位置**: [cropout.py](noise_layers/cropout.py)
-
-#### 8.4.1 算法流程
-
-```
-1. 创建全零mask: cropout_mask = zeros_like(noised_image)
-2. 随机选取矩形区域: (h_start, h_end, w_start, w_end)
-3. 该区域内mask设为1
-4. 合成: result = noised_image * mask + cover_image * (1 - mask)
-```
-
-**效果**：矩形区域保留编码图像，其余区域**还原为原始封面图像**。这模拟了部分区域被"修复"或"覆盖"的场景，比纯裁剪更温和。
-
-### 8.5 像素丢弃 (Dropout)
-
-**文件位置**: [dropout.py](noise_layers/dropout.py)
-
-#### 8.5.1 算法流程
-
-```
-1. keep_percent ~ Uniform(keep_min, keep_max)  # 如 [0.9, 0.95]
-2. 生成二值mask: P(1)=keep_percent, P(0)=1-keep_percent
-3. 合成: result = noised * mask + cover * (1-mask)
-```
-
-**效果**：随机将一定比例的像素替换为原始图像的对应像素。这是一种**逐像素**的局部扰动，模拟传输过程中的丢包或像素损坏。
-
-### 8.6 缩放变换 (Resize)
-
-**文件位置**: [resize.py](noise_layers/resize.py)
-
-#### 8.6.1 算法流程
-
-```
-1. ratio ~ Uniform(ratio_min, ratio_max)  # 如 [0.5, 1.0]
-2. 下采样: image → [H*ratio, W*ratio]  （双线性插值）
-3. 上采样回原尺寸: → [H, W]  （双线性插值）
-```
-
-**效果**：模拟图像被缩放后再恢复的过程，导致高频信息（包括隐写信号）丢失。两次插值的组合会产生平滑效应。
-
-### 8.7 JPEG压缩 (JpegCompression)
-
-**文件位置**: [jpeg_compression.py](noise_layers/jpeg_compression.py)
-
-这是**最复杂也是最重要的噪声层**，完整模拟了JPEG有损压缩的DCT域量化过程。
-
-#### 8.7.1 JPEG压缩流水线
-
-```
-RGB图像 [B,3,H,W]
-    │
-    ▼
-┌─────────────────────────────────────────────────┐
-│ Step 1: ZeroPadding（补齐到8的倍数）              │
-│   pad_h = (8 - H%8) % 8, pad_w = (8 - W%8) % 8   │
-├─────────────────────────────────────────────────┤
-│ Step 2: RGB → YUV色彩空间转换（BT.601标准）       │
-│   Y  = 0.299R + 0.587G + 0.114B                 │
-│   U  = -0.169R - 0.331G + 0.500B                │
-│   V  = 0.500R - 0.419G - 0.081B                 │
-├─────────────────────────────────────────────────┤
-│ Step 3: 分块DCT变换（8×8块）                     │
-│   使用预计算的64个DCT滤波器（8×8卷积核）          │
-│   stride=8，无重叠                               │
-├─────────────────────────────────────────────────┤
-│ Step 4: 量化（JPEG核心步骤）                      │
-│   使用Zigzag排序的掩码，只保留前N个AC系数         │
-│   Y通道保留25个，U/V通道各保留9个                 │
-│   掩码作用：image_dct * mask                     │
-├─────────────────────────────────────────────────┤
-│ Step 5: 分块IDCT逆变换                          │
-│   使用预计算的64个IDCT滤波器                      │
-├─────────────────────────────────────────────────┤
-│ Step 6: YUV → RGB色彩空间逆转换                  │
-├─────────────────────────────────────────────────┤
-│ Step 7: 去除padding                             │
-└─────────────────────────────────────────────────┘
-    │
-    ▼
-压缩后图像 [B,3,H,W]
-```
-
-#### 8.7.2 DCT/IDCT滤波器生成
-
-```python
-def gen_filters(size_x, size_y, dct_or_idct_fun):
-    filters = np.zeros((size_x * size_y, size_x, size_y))
-    for k_y in range(size_y):
-        for k_x in range(size_x):
-            for n_y in range(size_y):
-                for n_x in range(size_x):
-                    filters[k_y*size_x+k_x, n_y, n_x] = \
-                        dct_or_idct_fun(n_y, k_y, size_y) * dct_or_idct_fun(n_x, k_x, size_x)
-    return filters
-```
-
-生成 **64个8×8的DCT基函数图像**（对应64个频率分量），排列成 `(64, 1, 8, 8)` 的卷积核张量。
-
-**DCT系数公式**：
-
-$$C(n,k,N) = \cos\left(\frac{\pi}{N}(n + 0.5)k\right)$$
-
-**IDCT系数公式**：
-
-$$IC(n,k,N) = \left(\delta(0,n)(-\frac{1}{2}) + \cos\left(\frac{\pi}{N}(k+0.5)n\right)\right) \times \sqrt{\frac{1}{2N}}$$
-
-#### 8.7.3 DCT卷积实现
-
-```python
-def apply_conv(self, image, filter_type):
-    filters = self.dct_conv_weights
-    image_conv_channels = []
-    for channel in range(image.shape[1]):
-        image_ch = image[:, channel, :, :].unsqueeze(1)
-        image_conv = F.conv2d(image_ch, filters, stride=8)
-        image_conv = image_conv.permute(0, 2, 3, 1)
-        image_conv = image_conv.view(B, H/8, W/8, 8, 8)
-        image_conv = image_conv.permute(0, 1, 3, 2, 4)
-        image_conv = image_conv.contiguous().view(B, H, W)
-        image_conv_channels.append(image_conv)
-    return torch.cat(image_conv_channels, dim=1)
-```
-
-**巧妙之处**：用 `stride=8` 的卷积实现分块DCT，避免了显式的循环。64个输出通道对应8×8块的64个DCT系数。后续的view/permute操作将系数重新排列为标准的块状布局。
-
-#### 8.7.4 Zigzag量化掩码
-
-```python
-def get_jpeg_yuv_filter_mask(image_shape, window_size, keep_count):
-    mask = np.zeros((window_size, window_size), dtype=np.uint8)
-    index_order = sorted(
-        ((x, y) for x in range(window_size) for y in range(window_size)),
-        key=lambda p: (p[0]+p[1], -p[1] if (p[0]+p[1])%2 else p[1])
-    )
-    for i, j in index_order[0:keep_count]:
-        mask[i, j] = 1
-    return np.tile(mask, ...)
-```
-
-**Zigzag扫描顺序**：从DC分量(0,0)开始，沿对角线方向遍历，频率逐渐升高。
-
-**默认保留系数数量**：`yuv_keep_weights=(25, 9, 9)`
-- Y（亮度）通道：保留25个系数（约39%）
-- U/V（色度）通道：各保留9个（约14%，人眼对色度更不敏感）
-
-这模拟了**中等质量（Q≈50-70）**的JPEG压缩效果。
-
-**掩码缓存机制**：JpegCompression内部维护一个大型掩码（1000×1000），通过切片适配不同尺寸的输入图像，避免重复计算。
-
-### 8.8 量化噪声 (Quantization)
-
-**文件位置**: [quantization.py](noise_layers/quantization.py)
-
-#### 8.8.1 傅里叶四舍五入量化
-
-```python
-def fourier_rounding(self, tensor):
-    z = torch.mul(self.weights, torch.sin(torch.mul(tensor, self.scales)))
-    z = torch.sum(z, dim=0)
-    return tensor + z
-```
-
-这不是简单的四舍五入，而是基于**傅里叶级数的近似舍入**：
-
-$$round(x) \approx x + \sum_{n=1}^{N} \frac{(-1)^{n+1}}{n\pi} \sin(2\pi(n+1)x)$$
-
-其中 `N=10`（谐波数量）。傅里叶级数展开的阶跃函数（sign function）可以用来近似最近整数舍入。
-
-**参数**：
-- `weights`: 系数 $\frac{(-1)^{n+1}}{(n+1)\pi}$，形状 `[10]` → 扩展为 `[10,1,1,1,1]`
-- `scales`: 频率 $2\pi(n+1)$，形状 `[10]` → 扩展为 `[10,1,1,1,1]`
-
-#### 8.8.2 完整流程
-
-```
-1. transform(tensor, (0, 255)): 线性映射到 [0, 255]
-2. clamp(min=0, max=255): 截断到有效范围
-3. fourier_rounding(): 傅里叶近似舍入到整数
-4. transform(tensor, (orig_min, orig_max)): 映射回原始范围
-```
-
-**效果**：模拟图像被保存为整数格式（如PNG/JPG的8-bit量化）时的精度损失。
-
----
-
-## 9. 训练系统 (`trainer.py` & `train.py`)
-
-### 9.1 Trainer类详解
-
-**文件位置**: [trainer.py](trainer.py)
-
-#### 9.1.1 初始化流程
-
-Trainer的 `__init__` 方法完成了整个系统的组装：
-
-```
-1. 创建TensorBoard日志记录器
-2. 初始化四大核心模型:
-   ├── Encoder (可训练, msg_budget=0.04, prv_budget=0.04, texture_mask_strength=3.0,
-   │            texture_mask_smooth_kernel=5, phase1_prv_noise_smooth_kernel=7)
-   ├── Decoder (可训练)
-   ├── Steganalyzer (可训练)
-   └── ContentRecognizer/CLIP (冻结)
-3. 创建优化器:
-   ├── optimizer_encoder_decoder: Adam(encoder+decoder参数)
-   └── optimizer_steganalyzer: Adam(steganalyzer参数)
-4. 创建损失函数集合:
-   ├── SSIMLoss (可微分SSIM)
-   ├── MSELoss (像素重建)
-   ├── BCEWithLogitsLoss (消息提取)
-   └── FeatureRedirectionLoss (隐私保护)
-5. 条件性创建高级组件:
-   ├── DINOv2模型 (如 dino_weight > 0)
-   ├── FeatureMemoryBank for CLIP (如 use_clip_redirect)
-   │   └── clip_memory_bank (CLIP 512维特征, 容量5000)
-   └── FeatureMemoryBank for DINO (如 use_clip_redirect && dino_weight > 0)
-       └── dino_memory_bank (DINO 384维特征, 容量5000)
-6. 解析并构建噪声层管道
-```
-
-#### 9.1.2 FeatureMemoryBank (通用特征记忆库)
-
-**文件位置**: [trainer.py](trainer.py) 中的 `FeatureMemoryBank` 类
-
-这是用于存储CLIP/DINO等冻结模型特征向量的**通用特征记忆库**：
-
-```python
-class FeatureMemoryBank:
-    def __init__(self, feature_dim, memory_size=5000, device='cuda'):
-        self.memory_bank = torch.zeros(memory_size, feature_dim, device=device)
-        self.memory_ptr = 0
-        self.memory_count = 0
-```
-
-**记忆库更新机制**：
-
-```python
-@torch.no_grad()
-def update(self, features):
-    features = F.normalize(features.float(), p=2, dim=1)
-    batch_size = features.shape[0]
-    ptr = self.memory_ptr
-    if ptr + batch_size > self.memory_size:
-        remaining = self.memory_size - ptr
-        self.memory_bank[ptr:] = features[:remaining]
-        self.memory_bank[:batch_size - remaining] = features[remaining:]
-        self.memory_ptr = batch_size - remaining
-    else:
-        self.memory_bank[ptr:ptr + batch_size] = features
-        self.memory_ptr = (ptr + batch_size) % self.memory_size
-    self.memory_count = min(self.memory_count + batch_size, self.memory_size)
-```
-
-这是一个**循环队列（Ring Buffer）** 实现：
-- 固定容量5000个特征向量
-- 写入指针循环移动，新特征覆盖最旧的特征
-- `@torch.no_grad()` 装饰器确保不产生计算图开销
-
-**硬负样本挖掘**：
-
-```python
-def get_hard_negatives(self, features, k=5):
-    if self.memory_count == 0:
-        return None
-    features = features.float()
-    valid_memory = self.memory_bank[:self.memory_count]
-    similarities = torch.mm(features, valid_memory.t())
-    actual_k = min(k, self.memory_count)
-    _, indices = similarities.topk(actual_k, dim=1)
-    hard_negatives = valid_memory[indices]
-    return hard_negatives  # shape: [B, k, feature_dim] 或 None
-```
-
-返回Top-K最相似的记忆特征作为硬负样本候选。
-
-**状态保存/加载**：
-
-```python
-def state_dict(self):
-    return {
-        'memory_bank': self.memory_bank.cpu(),
-        'memory_ptr': self.memory_ptr,
-        'memory_count': self.memory_count
-    }
-
-def load_state_dict(self, state_dict):
-    self.memory_bank = state_dict['memory_bank'].to(self.device)
-    self.memory_ptr = state_dict['memory_ptr']
-    self.memory_count = state_dict['memory_count']
-```
-
-#### 9.1.3 DINOv2特征提取
-
-```python
-def extract_dino_features(self, image, allow_grad=False):
-    if not hasattr(self, 'dino_model') or self.dino_model is None:
-        return None
-    if allow_grad:
-        # 编码图像：允许梯度回传以优化隐私扰动
-        image_resized = F.interpolate(image, size=(224, 224), mode='bilinear', align_corners=False)
-        image_normalized = (image_resized + 1) / 2
-        image_normalized = (image_normalized - self.dino_mean) / self.dino_std
-        features = self.dino_model(image_normalized)
-        features = features / (features.norm(dim=-1, keepdim=True) + 1e-7)
-    else:
-        # 封面图像：无梯度计算
-        with torch.no_grad():
-            image_resized = F.interpolate(image, size=(224, 224), mode='bilinear', align_corners=False)
-            image_normalized = (image_resized + 1) / 2
-            image_normalized = (image_normalized - self.dino_mean) / self.dino_std
-            features = self.dino_model(image_normalized)
-            features = features / (features.norm(dim=-1, keepdim=True) + 1e-7)
-    return features  # shape: [B, 384]
-```
-
-DINOv2 (`vit_small_patch14_dinov2.lvd142m`) 通过timm库加载，输出 **384维** 特征向量。`allow_grad` 参数控制是否允许梯度回传：封面图像特征无需梯度（用于计算逃逸目标），编码图像特征需要梯度（用于优化隐私扰动使特征偏移）。
-
-#### 9.1.4 DINOv2模型加载与位置编码插值
-
-```python
-self.dino_model = timm.create_model('vit_small_patch14_dinov2.lvd142m', pretrained=False, num_classes=0, img_size=224)
-if dino_model_path and os.path.exists(dino_model_path):
-    state_dict = torch.load(dino_model_path, map_location=self.device)
-    if isinstance(state_dict, dict) and 'state_dict' in state_dict:
-        state_dict = state_dict['state_dict']
-    elif isinstance(state_dict, dict) and 'model' in state_dict:
-        state_dict = state_dict['model']
-
-    model_pos_embed = self.dino_model.pos_embed.data
-    ckpt_pos_embed = state_dict.get('pos_embed', None)
-    if ckpt_pos_embed is not None and ckpt_pos_embed.shape != model_pos_embed.shape:
-        cls_token = ckpt_pos_embed[:, :1, :]
-        patch_embed = ckpt_pos_embed[:, 1:, :]
-        embed_dim = patch_embed.shape[-1]
-        orig_grid_size = int(patch_embed.shape[1] ** 0.5)
-        new_grid_size = int((model_pos_embed.shape[1] - 1) ** 0.5)
-        patch_embed = patch_embed.reshape(1, orig_grid_size, orig_grid_size, embed_dim).permute(0, 3, 1, 2)
-        patch_embed = F.interpolate(patch_embed, size=(new_grid_size, new_grid_size), mode='bicubic', align_corners=False)
-        patch_embed = patch_embed.permute(0, 2, 3, 1).reshape(1, new_grid_size * new_grid_size, embed_dim)
-        state_dict['pos_embed'] = torch.cat([cls_token, patch_embed], dim=1)
-
-    self.dino_model.load_state_dict(state_dict, strict=False)
-```
-
-**位置编码插值**：当预训练权重的位置编码尺寸与当前模型不匹配时（如预训练使用518×518，当前使用224×224），通过双三次插值将位置编码调整到正确的网格尺寸。保留CLS token不变，仅对patch embedding部分进行插值。
-
-### 9.2 两阶段训练策略
-
-#### 总体损失函数
-
-$$L_{total} = w_{visual}(L_{visual} + w_{noised} \cdot L_{visual}^{noised}) + w_{message} \cdot L_{message} + w_{adv} \cdot L_{adv} + w_{privacy} \cdot L_{privacy} + w_{rp} \cdot L_{residual} + w_{fft} \cdot L_{fft}$$
-
-其中 `w_fft` 仅在 Phase 2 生效（Phase 1 为 0），各组件详细说明如下：
-
-#### 9.2.1 视觉重建损失
-
-$$L_{visual} = \lambda_{pixel} \cdot L_{MSE}(I_{enc}, I_{cov}) + \lambda_{ssim} \cdot L_{SSIM}(I_{enc}, I_{cov})$$
-
-$$L_{visual}^{noised} = \lambda_{pixel} \cdot L_{MSE}(I_{noised}, I_{cov}) + \lambda_{ssim} \cdot L_{SSIM}(I_{noised}, I_{cov})$$
-
-代入默认值：
-
-$$L_{visual} = 1.0 \cdot L_{MSE} + 1.0 \cdot L_{SSIM}$$
-
-**双重视觉损失的含义**：
-- $L_{visual}$：无噪声情况下的重建质量（理想条件）
-- $L_{visual}^{noised}$：经噪声层处理后的重建质量（真实条件）
-
-两者的加权和确保模型不仅在干净条件下表现好，在有干扰时也能维持质量。MSE 与 SSIM 等权组合，分别从像素级绝对误差和结构级相似性两个角度约束图像质量。
-
-#### 9.2.2 消息提取损失
-
-$$L_{message} = BCEWithLogitsLoss(\hat{m}, m)$$
-
-其中 $\hat{m} = Decoder(I_{noised})$ 是解码器预测的原始logits，$m$ 是真实消息。
-
-**BCEWithLogitsLoss** 内部执行 `sigmoid + binary_cross_entropy`，数值上比分开计算更稳定。
-
-#### 9.2.3 对抗损失（GAN训练）
-
-当前实现采用 **Hinge Loss**（判别器）+ **Softplus 非饱和损失**（生成器），替代了早期的 BCE 形式，并引入判别器准确率门控机制。
-
-**判别器（Steganalyzer）Hinge Loss**：
-
-```python
-def _disc_hinge_loss(self, real_logits, fake_logits):
-    real_loss = F.relu(self.disc_hinge_margin - real_logits).mean()
-    fake_loss = F.relu(self.disc_hinge_margin + fake_logits).mean()
-    return (real_loss + fake_loss) / 2
-```
-
-判别器试图使真实图像（cover）的 logit > margin（默认1.0），隐写图像（stego）的 logit < -margin。Hinge Loss 在 logit 满足约束后梯度为零，避免判别器过度优化。
-
-**判别器准确率门控**：
-
-```python
-real_prob = torch.sigmoid(real_logits)
-fake_prob = torch.sigmoid(fake_logits)
-disc_acc = ((real_prob > 0.5).float().mean() + (fake_prob < 0.5).float().mean()) / 2
-
-# 仅当对抗权重 > 0 且判别器准确率未达上限时才更新判别器
-if adv_weight > 0 and disc_acc < self.disc_acc_high:
-    optimizer_steganalyzer.zero_grad()
-    L_D.backward()
-    optimizer_steganalyzer.step()
-```
-
-当判别器准确率达到 `disc_acc_high`（默认0.70）时，暂停判别器更新，防止判别器过强导致生成器梯度消失。这一机制取代了早期基于损失阈值的暂停策略，更直接地控制对抗平衡。
-
-**生成器（Encoder+Decoder）对抗损失**：
-
-```python
-def _gen_adv_loss(self, fake_logits):
-    return F.softplus(-fake_logits).mean()
-```
-
-生成器使用 `softplus(-fake_logits)` 形式的非饱和损失。相比 BCE，Softplus 在判别器很强时仍能提供非零梯度，避免梯度消失；在 logit 为负（判别器正确识别为假）时损失增长更温和，训练更稳定。
-
-**训练顺序**：
-1. 计算判别器损失和准确率，仅在 `adv > 0` 且 `disc_acc < disc_acc_high` 时更新判别器参数
-2. 计算生成器对抗损失（使用更新后的判别器）
-3. 连同其他损失一起更新生成器参数
-4. 对编码器和解码器参数施加梯度裁剪
-
-#### 9.2.4 隐私保护损失
-
-隐私损失由 `FeatureRedirectionLoss` 直接计算，详见第7.2节。在Phase 2中，隐私损失整合了以下子损失：
-
-| 子损失 | 权重 | 含义 |
-|--------|------|------|
-| CLIP逃逸损失 | `clip_weight=1.0` | CLIP特征空间中的二次Hinge逃逸 |
-| CLIP重定向损失 | `clip_redirect_weight=0.6` | CLIP特征空间中的有向重定向 |
-| DINO逃逸损失 | `dino_weight=0.5` | DINO特征空间中的二次Hinge逃逸 |
-| DINO重定向损失 | `dino_redirect_weight=0.3` | DINO特征空间中的有向重定向 |
-
-**CLIP/DINO 记忆库更新与硬负样本获取流程**（Trainer中）：
-
-```python
-if self.use_clip_redirect and self.clip_memory_bank is not None:
-    self.clip_memory_bank.update(feat_cover.detach())
-    clip_hard_negatives = self.clip_memory_bank.get_hard_negatives(
-        feat_encoded.detach(), k=self.clip_hard_negative_k
-    )
-
-if self.use_clip_redirect and self.dino_memory_bank is not None and dino_cover is not None:
-    self.dino_memory_bank.update(dino_cover.detach())
-    dino_hard_negatives = self.dino_memory_bank.get_hard_negatives(
-        dino_encoded.detach(), k=self.clip_hard_negative_k
-    )
-```
-
-**关键设计**：记忆库**先更新**封面图像特征（feat_cover），**再获取**硬负样本时使用编码图像特征（feat_encoded）作为查询。这确保：
-1. 当前batch的封面特征立即可供后续batch使用
-2. 查询使用的是编码图像特征，与重定向目标一致
-
-#### 9.2.5 残差惩罚
-
-$$L_{residual} = \text{mean}(msg\_residual^2) + \text{mean}(prv\_residual^2)$$
-
-这个值由编码器的 `forward` 方法直接返回，作为额外的正则化项限制修改幅度。Phase 1中 `prv_residual` 为经平滑归一化的 `dummy_prv` 随机噪声。
-
-#### 9.2.6 FFT 高频能量惩罚
-
-仅在 Phase 2 生效，对隐私残差施加频域约束：
-
-```python
-def _fft_high_freq_loss(self, prv_residual):
-    B, C, H, W = prv_residual.shape
-    fft = torch.fft.fft2(prv_residual)
-    fft_shifted = torch.fft.fftshift(fft)
-    magnitude = torch.abs(fft_shifted)
-    # 中心低频区域半径
-    radius = min(H, W) // 4
-    cy, cx = H // 2, W // 2
-    Y, X = torch.meshgrid(torch.arange(H), torch.arange(W))
-    mask = ((Y - cy)**2 + (X - cx)**2) > radius**2
-    high_freq = magnitude[:, :, mask]
-    return torch.sqrt((high_freq ** 2).mean() + 1e-8)
-```
-
-该损失统计 FFT 频谱中中心半径 `min(H,W)//4` 以外的高频分量幅度的均方根，乘以 `lambda_fft=10.0` 后加入总损失。隐私残差如果包含高频条纹或周期性模式，会被频域隐写分析器捕获；此损失将这些高频分量压低，使隐私扰动在频域上更接近白噪声分布。
-
-#### 9.2.7 梯度清零保护
-
-```python
-if phase == 2 and self.phase2_msg_head_frozen:
-    for param in self.encoder.msg_head.parameters():
-        param.grad = None
-```
-
-在Phase 2中，即使msg_head的参数被冻结（`requires_grad=False`），由于共享层的梯度回传，msg_head参数仍可能累积梯度。通过在backward后显式清零msg_head梯度，确保msg_head不会被意外更新。
-
-### 9.3 编码器头部冻结策略
-
-编码器的双头架构需要精心的冻结策略，确保各阶段训练目标不互相干扰：
-
-```python
-def _set_phase_freeze(self, phase, epoch):
-    if phase == 1:
-        self.unfreeze_msg_head()
-        self.freeze_prv_head()
-        self.unfreeze_shared_layers()
-    else:
-        self.freeze_msg_head()
-        self.unfreeze_prv_head()
-        if epoch <= self.cfg.num_epochs_phase2 // 3:
-            self.unfreeze_shared_layers()
-        else:
-            self.freeze_shared_layers()
-```
-
-#### Phase 1 冻结策略
-
-| 组件 | 状态 | 原因 |
-|------|------|------|
-| msg_head | ✅ 解冻 | 需要学习消息嵌入 |
-| prv_head | ❄️ 冻结 | Phase 1不进行隐私保护训练 |
-| 共享层（conv_layers + after_concat_layer） | ✅ 解冻 | 需要学习基础特征表示 |
-
-#### Phase 2 冻结策略
-
-| 组件 | 前1/3 epochs | 后2/3 epochs | 原因 |
-|------|-------------|-------------|------|
-| msg_head | ❄️ 冻结 | ❄️ 冻结 | 保护已学习的消息嵌入能力 |
-| prv_head | ✅ 解冻 | ✅ 解冻 | 需要学习隐私扰动 |
-| 共享层 | ✅ 解冻 | ❄️ 冻结 | 前期微调共享特征适配prv_head，后期冻结防止破坏msg能力 |
-
-**设计思路**：
-- Phase 2开始时msg_head立即冻结，防止隐私训练破坏消息嵌入能力
-- 共享层在Phase 2前1/3解冻，允许prv_head通过微调共享特征来适配隐私任务
-- Phase 2后2/3冻结共享层，防止过度调整影响消息提取的稳定性
-- 配合解码器恢复机制，确保消息提取准确率始终维持在阈值以上
-
-### 9.4 解码器恢复机制
-
-当Phase 2中验证比特准确率低于阈值时，触发解码器恢复训练：
-
-```python
-def recovery_step(self, train_loader, num_batches=5):
-    self.encoder.eval()
-    self.decoder.train()
-    self.freeze_prv_head()
-
-    temp_optimizer = optim.Adam(self.decoder.parameters(), lr=self.cfg.lr_decoder * 0.5)
-
-    for i, batch in enumerate(train_loader):
-        if i >= num_batches:
-            break
-
-        cover_image = batch['cover_image'].to(self.device)
-        message = batch['message'].to(self.device)
-
-        with torch.no_grad():
-            _, _, msg_residual, _ = self.encoder(
-                cover_image, message, phase=1, prv_noise_ratio=0.0
-            )
-            clean_encoded = cover_image + msg_residual
-            clean_encoded = torch.clamp(clean_encoded, -1, 1)
-
-        message_pred = self.decoder(clean_encoded)
-        L_msg = self.bce_with_logits_loss(message_pred, message)
-
-        temp_optimizer.zero_grad()
-        L_msg.backward()
-        torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), max_norm=1.0)
-        temp_optimizer.step()
-
-    self.unfreeze_prv_head()
-    self.encoder.train()
-```
-
-**关键设计**：
-1. **编码器设为eval模式**：不更新编码器参数
-2. **使用phase=1编码**：仅生成消息残差（不含隐私残差），在干净的编码图像上训练解码器
-3. **临时优化器**：使用半学习率（`lr_decoder * 0.5`）的独立Adam优化器，避免影响主优化器状态
-4. **冻结prv_head**：防止恢复训练影响隐私头
-5. **有限步数**：默认10个batch，快速恢复不过度训练
-
-**触发条件**（在train.py中）：
-
-```python
-if phase == 2:
-    val_bit_acc = val_losses.get('bit_accuracy', 1.0)
-    threshold = getattr(cfg, 'bit_accuracy_threshold', 0.90)
-    if val_bit_acc < threshold:
-        recovery_steps = getattr(cfg, 'recovery_steps', 10)
-        trainer.recovery_step(train_loader, num_batches=recovery_steps)
-```
-
-### 9.5 训练流程 (`train.py`)
-
-**文件位置**: [train.py](train.py)
-
-#### 9.5.1 命令行接口
-
-项目支持两种运行模式：
-
-**模式1：新建实验 (`new`)**
+### 11.1 单图验证 (`validation_script.py`)
 
 ```bash
-python train.py new --data-dir ./dataset --name experiment1 \
-    --batch-size 8 --size 256 --message 30 \
-    --epochs-phase1 150 --epochs-phase2 100 \
-    --lr-encoder 1e-3 --lr-decoder 1e-3 --lr-steganalyzer 1e-4 \
-    --disc-acc-high 0.70 --disc-hinge-margin 1.0 \
-    --phase1-adv-start 0.0 --phase1-adv-mid 0.25 --phase1-adv-end 0.75 \
-    --phase2-adv 0.5 \
-    --lambda-pixel 1.0 --lambda-ssim 1.0 \
-    --num-workers 4 --save-interval 10 \
-    --noise "identity"
+python val/validation_script.py -c ./experiments/exp/checkpoints/checkpoint.pth \
+  -i ./test.jpg -m "101000100110100101100011100010" --mode full -o output
 ```
 
-**模式2：继续训练 (`continue`)**
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--mode` | `full` | `full` / `decode` / `discriminator` / `similarity` |
+| `--refine-steps` | 30 | 逐图精修步数（0 关闭） |
+| `--refine-lr` | 0.1 | 精修学习率 |
+| `--refine-budget` | 0.08 | 精修残差预算（深挖配方默认） |
+| `--refine-margin` | 0.50 | 精修逃逸目标（深挖配方默认） |
+| `--refine-chroma-projection` | None(取 Config) | 精修收敛后剔除 prv 低频色度（1 开 / 0 关） |
+
+**full 模式流程**：加载 → 编码 → 逐图精修 →（解码/判别器/相似度/保存全部基于精修后图像）→ 自动调用 `visual_report.py` 生成 `report.html`。
+
+**精修配方**（`refine_encoded_image`，与 `refine_encode.py` 同源）：冻结全部网络；优化变量为 96×96 低分辨率隐私残差场（从网络原始残差经 `atanh` 变换热启动，即**初始候选 = 网络原始输出，保证不劣化**）；目标 `w_privacy × escape(margin) + w_message × 双分支BCE + w_visual × (MSE+SSIM)`（12/10/15）；约束链 `interpolate → tanh × budget → × texture_mask → clamp`；**只在 `bit_acc ≥ 1.0` 的状态里选 clip_sim 最低者**为最终结果。
+
+**色度投影**（`_project_out_chroma_lowfreq`，精修收敛后默认执行）：剔除隐私残差 8×8 网格低频色度分量（BT.601 YCbCr 变换，Y 通道不变），门控保证投影后 `bit_acc=100%` 且 `clip_sim ≤ (1−margin)` 否则回退未投影结果。机制与实测见 11.8 节。
+
+其他模式：`decode` 仅解码消息；`discriminator` 仅判别器预测；`similarity` 需 `--cover` 提供，计算原图与隐写图的 CLIP/DINO/SSIM/PSNR 相似度。
+
+### 11.2 单图基线验证 (`baseline_validation.py`)
+
+网络直出（无逐图精修、不生成 report.html），复用 `ValidationScript` 的全部组件与流程：
 
 ```bash
-python train.py continue --folder ./experiments/experiment1
+python val/baseline_validation.py -c ./other/checkpoint.pth -i ./other/test.jpg \
+  -m "101000100110100101100011100010" --device cpu -o other/baseline_output
 ```
 
-**模式3：从指定检查点恢复为新实验 (`new` + `--continue-from-folder`)**
+参数：`-c` / `-i` / `-m`（默认全 0 串）/ `-o` / `--device`。输出编码图与全指标，汇总格式与 full 模式同口径，用作"网络单独 vs 网络+编码期精修"的对照基线（amortization gap 分析）或 checkpoint 原生质量的快速检查。
+
+### 11.3 独立逐图精修 (`refine_encode.py`)
+
+不训练网络，对任意 checkpoint 的**单张或多张**图像（`-i` 接受多路径）直接优化隐私残差：
 
 ```bash
-python train.py new --data-dir ./dataset --name experiment2 \
-    --continue-from-folder ./experiments/experiment1
+python val/refine_encode.py -c ./exp/checkpoints/checkpoint.pth \
+  -i ./test.jpg -m "101..." --steps 30 --margin-end 0.50 --prv-budget 0.08 -o other/refined
 ```
 
-这允许从已有实验的检查点继续训练，但保存到新的实验目录中（保留原始实验不变）。
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--steps` | 60 | 优化步数 |
+| `--lr` | 0.1 | 学习率 |
+| `--w-privacy` / `--w-message` / `--w-visual` | 12 / 10 / 15 | 目标各项权重 |
+| `--prv-budget` / `--margin-end` | 0.08 / 0.50 | 覆盖约束链与逃逸目标（**训练前试探预算/margin 组合的逃逸天花板**） |
+| `--chroma-projection` | None(取 Config) | 收敛后色度投影（1/0） |
+| `--noise-eval` | 8 | 信道鲁棒性采样次数 |
 
-#### 9.5.2 CLI参数完整列表
+每图输出 `metrics.json`，末尾汇总 `summary.json`。
 
-| 参数 | 默认值 | 说明 |
-|------|-------|------|
-| `--data-dir` | 必需 | 数据集根目录 |
-| `--train-dir` | `train` | 训练集子目录 |
-| `--val-dir` | `val` | 验证集子目录 |
-| `--batch-size` | 8 | 批次大小 |
-| `--name` | `default` | 实验名称 |
-| `--size` | 256 | 图像分辨率 |
-| `--message` | 30 | 消息比特长度 |
-| `--continue-from-folder` | `''` | 恢复检查点目录 |
-| `--tensorboard` | False | 启用TensorBoard |
-| `--enable-fp16` | False | 启用混合精度 |
-| `--noise` | `identity` | 噪声层配置 |
-| `--seed` | 42 | 随机种子 |
-| `--epochs-phase1` | 150 | Phase 1轮次 |
-| `--epochs-phase2` | 100 | Phase 2轮次 |
-| `--discriminator-loss-threshold` | 0.6 | 判别器损失阈值（遗留兼容） |
-| `--disc-acc-high` | 0.70 | 判别器准确率上限，达到后暂停更新 |
-| `--disc-hinge-margin` | 1.0 | 判别器 Hinge Loss 的 margin |
-| `--phase1-adv-start` | 0.0 | Phase 1 前段对抗权重 |
-| `--phase1-adv-mid` | 0.25 | Phase 1 中段对抗权重 |
-| `--phase1-adv-end` | 0.75 | Phase 1 后段对抗权重 |
-| `--phase2-adv` | 0.5 | Phase 2 对抗权重 |
-| `--phase1-prv-noise-start` | 0.50 | Phase 1 隐私噪声开始比例 |
-| `--phase1-prv-noise-end` | 0.90 | Phase 1 隐私噪声达到上限比例 |
-| `--phase1-prv-noise-max-ratio` | 0.50 | Phase 1 隐私噪声最大比例 |
-| `--phase1-prv-noise-power` | 2.0 | Phase 1 隐私噪声幂律指数 |
-| `--phase1-prv-noise-smooth-kernel` | 7 | Phase 1 隐私噪声平滑核大小 |
-| `--lr-encoder` | 1e-3 | 编码器学习率 |
-| `--lr-decoder` | 1e-3 | 解码器学习率 |
-| `--lr-steganalyzer` | 1e-4 | 隐写分析器学习率 |
-| `--lambda-pixel` | 1.0 | 像素损失权重 |
-| `--lambda-ssim` | 1.0 | SSIM损失权重 |
-| `--num-workers` | 4 | 数据加载线程 |
-| `--save-interval` | 10 | 检查点保存间隔 |
+### 11.4 批量定量评估 (`batch_eval.py`，精修版)
 
-#### 9.5.3 实验目录结构
-
-```
-experiments/{experiment_name}/
-├── config.json              # 配置快照
-├── train.log                # 训练日志
-├── checkpoints/
-│   ├── checkpoint.pth        # 最新检查点（含所有模块和优化器状态）
-│   ├── checkpoint_phase{N}_epoch{M}.pth  # 阶段性检查点
-│   ├── best_phase1.pth       # Phase 1 最佳检查点
-│   ├── best_phase2.pth       # Phase 2 最佳检查点
-│   └── visualizations/
-│       ├── phase1_epoch10.png
-│       └── ...
-└── tensorboard/              # TensorBoard事件文件
+```bash
+python val/batch_eval.py -c ./other/checkpoint.pth --val-dir ./dataset1/val \
+  --num-images 200 --refine-steps 30 -o other/batch_eval --device cpu
 ```
 
-#### 9.5.4 训练主循环 (`run_training_loop`)
+- 从 `--val-dir` 递归采样 `--num-images`（默认 200）张，每张随机消息，逐一编码+精修（深挖配方默认 budget 0.08 / margin 0.50 / 色度投影取 Config）。
+- 输出基线/精修的 CLIP/DINO/bit_acc/PSNR/SSIM 统计（均值±标准差、分位数）、信道鲁棒性（`--noise-eval` 默认 8 次随机噪声采样的解码率与相似度）、uint8 往返（内存内模拟 PNG 8bit 量化）。
+- `--save-images`（默认开）/ `--no-save-images`；`results.json` **增量保存支持断点续跑**（中断后原命令重跑自动跳过已完成部分；从头重跑须换输出目录或删除旧 `results.json`）；`--report-only` 不加载模型仅重出报告。
+- 输出：`results.json` / `summary.json` / `details.csv`（逐图明细）/ `report.html` + 4 张 PNG 面板。
 
-```python
-for phase in range(start_phase, 3):
-    num_epochs = getattr(cfg, f'num_epochs_phase{phase}')
-    phase_start_epoch = start_epoch if phase == start_phase else 1
+### 11.5 批量基线评估 (`batch_baseline.py`，网络直出)
 
-    if phase == 1 and phase_start_epoch == 1:
-        trainer.warmup_memory_bank(train_loader, num_batches=50)
+复用 `batch_eval.py` 的采样/噪声/往返公共函数（同 seed 同 val-dir 时评估同一批图像，与含精修版直接对照），网络单次前向后计算全指标+信道鲁棒性+uint8 往返；单条件记录（无 base/refined 冗余结构），**速度约为含精修版 20~30 倍**，适合大规模快速评估 checkpoint 原生质量或论文 amortization gap 分析的基线列。
 
-    if phase == 2 and not trainer.phase2_msg_head_frozen:
-        trainer.freeze_msg_head()
-
-    for epoch in range(phase_start_epoch, num_epochs+1):
-        for batch_idx, batch in enumerate(train_loader):
-            losses = trainer.train_step(batch, phase, epoch)
-
-        val_losses = trainer.validate(val_loader, phase, epoch, save_vis)
-
-        if phase == 2:
-            val_bit_acc = val_losses.get('bit_accuracy', 1.0)
-            if val_bit_acc < cfg.bit_accuracy_threshold:
-                trainer.recovery_step(train_loader, num_batches=cfg.recovery_steps)
-
-        if epoch % cfg.save_interval == 0:
-            trainer.save_checkpoint(epoch, phase, is_best)
+```bash
+python val/batch_baseline.py -c other/checkpoint.pth --num-images 200 -o other/batch_baseline --device cpu
 ```
 
-#### 9.5.5 检查点保存策略
+输出同样为 `results.json` / `summary.json` / `details.csv` / 可视化报告（断点续跑）；默认不保存编码图（`--save-images` 开启）。
 
-```python
-def save_checkpoint(self, epoch, phase, is_best=False):
-    checkpoint = {
-        'epoch': epoch,
-        'phase': phase,
-        'encoder_state_dict': self.encoder.state_dict(),
-        'decoder_state_dict': self.decoder.state_dict(),
-        'steganalyzer_state_dict': self.steganalyzer.state_dict(),
-        'optimizer_encoder_decoder': self.optimizer_encoder_decoder.state_dict(),
-        'optimizer_steganalyzer': self.optimizer_steganalyzer.state_dict(),
-        'best_loss': self.best_loss,
-        'phase2_msg_head_frozen': self.phase2_msg_head_frozen
-    }
+### 11.6 CBIR 检索逃逸评估 (`retrieval_eval.py`，精修版)
 
-    if self.clip_memory_bank is not None:
-        checkpoint['clip_memory_bank'] = self.clip_memory_bank.state_dict()
-    if self.dino_memory_bank is not None:
-        checkpoint['dino_memory_bank'] = self.dino_memory_bank.state_dict()
+```bash
+python val/retrieval_eval.py -c ./other/checkpoint.pth --val-dir ./dataset1/val \
+  --num-queries 100 --gallery-size 1000 --refine-steps 30 \
+  --refine-margin 0.50 --refine-budget 0.08 -o other/retrieval_eval --device cpu
 ```
 
-**保留策略**：每个phase最多保留5个最新检查点，自动删除最旧的检查点。
+- 攻击者视角测试：图库从 `--val-dir` 采样（`--extra-gallery-dir` + `--extra-gallery-size` 可从 train 集扩充干扰池），**查询集为图库子集且原图保留在图库内**（检索才有"命中"可言）。
+- 编码图（基线）与精修图分别作为查询对全图库做 CLIP 余弦检索，报告 top-1/5/10 命中率、逃逸率（=1−top1）、平均排名、中位排名、MRR 与"原图相似度 vs 最强干扰相似度"竞争余量。
+- **自检**：原图自查询应 100% top-1（特征链路正确性校验）。
+- 图库特征缓存至 `gallery_feats.pt`（路径集合命中缓存即复用）；`eval_meta.json` 记录图库规模等元信息；`results.json` 断点续跑；`--report-only` 仅重出报告。
+- 实测（20 图库、深挖配方）：基线 top-1 命中 100%、精修后逃逸率 66.7%。
 
-#### 9.5.6 随机种子设置
+### 11.7 CBIR 检索逃逸基线评估 (`retrieval_baseline.py`，网络直出)
 
-```python
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+复用 `retrieval_eval.py` 的图库构造/特征缓存/检索函数，编码图单次前向后直接作查询；图库特征缓存 `gallery_feats.pt` 与精修版共用（同图库配置直接命中，无需重新提取）；单条件记录，报告 top-k 命中率、逃逸率、MRR、自检；断点续跑 + 可视化报告。
+
+```bash
+python val/retrieval_baseline.py -c other/checkpoint.pth --num-queries 100 --gallery-size 1000 -o other/retrieval_baseline --device cpu
 ```
 
-确保实验的可重复性。默认种子为42。
+### 11.8 全链路一键验证 (`run_full_validation.py`)
 
-### 9.6 记忆库预热
+编排 val/ 下五个评估脚本（快阶段先行、失败早暴露），各阶段断点续跑：
 
-```python
-def warmup_memory_bank(self, train_loader, num_batches=50):
-    if self.clip_memory_bank is None and self.dino_memory_bank is None:
-        return
-
-    with torch.no_grad():
-        for i, batch in enumerate(train_loader):
-            if i >= num_batches:
-                break
-            cover_image = batch['cover_image'].to(self.device)
-
-            if self.clip_memory_bank is not None:
-                clip_feat = self.content_recognizer(cover_image)
-                self.clip_memory_bank.update(clip_feat)
-
-            if self.dino_memory_bank is not None:
-                dino_feat = self.extract_dino_features(cover_image)
-                if dino_feat is not None:
-                    self.dino_memory_bank.update(dino_feat)
+```bash
+python val/run_full_validation.py -c ./experiments/full_run/checkpoints/checkpoint_best.pth \
+  --val-dir ./dataset/test -o ./other/full_validation
 ```
 
-在Phase 1开始前，用50个batch的封面图像特征**预填**CLIP和DINO记忆库。这确保在正式训练开始时，记忆库已有足够的样本可供硬负样本挖掘。
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `-c` | 必填 | checkpoint 路径 |
+| `--val-dir` | `./dataset/test` | 测试集目录 |
+| `--num-images` | 1000 | 批量评估规模 |
+| `--num-queries` / `--gallery-size` | 100 / 1000 | 检索评估规模 |
+| `--extra-gallery-dir` / `--extra-gallery-size` | None / 0 | 图库扩充 |
+| `--refine-steps/-lr/-budget/-margin/-chroma-projection` | 30 / 0.1 / 0.08 / 0.50 / None | 精修配方（深挖默认） |
+| `--noise-eval` | 8 | 信道鲁棒性采样 |
+| `--message` | 30 bit 默认串 | 单图全链路验证消息 |
+| `--seed` | 42 | 全局种子（同 seed 同 val-dir 保证基线与精修评估同一批图像） |
+| `--no-save-images` | 否 | 批量精修评估不保存精修编码图 |
+| `--stages` | `all` | 阶段子集：`smoke,single,batch_baseline,retrieval_baseline,batch_eval,retrieval_eval,summary` |
+| `--report-only` | 否 | 从已有 results.json 重出各子报告与汇总 |
+| `--dry-run` | 否 | 只打印将执行的命令 |
+
+**阶段顺序**（STAGE_ORDER）：`smoke → single → batch_baseline → retrieval_baseline → batch_eval → retrieval_eval → summary`。
+
+- **冒烟门控（smoke）**：`_smoke` 临时目录，每次全量重跑。校验检索自检（原图自查询）top-1=100%、直出 bit_acc≥0.5、精修链路可用后才开始全量——特征链路或模型损坏能最快暴露。
+- **缓存复用**：检索两脚本图库配置一致时，把基线阶段的 `gallery_feats.pt` 复制给精修版（缓存按路径列表自校验）。
+- **汇总（summary）**：读取四个 `summary.json` 生成 `full_summary.json` + 英文 `full_summary.md`（网络直出/精修三列对照表，可直接进论文），并做两路直出结果一致性交叉检查（两路直出 clip_sim 均值差 >0.02 或检索 top-1 差 >5% 时警告 seed/配置不一致）。
+- 子脚本自带断点续跑：任一阶段中断后重跑同一条命令自动续；从头重跑需换 `--output-root` 或删除对应子目录的 `results.json`。
+
+### 11.9 可视化报告生成器
+
+**`visual_report.py`**（单图验证，full 模式自动调用）：自包含 `report.html`（base64 内嵌图表）+ 独立 PNG 面板。内容：核心指标卡片（bit_acc/CLIP·DINO 隐私保护/PSNR/SSIM/判别器，按阈值标色）、原图-编码图-残差对比、精修逃逸轨迹（相似度与 bit_acc/PSNR 随步数变化）、隐私逃逸对比条形图（附逃逸目标线）、消息比特核验面板（逐比特正确性+解码置信度）、精修前后对照表。
+
+**`eval_visualizer.py`**（批量/检索评估，评估结束自动调用，可 `--report-only`）：批量报告含相似度分布对比、逐图改善哑铃图、质量-隐私权衡散点、鲁棒性对比、全指标对照表；检索报告含排名分布/CDF、逐查询排名散点（log-log）、相似度竞争散点（逃逸机制）、全指标对照表；基线版（`generate_batch_baseline_report`/`generate_retrieval_baseline_report`）为单条件报告。
+
+两模块在 matplotlib 缺失或生成失败时自动跳过，不影响评估流程本身。
+
+### 11.10 评估工作流建议
+
+1. 正式评估前先小规模冒烟：`--num-images 3` / `--num-queries 3 --gallery-size 20`（各约 2-3 分钟）。
+2. 确认检索输出末尾"自检（原图自查询 top-1 命中率）"为 100% 且基线 top-1 命中接近 100% 后再跑正式规模。
+3. 正式规模耗时参考：批量 200 张约 2~2.5 小时 CPU；检索 100 查询/1000 图库约 1.5~2 小时 CPU；A100 分钟级。
+4. 双配方对照（深挖 margin 0.50/budget 0.08 默认 vs 标准 margin 0.30/budget 0.04 显式指定 `--refine-budget 0.04 --refine-margin 0.30` 各跑一遍）构成"视觉质量-隐私保护"权衡表。
+5. 精修步数 30 与 60 的逃逸效果基本相同（逃逸主要发生在前 30 步）——30 步砍掉一半时间几乎不损失效果。
+6. 一键全链路：直接用 `run_full_validation.py`（内置冒烟门控与汇总对照表）。
 
 ---
 
-## 10. 验证脚本 (`validation_script.py`)
+## 12. 核心算法原理
 
-**文件位置**: [validation_script.py](validation_script.py)
+### 12.1 双残差编码
 
-验证脚本提供了四种工作模式：
+消息残差与隐私残差分离产生、独立预算约束、独立冻结调度：
 
-### 10.1 完整验证模式 (`--mode full`)
+- **解耦**：消息目标（高频、逐比特可靠）与隐私目标（中频、patch 尺度结构化）在频段与梯度方向上都不同，单残差会互相牵制。
+- **复用**：热启动重训隐私支路时消息通路完整复用（直入 Phase 2 首轮 val bit_acc 0.925）。
+- **保解码**：精修不动 `msg_residual`，只在比特 100% 正确状态里选优。
 
-执行完整的隐写流程并输出全面评估指标：
+### 12.2 多特征空间逃逸
 
-```python
-def run_full_validation(self, image_path, message, output_dir=None):
-    # 1. 加载并预处理图像
-    # 2. 处理消息（补零/截断到30位）
-    # 3. 编码：Encoder(cover, message, phase=2, prv_noise_ratio=0.0) → encoded_image
-    # 4. 解码：Decoder(encoded_image) → decoded_message
-    # 5. 消息验证：计算比特准确率
-    # 6. 判别器预测：分别对原图和隐写图进行隐写检测
-    # 7. 隐私评估：计算CLIP/DINO余弦相似度、欧氏距离、SSIM、PSNR
-    # 8. 保存可视化结果
+CLIP（语义）+ DINOv2（细粒度纹理）双空间二次 Hinge 逃逸，margin 独立调度：
+
+- 攻击者可能改用自监督特征做近重复检测，单逃 CLIP 不够；
+- CLIP/DINO 特征空间的典型 hard negative 相似度不同（≈0.73 vs ≈0.47），redirect 目标与 margin 必须分别标定。
+
+### 12.3 频段设计与纹理掩码
+
+- 96×96 低通把残差约束在 CLIP 敏感、人眼不敏感的中频段（2.7px/格，覆盖 32~96 周期/图）；48×48 低通实测逃逸失效（privacy 占损失 88% 但 sim 几乎不降）；
+- 纹理掩码把幅度集中到梯度复杂区（q05/q95 → [0.15, 1.0]，下限 0.15 保证逃逸余量）；
+- 两者合起来使逃逸与视觉质量不冲突（margin 0.50 + budget 0.08 下仍 PSNR 38.95 / SSIM 0.957）。
+
+### 12.4 记忆库硬负样本有向重定向
+
+逃逸只约束"离开原图"，不约束"去向哪里"——无约束逃逸可能落入其他敏感区域（例如检索到另一张同场景图）。Redirect 从记忆库检索与当前编码特征最相似的**其他**载体特征（排除近重复），以线性 Hinge 把相似度拉升到 `target_sim` 即停（CLIP 0.85 / DINO 0.60），并用 `control_loss` 封顶（0.90 / 0.65）防止过头变成他人图像的"副本"。
+
+### 12.5 渐进逃逸边界
+
+Balance 段 margin 在前 50% 轮次内从 start 渐进到 end：二次 Hinge 的梯度 `∝ 2×(sim − target)`，margin 突变会造成目标跳变与优化震荡；渐进让网络先在温和目标下建立方向，再逐步收紧。Sprint/Refine 段直接取 end 值（纯逃逸阶段无需渐进——实测 40 轮 sprint 中若走 ramp，margin 仅 0.10→0.26，冲刺前期梯度被削弱 ~3 倍）。
+
+### 12.6 蒸馏与部署精修（摊销鸿沟）
+
+网络是"摊销求解器"——用一次前向近似逐图优化问题，存在不可消除的摊销鸿沟。三层递进：
+
+1. **内环蒸馏**（训练期）：教师残差是当前 batch 的逐图最优解近似，学生通过归一化 MSE 学习教师的**方向与能量分布**（而非绝对值——残差绝对值量级太小）。
+2. **部署精修**（编码期）：对单图真正求解。以网络输出为初始候选（保证不劣化），30~60 步 Adam。
+3. **消息锚硬保证**：所有时刻只在 bit_acc=100% 的可行域内选优。
+
+### 12.7 色度低频投影（发灰/蒙层修复）
+
+**问题**：实测隐私残差能量 77% 落在色度通道、低频（8×8 块均值尺度）占其 44%，且总残差低频色度的 97% 来自 prv_residual——构成"发灰/蒙层"感知劣化主体，而 PSNR/SSIM 对此失明。
+
+**为什么不用梯度惩罚**：实测 w=40~5000 的色度惩罚均被逃逸梯度完全淹没——逃逸方向与色度方向高度平行（CLIP 逃逸天然偏好色度通道），惩罚项与主目标对冲，形同虚设。
+
+**方案（结构化事后投影）**：精修收敛后，把 `prv_residual` 的 8×8 网格低频色度分量整支剔除：
+
+```
+YCbCr 变换（BT.601）→ Cb/Cr 各做 8×8 自适应均值池化 → 双线性上采样回全分辨率
+→ 按逆变换系数从 RGB 残差中扣除（Y 通道不动）
 ```
 
-**编码器调用方式**：
+**尺度选择**：更粗尺度（16/16 以上网格）的低频是逃逸承重结构（剔除后 clip_sim 回升到 0.57/0.80），只动 8×8 网格。
 
-```python
-encoded_image, residual_penalty, msg_residual, prv_residual = self.encoder(
-    cover_image, message, phase=2, prv_noise_ratio=0.0
-)
-```
+**门控回退**：投影后 bit_acc 必须 100% 且 clip_sim ≤ (1−margin)，否则回退未投影结果。
 
-验证时使用 `phase=2` 和 `prv_noise_ratio=0.0`，确保同时应用消息残差和隐私残差。
+**实测**（test.jpg）：clip 0.438→0.467（仍在 margin 0.50 目标内）、低频色度 −91%、PSNR +0.5 dB、SSIM +0.001、bit 100%。
 
-**输出指标**：
+### 12.8 逃逸杠杆与实测（CPU 逐图精修，60 步，bit_acc 全程 100%）
 
-| 指标 | 公式/方法 | 含义 |
-|------|----------|------|
-| 比特准确率 | `correct_bits / total_bits` | 消息提取正确率 |
-| 隐写概率(原图) | `sigmoid(Steganalyzer(cover))` | 原图被判为隐写的概率（应接近0%） |
-| 隐写概率(隐写图) | `sigmoid(Steganalyzer(encoded))` | 隐写图被判为隐写的概率（应接近50%，即成功欺骗） |
-| CLIP余弦相似度 | `cos(f_cover, f_encoded)` | CLIP特征空间相似度（越低隐私越好） |
-| DINO余弦相似度 | `cos(f_cover_dino, f_encoded_dino)` | DINO特征空间相似度（越低隐私越好） |
-| SSIM | `1 - SSIM_Loss` | 结构相似度（越高视觉质量越好） |
-| PSNR | `10·log₁₀(4.0/MSE)` | 峰值信噪比（dB，越高越好） |
-| CLIP欧氏距离 | `‖f_encoded - f_cover‖₂` | CLIP特征向量欧氏距离 |
-| DINO欧氏距离 | `‖f_encoded_dino - f_cover_dino‖₂` | DINO特征向量欧氏距离 |
+| 杠杆 | 取值 | CLIP sim |
+| --- | --- | --- |
+| margin（budget 0.08） | 0.30 / 0.40 / 0.50 | 0.575 / 0.547 / 0.440 |
+| budget（margin 0.30） | 0.04 / 0.06 / 0.08 | 0.634 / 0.603 / 0.575 |
+| 视觉权重 w_visual | 15 → 8 | 无影响（幅度由 margin 驱动的 hinge 平衡决定） |
 
-### 10.2 判别器模式 (`--mode discriminator`)
+margin 0.50 + budget 0.08 时 PSNR 38.95 / SSIM 0.957，仍属视觉高质量区间。margin 排第一的原因：二次 Hinge 在 sim < (1−margin) 后梯度归零，margin 直接决定 hinge 平衡点；budget 排第二：逃逸深度 ∝ 特征位移²，位移受 budget × 掩码能量约束。
 
-仅对单张图像执行隐写检测：
+### 12.9 失败模式汇编（工程经验，可作为论文 discussion）
 
-```bash
-python validation_script.py -c checkpoint.pth -i image.png --mode discriminator
-```
+以下每条均为实测验证过的反直觉结论（"问题 → 现象 → 归因"）：
 
-### 10.3 解码模式 (`--mode decode`)
-
-仅从隐写图像中提取隐藏消息：
-
-```bash
-python validation_script.py -c checkpoint.pth -i stego.png --mode decode
-```
-
-### 10.4 相似度判断模式 (`--mode similarity`)
-
-仅计算两张图像之间的特征相似度（无需检查点）：
-
-```bash
-python validation_script.py -i encoded_image.png --cover cover_image.png --mode similarity
-```
-
-### 10.5 消息处理
-
-验证脚本支持灵活的消息输入：
-- 二进制字符串：直接输入如 `"101000100110100101100011100010"`
-- 消息文件路径：指向包含二进制字符串的文件
-- 自动补零/截断：消息长度不足30位时自动补0，超过30位时自动截断
-
-### 10.6 DINOv2相似度评估
-
-验证脚本集成了DINOv2相似度评估功能，在隐私相似度判断中同时输出CLIP和DINO两种模态的指标：
-
-```python
-if self.dino_model is not None:
-    feat_cover_dino = self.extract_dino_features(cover_image)
-    feat_encoded_dino = self.extract_dino_features(encoded_image)
-    dino_sim = F.cosine_similarity(feat_cover_dino, feat_encoded_dino, dim=1).item()
-    dino_euclidean_dist = torch.norm(feat_encoded_dino - feat_cover_dino, p=2, dim=1).item()
-```
+| 失败模式 | 现象 | 归因与修复 |
+| --- | --- | --- |
+| 消息分支锁死 | Phase 1 仅用含噪单分支时 L_message 锁死在 ln2 | 随机初始化的微弱 msg 信号被信道摧毁；干净分支权重 0.8 冷启动 |
+| 编码器躺平 | 加大 noised 视觉权重后 sim 不降、视觉不变 | 含噪视觉损失把信道失真归咎于残差；各阶段 noised 恒 0 |
+| 多目标 SNR 失效 | 正常 Phase 2 20000 步停在 clip_sim 0.946，加大 privacy 权重无效 | Adam 对梯度尺度不变，多目标逐图方向不一致时信噪比失效；Sprint 段单目标 + lr×5 |
+| 雅可比毒化 | 隐私损失只在含噪图上算时完全推不动 | quant 傅里叶近似梯度 1~21 倍震荡、jpeg 近似劣质；干净分支主力 + 含噪分支仅锚定 |
+| redirect 形同虚设 | target 仅高于 hard negative 均值 0.02 时 redirect 占损失 <1% | 目标必须明显高于该空间典型 hard negative（CLIP 0.73→target 0.85；DINO 0.47→0.60） |
+| 频段错配 | 48×48 低通时 privacy 占损失 88% 但 sim 几乎不降 | 48 网格 <24 周期把残差压进 CLIP 最不敏感频段；96 网格覆盖 patch 尺度 |
+| 纹理下限过低 | 掩码下限 0.05 时逃逸天花板 sim≈0.72 贴边无余量 | 下限提至 0.15 |
+| 色度惩罚无效 | w=40~5000 色度梯度惩罚全部失败 | 逃逸方向与色度方向高度平行；改为结构化事后投影 |
+| 多目标回拉 | Sprint 开头 + Balance 之后模型停在折中态（val clip_sim 卡 0.87） | Balance 会把残差往"消息友好"方向回拉；终段 Refine 以精修配方收尾 |
+| best 冻结 | 从头训练时 Phase 2 的 best 永远不更新 | 两阶段准则数值不可比；按 `best_loss_phase` 检测准则阶段切换并重置 |
 
 ---
 
-## 11. CLIP与DINOv2视觉模型
+## 13. 使用指南
 
-### 11.1 CLIP模型
+### 13.1 环境依赖
 
-本项目的CLIP模型通过 `pip install git+https://github.com/openai/CLIP.git` 安装。CLIP (Contrastive Language-Image Pre-Training) 由OpenAI开发，通过大规模图文对比学习训练。
+- Python >= 3.8，PyTorch >= 2.0.0，torchvision >= 0.15.0
+- CUDA（训练推荐）/ CPU（验证与评估可用）
+- DINOv2 权重：`./models/dinov2_vits14_pretrain.pth`（缺失时警告并随机初始化）
 
-**核心特性**：
-- **预训练规模**：约4亿图文对
-- **架构**：图像端使用ViT-B/32（Transformer）
-- **特征维度**：512维L2归一化特征向量
-- **使用方式**：本项目仅使用图像编码器（`clip.load` + `encode_image`），文本编码器通过 `encode_text()` 方法可选使用
-
-**在本项目中的作用**：
-- 将原始封面图像和编码图像分别通过CLIP编码，得到512维语义特征
-- 计算两者的余弦相似度，用于隐私损失计算
-- CLIP的语义理解能力使得即使像素级差异很小，语义级的"相似性泄露"也能被检测
-
-### 11.2 DINOv2模型
-
-DINOv2（Self-distilled Vision Transformers）由Meta开发，通过自蒸馏方式训练。
-
-**核心特性**：
-- **架构**：ViT-S/14（Small variant，patch size 14）
-- **特征维度**：384维L2归一化特征向量
-- **加载方式**：通过timm库加载（`vit_small_patch14_dinov2.lvd142m`）
-- **权重路径**：`./models/dinov2_vits14_pretrain.pth`
-
-**在本项目中的作用**：
-- 提供与CLIP互补的视觉特征表示
-- CLIP侧重图文对齐语义，DINOv2侧重自监督视觉特征和细粒度纹理
-- 联合使用覆盖更多潜在的攻击向量
-
-**与CLIP的互补性**：
-
-| 特性 | CLIP ViT-B/32 | DINOv2 ViT-S/14 |
-|------|--------------|-----------------|
-| 训练方式 | 图文对比学习 | 自蒸馏 |
-| 特征维度 | 512 | 384 |
-| 语义侧重 | 物体类别、场景类型 | 纹理、细粒度结构 |
-| 隐私权重 | 1.0 | 1.0 |
-
----
-
-## 12. 核心算法原理深度剖析
-
-### 12.1 双残差隐写编码原理
-
-#### 传统隐写 vs 双残差隐写
-
-| 维度 | 传统隐写（LSB等） | 单残差隐写 | 双残差隐写（本系统） |
-|------|------------------|-----------|-------------------|
-| 嵌入方式 | 手工规则（修改最低有效位） | 单一神经网络残差 | 解耦的消息残差 + 隐私残差 |
-| 容量控制 | 固定 | 隐式学习 | 预算约束（msg_budget, prv_budget） |
-| 隐私保护 | 无 | 与消息嵌入耦合 | 独立隐私头，阶段解耦训练 |
-| 阶段适配 | 无 | 无 | Phase 1虚拟噪声预适应 |
-
-#### 本系统的编码策略
-
-编码器采用**双残差预算约束嵌入**策略：
-
-1. **消息空间化**：30位消息 → 30通道的256×256特征图
-2. **特征融合**：消息 + 128通道图像特征 + 原始图像 → 161通道联合表示
-3. **共享特征提取**：161通道 → 128通道共享特征
-4. **双头分支**：
-   - msg_head：128通道 → 3通道消息残差，`msg_budget * tanh` 约束
-   - prv_head：128通道 → 3通道隐私残差，`prv_budget * tanh` 约束
-5. **残差叠加**：`encoded = cover + msg_residual + prv_residual`
-
-**预算约束的数学含义**：
-
-$$msg\_residual = \beta_{msg} \cdot \tanh(f_{msg}(h_{shared}))$$
-
-其中 $\beta_{msg} = 0.04$，$\tanh$ 输出范围 $[-1, 1]$，因此 $msg\_residual \in [-0.04, 0.04]$。
-
-$$prv\_residual = \beta_{prv} \cdot \tanh(f_{prv}(h_{shared}))$$
-
-其中 $\beta_{prv} = 0.04$，因此 $prv\_residual \in [-0.04, 0.04]$。Phase 2 中隐私残差还会乘以纹理掩码（取值 [0.15, 1.0]），进一步在平滑区域抑制扰动。
-
-总修改幅度上界：$|msg\_residual| + |prv\_residual| \le 0.04 + 0.04 = 0.08$
-
-这保证了编码图像与原图的像素差异不超过8%的动态范围，确保视觉不可感知性。
-
-### 12.2 对抗训练原理
-
-本系统采用的是**Hinge GAN + Softplus 生成器损失 + 谱归一化**的训练范式：
-
-```
-┌──────────────┐         ┌──────────────────┐
-│   Generator   │ encoded │   Discriminator  │
-│ (Enc + Dec)  │────────▶│ (Steganalyzer)   │
-│              │  image  │                  │
-└──────┬───────┘         └────────┬─────────┘
-       │                          │
-       │ L_adv = softplus(-logit) │ L_D = Hinge(real, fake, margin=1.0)
-       │                          │ (仅当 disc_acc < 0.70 时更新)
-       ▼                          ▼
-  更新Gen参数                   更新Disc参数
-```
-
-**训练动力学**：
-1. 判别器学会区分真实图像和隐写图像
-2. 生成器学会制造更难被检测的隐写图像
-3. 达到纳什均衡时，隐写图像的统计分布与真实图像无法区分
-
-**判别器准确率门控**：当判别器准确率达到 `disc_acc_high`（默认0.70）时暂停判别器更新，防止判别器过强导致生成器梯度消失，这是训练稳定性的重要保障。同时使用 Hinge Loss 替代 BCE，在 logit 满足 margin 约束后梯度归零，避免判别器过度优化。
-
-**SpectralNorm的关键作用**：保证判别器满足1-Lipschitz约束，避免梯度爆炸/消失，使对抗训练稳定收敛。
-
-### 12.3 隐私保护的多模态特征逃逸机制
-
-#### 问题定义
-
-传统隐写只关心"能否被发现"，但忽略了**语义隐私泄露**风险：
-- 攻击者可以使用CLIP等语义模型提取图像特征
-- 如果编码前后特征相似，攻击者可以通过**语义检索**建立联系
-- 这构成了**推理攻击（Inference Attack）**的一种
-
-#### 解决方案：特征空间逃逸 + 有向重定向
-
-```
-CLIP/DINO语义特征空间（单位超球面）
-
-                    f_encoded (目标位置)
-                       ●
-                      /
-                     /  ← 最大化距离(推离原图) — escape_loss
-                    /
-                   /
-        f_cover ●─────────────────● f_other_image
-                  \               /
-                   \  ← 最小化距离(拉向负样本) — redirect_loss
-                    \           /
-                     ● f_hard_negative
-                    ↑
-              control_loss 防止过度接近
-```
-
-**逃逸策略**：
-1. **推离**（Push Away）：最大化 `sim(f_encoded, f_cover)` 的距离（二次 Hinge + Softplus 预热）
-2. **拉向**（Pull Toward）：最小化 `sim(f_encoded, f_hard_negative)` 的距离（有向重定向，Softplus Loss）
-3. **控制**（Control）：防止过度接近负样本（Hinge Loss）
-
-#### 为什么多模态？
-
-不同预训练模型捕获的语义信息有所差异：
-- **CLIP**：强调图文对齐语义，对物体类别、场景类型敏感
-- **DINOv2**：自监督学习，对纹理、细粒度结构更敏感
-
-联合使用可以覆盖更多潜在的攻击向量。
-
-#### 有向重定向的优势
-
-相比纯"推离"策略，有向重定向引入了一个**语义目标**：
-- 纯推离：编码图像可能飘向特征空间的任意方向，甚至可能靠近其他敏感区域
-- 有向重定向：明确将编码图像"伪装"成某个无关图像，使攻击者更难以通过检索找到原图
-- 控制项防止过度接近，保持特征多样性
-
-### 12.4 记忆库驱动的硬负样本挖掘
-
-#### 动机
-
-普通损失函数使用batch内的随机样本作为负样本，但这些样本可能太容易区分（"简单负样本"），提供的训练信号较弱。
-
-#### MoCo风格的记忆库
-
-```
-训练过程中:
-
-Batch 1: [img_A, img_B, img_C, img_D]
-    ↓ 提取特征并存入记忆库
-Memory Bank: [f_A, f_B, f_C, f_D, ..., ?, ?, ...] (capacity=5000)
-
-...
-
-Batch N: 查询 img_X 的特征 f_X
-    ↓ 在记忆库中搜索
-Top-5 最相似: [f_P, f_Q, f_R, f_S, f_T]  ← 这些就是"硬负样本"
-    ↓ FeatureRedirectionLoss内部选最难的1个
-Hardest: f_P
-    ↓ 用作重定向目标
-L_redirect = mean(log1p(exp((1-margin) - sim(f_encoded, f_P))))
-L_control = mean(relu(sim(f_encoded, f_P) - max_target_sim))
-```
-
-**多记忆库设计**：
-
-| 记忆库 | 存储特征 | 特征维度 | 用途 |
-|--------|---------|---------|------|
-| `clip_memory_bank` | CLIP特征 | 512 | CLIP有向重定向的负样本来源 |
-| `dino_memory_bank` | DINOv2特征 | 384 | DINO有向重定向的负样本来源 |
-
-**优势**：
-- 记忆库积累了历史batch的特征，负样本池远大于当前batch
-- 选择"最相似"的样本作为负样本，迫使模型学习更精细的区分能力
-- 循环缓冲区设计保证特征分布的时效性
-- 多记忆库覆盖多模态攻击向量
-
-### 12.5 渐进逃逸边界机制
-
-#### 问题
-
-如果在Phase 2一开始就使用较大的逃逸margin，隐私损失会产生巨大的梯度，可能导致：
-- 编码器过度修改图像，视觉质量严重下降
-- 消息提取准确率急剧下降
-- 训练过程不稳定甚至崩溃
-
-#### 解决方案
-
-通过 `get_escape_margin()` 实现逃逸margin的线性增长：
-
-$$margin(epoch) = margin_{start} + (margin_{end} - margin_{start}) \times \frac{epoch - 1}{total\_epochs - 1}$$
-
-代入默认值：
-
-$$margin(epoch) = 0.15 + 0.15 \times \frac{epoch - 1}{99}$$
-
-| Phase 2 Epoch | margin | 逃逸目标 (1-margin) | 含义 |
-|--------------|--------|-------------------|------|
-| 1 | 0.150 | 0.850 | 编码特征需与原图相似度 < 0.85 |
-| 34 | 0.200 | 0.800 | 相似度需 < 0.80 |
-| 67 | 0.250 | 0.750 | 相似度需 < 0.75 |
-| 100 | 0.300 | 0.700 | 相似度需 < 0.70 |
-
-**渐进策略的效果**：
-- 训练初期：margin 起始值 0.15 已提供足够的逃逸约束，确保隐私保护从 Phase 2 一开始就生效
-- 训练后期：margin 增大到 0.30，逃逸要求严格，隐私保护充分
-- 整个过程平滑过渡，避免梯度突变
-
----
-
-## 13. 完整数据流图
-
-以下是单个训练step的完整数据流向：
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Train Step 数据流 (Phase 2)                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  输入                                                                     │
-│  ┌─────────────────┐  ┌──────────────────┐                               │
-│  │ cover_image      │  │ message           │                               │
-│  │ [B,3,256,256]    │  │ [B,30]            │                               │
-│  │ range:[-1,1]     │  │ values:{0,1}      │                               │
-│  └────────┬────────┘  └────────┬─────────┘                               │
-│           │                      │                                         │
-│           ▼                      │                                         │
-│  ┌───────────────────────────────┘                                         │
-│  │                                                                        │
-│  │  ENCODER (Dual-Head)                                                   │
-│  │  ┌──────────────────────────────────────────────────────────┐          │
-│  │  │ 1. message expand: [B,30] → [B,30,256,256]               │          │
-│  │  │ 2. ConvBNRelu×16: cover → [B,128,256,256] features      │          │
-│  │  │ 3. Concat: [msg(30); feat(128); cover(3)] → [B,161,...]  │         │
-│  │  │ 4. ConvBNRelu: [B,161] → [B,128,256,256] (shared)       │          │
-│  │  │ 5. msg_head: shared → [B,3,256,256] → 0.04*tanh → msg_r │         │
-│  │  │ 6. texture_mask = sigmoid(grad(cover)*3.0) ∈[0.15,1.0]    │         │
-│  │  │ 7. prv_head: shared → [B,3,256,256] → 0.04*tanh → prv_r   │         │
-│  │  │ 8. prv_r = prv_r * texture_mask (纹理掩码加权)              │         │
-│  │  │ 9. encoded = cover + msg_r + prv_r                          │         │
-│  │  │ 10. clamp(encoded, -1, 1)                                   │         │
-│  │  └──────────────────────────────────────────────────────────┘          │
-│  │                      │                                                │
-│  │                      ▼                                                │
-│  │            encoded_image [B,3,256,256]                                │
-│  │            residual_penalty (scalar)                                   │
-│  │            msg_residual [B,3,256,256]                                  │
-│  │            prv_residual [B,3,256,256]                                  │
-│  │                                                                        │
-│  ├───────────────────────────────────────────────────────────────────────┤
-│  │                                                                        │
-│  │  NOISER (随机选择一种噪声)                                              │
-│  │  ┌──────────────────────────────────────────────────────────┐          │
-│  │  │ Input: (encoded_image, cover_image)                       │          │
-│  │  │ → 随机选择: Identity/Crop/Cropout/Dropout/Resize/JPEG/Quant │        │
-│  │  │ Output: (noised_encoded, noised_cover)                    │          │
-│  │  └──────────────────────────────────────────────────────────┘          │
-│  │         │                    │                                        │
-│  │         ▼                    ▼                                        │
-│  │  noised_encoded          noised_cover                                 │
-│  │  [B,3,256,256]           [B,3,256,256]                                │
-│  │                                                                        │
-│  ├───────────────────────────────────────────────────────────────────────┤
-│  │                                                                        │
-│  │  DECODER                                                               │
-│  │  ┌──────────────────────────────────────────────────────────┐          │
-│  │  │ ConvBNRelu×8 + ConvBNRelu(64→30) + AdaptiveAvgPool      │          │
-│  │  │ + Linear(30→30)                                          │          │
-│  │  │ → message_pred [B,30] (raw logits)                       │          │
-│  │  └──────────────────────────────────────────────────────────┘          │
-│  │                                                                        │
-│  ├───────────────────────────────────────────────────────────────────────┤
-│  │                                                                        │
-│  │  LOSS COMPUTATIONS                                                     │
-│  │                                                                        │
-│  │  ├─ Visual Loss ──────────────────────────────────────────────────┐    │
-│  │  │ L_pixel = MSE(encoded, cover)                                  │    │
-│  │  │ L_ssim = 1 - SSIM(encoded, cover)                              │    │
-│  │  │ L_visual = 1.0*L_pixel + 1.0*L_ssim                            │    │
-│  │  │ L_visual_noised = 同上(noised_encoded vs cover)                │    │
-│  │  └────────────────────────────────────────────────────────────────┘    │
-│  │                                                                        │
-│  │  ├─ Message Loss ─────────────────────────────────────────────────┐    │
-│  │  │ L_message = BCEWithLogits(message_pred, message)               │    │
-│  │  └────────────────────────────────────────────────────────────────┘    │
-│  │                                                                        │
-│  │  ├─ Adversarial Loss ─────────────────────────────────────────────┐    │
-│  │  │ D_train: HingeLoss(cover_logits, stego_logits, margin=1.0)     │    │
-│  │  │   disc_acc = (real>0.5 + fake<0.5)/2                          │    │
-│  │  │   仅当 adv>0 且 disc_acc<0.70 时更新D                          │    │
-│  │  │ L_adv = softplus(-stego_logits).mean()  [生成器视角]          │    │
-│  │  └────────────────────────────────────────────────────────────────┘    │
-│  │                                                                        │
-│  │  ├─ Privacy Loss (Phase 2 only) ──────────────────────────────────┐    │
-│  │  │ 1. CLIP features:                                               │    │
-│  │  │    f_cover = ContentRecognizer(cover).detach()  [B,512]        │    │
-│  │  │    f_encoded = ContentRecognizer(encoded)       [B,512]        │    │
-│  │  │ 2. DINO features:                                               │    │
-│  │  │    dino_cover = DINOv2(cover, allow_grad=False)  [B,384]      │    │
-│  │  │    dino_encoded = DINOv2(encoded, allow_grad=True) [B,384]    │    │
-│  │  │ 3. Memory bank update + hard negatives:                         │    │
-│  │  │    clip_mem.update(f_cover)                                     │    │
-│  │  │    clip_neg = clip_mem.get_hard_negatives(f_encoded, k=5)      │    │
-│  │  │    dino_mem.update(dino_cover)                                  │    │
-│  │  │    dino_neg = dino_mem.get_hard_negatives(dino_encoded, k=5)   │    │
-│  │  │ 4. FeatureRedirectionLoss:                                      │    │
-│  │  │    escape_margin = get_escape_margin(phase, epoch)              │    │
-│  │  │    L_privacy = 1.0*L_clip_escape + 0.6*L_clip_redirect         │    │
-│  │  │             + 0.5*L_dino_escape + 0.3*L_dino_redirect          │    │
-│  │  └────────────────────────────────────────────────────────────────┘    │
-│  │                                                                        │
-│  │  ├─ FFT Loss (Phase 2 only) ──────────────────────────────────────┐    │
-│  │  │ L_fft = sqrt(mean(|FFT_high_freq(prv_r)|²))                   │    │
-│  │  └────────────────────────────────────────────────────────────────┘    │
-│  │                                                                        │
-│  │  ├─ Total Loss ────────────────────────────────────────────────────┐    │
-│  │  │ L_total = 10.0*(L_visual + 0.3*L_visual_noised)                │    │
-│  │  │        + w_message*L_message + 0.5*L_adv                       │    │
-│  │  │        + w_privacy*L_privacy + 0.5*L_residual                  │    │
-│  │  │        + 10.0*L_fft                                            │    │
-│  │  │  (Phase 2 前1/3: message=20.0, privacy=2.0)                    │    │
-│  │  │  (Phase 2 中1/3: message=15.0, privacy=4.0)                    │    │
-│  │  │  (Phase 2 后1/3: message=10.0, privacy=5.0)                    │    │
-│  │  └────────────────────────────────────────────────────────────────┘    │
-│  │                                                                        │
-│  ├───────────────────────────────────────────────────────────────────────┤
-│  │                                                                        │
-│  │  OPTIMIZER STEPS                                                       │
-│  │  1. optimizer_encoder_decoder.zero_grad()                              │
-│  │  2. L_total.backward()                                                │
-│  │  3. [If phase==2 && msg_head_frozen]: zero msg_head grads             │
-│  │  4. clip_grad_norm(enc+dec params, max_norm=1.0)                      │
-│  │  5. optimizer_encoder_decoder.step()                                   │
-│  │                                                                        │
-│  └───────────────────────────────────────────────────────────────────────┘
-│                                                                         │
-│  输出                                                                     │
-│  losses dict: {L_pixel, L_ssim, L_visual, L_message, L_adv,            │
-│               L_privacy, L_fft, L_total, bit_accuracy, escape_margin,  │
-│               D_acc, prv_noise_ratio, privacy_clip_escape, ...}        │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 14. 使用指南
-
-### 14.1 环境依赖
-
-```
-torch>=2.0.0
-torchvision>=0.15.0
-ftfy
-regex
-tqdm
-Pillow
-tensorboard
-numpy
-timm
-git+https://github.com/openai/CLIP.git
-```
-
-### 14.2 启动训练
+依赖安装（仓库已 vendored `CLIP/`，从项目根运行时 `import clip` 直接命中，无需额外安装；也可 `pip install git+https://github.com/openai/CLIP.git`）：
 
 ```bash
-# 新建实验（基础训练，无噪声）
-python train.py new --data-dir /path/to/dataset --name my_experiment
+pip install torch torchvision timm pillow numpy matplotlib tensorboard
+```
 
-# 新建实验（带JPEG压缩噪声）
-python train.py new --data-dir /path/to/dataset --name exp_with_noise \
-    --noise "jpeg"
+### 13.2 训练
 
-# 新建实验（组合多种噪声）
-python train.py new --data-dir /path/to/dataset --name exp_combined \
-    --noise "cropout((0.55,0.6),(0.55,0.6))+dropout((0.9,0.95))"
+```bash
+# 从头训练（深挖配方已全部设为代码默认值；数据集默认 ./dataset1）
+python train.py new --name full_run
 
-# 自定义超参数
-python train.py new --data-dir /path/to/dataset --name custom_exp \
-    --epochs-phase1 150 --epochs-phase2 100 \
-    --lr-encoder 1e-3 --lr-decoder 1e-3 --lr-steganalyzer 1e-4 \
-    --disc-acc-high 0.70 --disc-hinge-margin 1.0 \
-    --phase1-adv-start 0.0 --phase1-adv-mid 0.25 --phase1-adv-end 0.75 \
-    --phase2-adv 0.5 \
-    --lambda-pixel 1.0 --lambda-ssim 1.0
+# 指定数据集与常用参数
+python train.py new --data-dir ./dataset --name my_experiment \
+  --batch-size 35 --size 256 --message 30 \
+  --epochs-phase1 150 --epochs-phase2 100 \
+  --noise "jpeg+resize(0.8,1.2)+quant" --seed 42
 
-# 断点续训
+# 冒烟测试（约 1 轮 Phase 1；本地 CPU 显式传 --batch-size 1）
+python train.py new --data-dir ./dataset --name smoke \
+  --epochs-phase1 1 --epochs-phase2 0 --batch-size 1 --num-workers 0 --save-interval 1
+
+# 断点续训（携带绝对轮号）
 python train.py continue --folder ./experiments/my_experiment
+
+# 热启动重训隐私支路（纯权重初始化，训练计划由本次 CLI 决定）
+python train.py new --data-dir ./dataset --name privacy_v2 \
+  --continue-from-folder ./experiments/old_exp \
+  --epochs-phase1 0 --epochs-phase2 100
 ```
 
-### 14.3 运行验证
+### 13.3 隐私深挖配方（更大预算与 margin，现为默认值，显式写出便于回溯）
 
 ```bash
-# 完整验证（编码→解码→检测→隐私评估）
-python validation_script.py \
-    -c ./experiments/my_experiment/checkpoints/checkpoint.pth \
-    -i ./test_image.jpg \
-    -m "101000100110100101100011100010" \
-    --mode full \
-    -o ./output
-
-# 仅判别器检测
-python validation_script.py -c checkpoint.pth -i image.png --mode discriminator
-
-# 仅解码消息
-python validation_script.py -c checkpoint.pth -i stego.png --mode decode
-
-# 相似度判断（需提供原图和隐写图）
-python validation_script.py -i encoded_image.png --cover cover_image.png --mode similarity
+python train.py new --name deep_escape \
+  --continue-from-folder ./experiments/warm \
+  --epochs-phase1 0 --epochs-phase2 100 --sprint-epochs 20 --refine-epochs 80 \
+  --prv-budget 0.08 --privacy-margin-end 0.50 --dino-margin-end 0.20
 ```
 
-### 14.4 监控训练
+### 13.4 验证与评估
+
+见[第 11 章](#11-验证与评估工具链-val)各节命令示例。常用：
+
+```bash
+# 单图完整验证（默认 30 步精修 + 色度投影 + 可视化报告）
+python val/validation_script.py -c ./experiments/exp/checkpoints/checkpoint.pth \
+  -i ./test.jpg -m "101000100110100101100011100010" --mode full -o output
+
+# 关闭精修 / 回落标准配方
+python val/validation_script.py -c ... -i ./test.jpg -m "101..." -o output --refine-steps 0
+python val/validation_script.py -c ... -i ./test.jpg -m "101..." -o output \
+  --refine-budget 0.04 --refine-margin 0.30
+
+# 单图基线（网络直出）
+python val/baseline_validation.py -c ./other/checkpoint.pth -i ./other/test.jpg \
+  -m "101000100110100101100011100010" --device cpu -o other/baseline_output
+
+# 批量 / 检索评估（精修版与基线版）
+python val/batch_eval.py -c ./other/checkpoint.pth --num-images 200 -o other/batch_eval --device cpu
+python val/batch_baseline.py -c other/checkpoint.pth --num-images 200 -o other/batch_baseline --device cpu
+python val/retrieval_eval.py -c ./other/checkpoint.pth --num-queries 100 --gallery-size 1000 \
+  -o other/retrieval_eval --device cpu
+python val/retrieval_baseline.py -c other/checkpoint.pth --num-queries 100 --gallery-size 1000 \
+  -o other/retrieval_baseline --device cpu
+
+# 全链路一键验证（冒烟门控 + 断点续跑 + 汇总对照表）
+python val/run_full_validation.py -c ./experiments/full_run/checkpoints/checkpoint_best.pth \
+  --val-dir ./dataset/test -o ./other/full_validation
+
+# 仅重出报告（不加载模型）
+python val/batch_eval.py --report-only -o other/batch_eval
+python val/retrieval_eval.py --report-only -o other/retrieval_eval
+python val/batch_baseline.py --report-only -o other/batch_baseline
+python val/retrieval_baseline.py --report-only -o other/retrieval_baseline
+python val/run_full_validation.py --report-only -o other/full_validation
+```
+
+### 13.5 监控训练
+
+启用 `--tensorboard` 后：
 
 ```bash
 tensorboard --logdir experiments/my_experiment/tensorboard
 ```
 
-TensorBoard中可查看的标量：
-- `Phase{1,2}/Train/{L_total, L_visual, L_message, L_adv, L_privacy, L_fft, bit_accuracy, escape_margin, D_acc, ...}`
-- `Phase{1,2}/Val/{L_total, L_visual, L_message, L_adv, L_privacy, ...}`
+### 13.6 噪声层配置语法
 
-### 14.5 噪声层配置语法
+```bash
+--noise "jpeg"                                  # 单层
+--noise "jpeg+resize(0.8,1.2)"                  # 组合（+ 分隔）
+--noise "cropout((0.55,0.6),(0.55,0.6))+jpeg"   # 带参数
+```
 
-| 命令 | 格式 | 说明 |
-|------|------|------|
-| identity | `identity` | 无操作 |
-| cropout | `cropout((hmin,hmax),(wmin,wmax))` | 裁剪替换 |
-| crop | `crop((hmin,hmax),(wmin,wmax))` | 随机裁剪 |
-| dropout | `dropout((keep_min,keep_max))` | 像素丢弃 |
-| resize | `resize((min_ratio,max_ratio))` | 随机缩放 |
-| jpeg | `jpeg` | JPEG压缩 |
-| quant | `quant` | 量化 |
-| 组合 | `cmd1+cmd2+...` | 用+号连接，每次随机选一种 |
+### 13.7 CLIP 一致性测试（vendored 包）
+
+```bash
+python -m pytest CLIP/tests/test_consistency.py
+```
+
+（需要 pytest；当前仓库根目录没有项目级 lint、format 或主测试配置。）
 
 ---
 
 ## 附录A：关键超参数速查表
 
-| 类别 | 参数 | 默认值 | 作用 |
-|------|------|--------|------|
-| 图像 | image_size | 256 | 输入分辨率 |
-| 消息 | message_length | 30 | 隐藏比特数 |
-| 训练 | batch_size | 8 | 批次大小 |
-| LR | lr_encoder | 1e-3 | 编码器学习率 |
-| LR | lr_decoder | 1e-3 | 解码器学习率 |
-| LR | lr_steganalyzer | 1e-4 | 判别器学习率 |
-| λ | lambda_pixel | 1.0 | MSE权重 |
-| λ | lambda_ssim | 1.0 | SSIM权重 |
-| λ | lambda_fft | 10.0 | FFT高频惩罚权重（Phase 2） |
-| 预算 | msg_budget | 0.04 | 消息残差预算 |
-| 预算 | prv_budget | 0.04 | 隐私残差预算 |
-| 纹理 | texture_mask_strength | 3.0 | 纹理掩码 sigmoid 斜率 |
-| 纹理 | texture_mask_smooth_kernel | 5 | 纹理掩码平滑核大小 |
-| 对抗 | disc_acc_high | 0.70 | 判别器准确率上限 |
-| 对抗 | disc_hinge_margin | 1.0 | Hinge Loss margin |
-| 对抗 | phase1_adv_start | 0.0 | Phase 1 前段对抗权重 |
-| 对抗 | phase1_adv_mid | 0.25 | Phase 1 中段对抗权重 |
-| 对抗 | phase1_adv_end | 0.75 | Phase 1 后段对抗权重 |
-| 对抗 | phase2_adv | 0.5 | Phase 2 对抗权重 |
-| 噪声 | phase1_prv_noise_start | 0.50 | Phase 1 隐私噪声开始比例 |
-| 噪声 | phase1_prv_noise_end | 0.90 | Phase 1 隐私噪声上限比例 |
-| 噪声 | phase1_prv_noise_max_ratio | 0.50 | Phase 1 隐私噪声最大比例 |
-| 噪声 | phase1_prv_noise_power | 2.0 | Phase 1 隐私噪声幂律指数 |
-| 噪声 | phase1_prv_noise_smooth_kernel | 7 | Phase 1 隐私噪声平滑核 |
-| 隐私 | privacy_margin_start | 0.15 | 起始逃逸margin |
-| 隐私 | privacy_margin_end | 0.30 | 结束逃逸margin |
-| 隐私 | clip_weight | 1.0 | CLIP特征逃逸权重 |
-| 隐私 | dino_weight | 0.5 | DINOv2特征逃逸权重 |
-| 重定向 | use_clip_redirect | False | 启用有向重定向 |
-| 重定向 | clip_redirect_weight | 0.6 | CLIP重定向权重 |
-| 重定向 | dino_redirect_weight | 0.3 | DINO重定向权重 |
-| 重定向 | clip_redirect_margin | 0.35 | CLIP重定向margin |
-| 重定向 | clip_max_target_sim | 0.55 | CLIP最大允许相似度 |
-| 重定向 | dino_redirect_margin | 0.3 | DINO重定向margin |
-| 重定向 | dino_max_target_sim | 0.55 | DINO最大允许相似度 |
-| 记忆库 | clip_memory_size | 5000 | 记忆库容量 |
-| 记忆库 | clip_hard_negative_k | 5 | 硬负样本数 |
-| 记忆库 | memory_warmup_batches | 50 | 预热批次数 |
-| 恢复 | bit_accuracy_threshold | 0.90 | 恢复触发阈值 |
-| 恢复 | recovery_steps | 10 | 恢复训练批次数 |
-| 阶段 | P1 epochs | 150 | 基础+渐进对抗训练 |
-| 阶段 | P2 epochs | 100 | 隐私保护训练 |
-| 其他 | discriminator_loss_threshold | 0.6 | 判别器损失阈值（遗留） |
-| 其他 | num_workers | 4 | 数据加载线程 |
-| 其他 | save_interval | 10 | 检查点保存间隔 |
-| 其他 | seed | 42 | 随机种子 |
+| 参数 | 默认值 | CLI 覆盖 |
+| --- | --- | --- |
+| `image_size` | 256 | `--size` |
+| `message_length` | 30 | `--message` |
+| `batch_size` | 35（A100 口径） | `--batch-size` |
+| `num_epochs_phase1` / `num_epochs_phase2` | 150 / 100 | `--epochs-phase1` / `--epochs-phase2` |
+| `msg_budget` / `prv_budget` | 0.04 / 0.08 | `--prv-budget` |
+| `privacy_margin_end` | 0.50 | `--privacy-margin-end` |
+| `dino_escape_margin_end` | 0.20 | `--dino-margin-end` |
+| `prv_lowres_size` | 96 | — |
+| `prv_head_lr_mult` | 5.0 | — |
+| `phase2_sprint_epochs` | 40 | `--sprint-epochs` |
+| `phase2_refine_epochs` | 30 | `--refine-epochs` |
+| `distill_inner_steps` | 10 | `--distill-steps` |
+| `distill_weight` | 25.0 | `--distill-weight` |
+| `lambda_fft` | 50.0 | — |
+| `privacy_noised_ratio` | 0.3 | — |
+| `use_clip_redirect` | True | — |
+| `clip_redirect_target_sim` / `dino_redirect_target_sim` | 0.85 / 0.60 | — |
+| `clip/dino_redirect_exclude_sim` | 0.92 / 0.87 | — |
+| `clip/dino_max_target_sim` | 0.90 / 0.65 | — |
+| `dino_weight` | 0.5 | — |
+| `refine_chroma_projection` | True | `--refine-chroma-projection`（val 脚本） |
+| `noise_config` | jpeg+resize(0.8,1.2)+quant | `--noise` |
+| `bit_accuracy_threshold` | 0.90 | — |
+| `recovery_steps` | 10 | — |
+| `lr_encoder` / `lr_decoder` / `lr_steganalyzer` | 1e-3 / 1e-3 / 1e-4 | `--lr-*` |
+| `memory_warmup_batches` | 50 | — |
+| 各阶段 adv / noised 权重 | 0.0 | `--phase1-adv-*` / `--phase2-adv` |
+| 纹理掩码下限 | 0.15 | — |
 
-## 附录B：模型参数量汇总
+## 附录B：输出文件清单
 
-| 模型 | 近似参数量 | 可训练 |
-|------|-----------|--------|
-| Encoder (Dual-Head, 128ch, 16blocks) | ~2.99M | ✓ (阶段性冻结部分头) |
-| Decoder (CNN, 64ch, 8blocks) | ~278K | ✓ |
-| Steganalyzer (CNN+SN, 双层FC) | ~4.7M | ✓ |
-| ContentRecognizer (CLIP ViT-B/32) | ~150M | ✗ (冻结) |
-| DINOv2 (ViT-S/14) | ~22M | ✗ (冻结) |
-| CLIP Memory Bank | ~10M (5000×512×4B) | buffer only |
-| DINO Memory Bank | ~7.7M (5000×384×4B) | buffer only |
-| **总可训练** | **~7.97M** | |
+**训练（`experiments/<name>/`）**：
+
+```
+config.json              # 训练配置（continue 子命令恢复用）
+train.log                # 训练日志
+checkpoints/
+  ├── checkpoint.pth                 # 最新（含绝对轮号、优化器、记忆库、best_loss_phase）
+  ├── checkpoint_best.pth            # 多准则最优
+  └── checkpoint_phase{N}_epoch{M}.pth
+  └── visualizations/phase{N}_epoch{M}.png   # 验证时保存的原图-编码图对照
+tensorboard/             # TensorBoard 事件日志
+```
+
+**单图验证（`-o` 输出目录）**：`cover_image.png` / `encoded_image.png` / `report.html` / `panel_images.png` / `panel_trajectory.png` / `panel_privacy.png` / `panel_message.png`。
+
+**单图基线（`baseline_validation.py`）**：`cover_image.png` / `encoded_image.png` / 指标输出（无 report.html）。
+
+**批量评估（精修版与基线版）**：`results.json`（断点续跑）/ `summary.json` / `details.csv` / `report.html` / `panel_dist.png` / `panel_dumbbell.png` / `panel_pareto.png` / `panel_robustness.png`（基线版默认不含精修图，`--save-images` 可开）。
+
+**检索评估（精修版与基线版）**：`results.json`（断点续跑）/ `summary.json` / `eval_meta.json` / `gallery_feats.pt`（图库特征缓存，两脚本共用）/ `report.html` / `panel_rankhist.png` / `panel_rankcdf.png` / `panel_rankscatter.png` / `panel_sims.png`。
+
+**独立精修（`refine_encode.py`）**：每图 `metrics.json` + 汇总 `summary.json`。
+
+**全链路（`run_full_validation.py`）**：输出根目录下五个子目录（`_smoke/`、`single/`、`batch_baseline/`、`retrieval_baseline/`、`batch_eval/`、`retrieval_eval/`）+ 顶层 `full_summary.json` / `full_summary.md`（三列对照汇总，可直接进论文）。
 
 ## 附录C：术语表
 
-| 术语 | 英文 | 解释 |
-|------|------|------|
-| 隐写 | Steganography | 将秘密信息隐藏在载体中的技术 |
-| 载体图像 | Cover Image | 用于承载秘密信息的原始图像 |
-| 隐写图像 | Stego/Encoded Image | 嵌入了秘密信息的图像 |
-| 编码器 | Encoder | 将消息嵌入载体图像的网络 |
-| 解码器 | Decoder | 从图像中提取消息的网络 |
-| 隐写分析器 | Steganalyzer | 检测图像是否含隐写信息的分类器 |
-| 谱归一化 | SpectralNorm | 限制权重矩阵谱范数的正则化技术 |
-| SSIM | Structural Similarity | 结构相似性指数 |
-| 特征逃逸 | Feature Escape | 在特征空间中拉开原始/编码图像的距离 |
-| 有向重定向 | Directed Redirection | 将编码图像特征拉向无关负样本 |
-| 硬负样本 | Hard Negative | 与查询样本最相似的负样本 |
-| 记忆库 | Memory Bank | 存储历史特征向量的循环缓冲区 |
-| Softplus Loss | | log1p(exp(x)) 形式的平滑损失函数 |
-| 预算约束 | Budget Constraint | 通过tanh×budget限制残差幅度的机制 |
-| 双残差头 | Dual-Residual Head | 编码器中消息头和隐私头的双分支架构 |
-| 头部冻结 | Head Freezing | 训练中冻结特定头部参数的策略 |
-| 解码器恢复 | Decoder Recovery | 比特准确率下降时重新训练解码器的机制 |
-| 渐进逃逸边界 | Progressive Escape Margin | 逃逸margin从0.15线性增长到0.30的策略 |
-| DCT | Discrete Cosine Transform | 离散余弦变换 |
-| CLIP | Contrastive Language-Image Pre-training | OpenAI的图文对比学习模型 |
-| DINOv2 | Self-distilled Vision Transformers | Meta的自监督视觉模型 |
-| GAN | Generative Adversarial Network | 生成对抗网络 |
-| Hinge Loss | | max(0, margin - score) 形式的损失函数 |
-| 纹理掩码 | Texture Mask | 基于梯度幅值的空间权重图，将扰动集中在纹理区域 |
-| FFT 高频惩罚 | FFT High-Freq Loss | 对残差 FFT 频谱中高频分量幅度的惩罚项 |
-| 判别器准确率门控 | Disc Accuracy Gating | 判别器准确率达到阈值时暂停更新的机制 |
-| 二次 Hinge 逃逸 | Quadratic Hinge Escape | relu(diff)² 形式的逃逸损失，对违反约束施加强梯度 |
-
----
-
-*本文档基于 PrivSteg 项目源码生成，涵盖全部模块的实现细节与技术原理。*
+| 术语 | 含义 |
+| --- | --- |
+| Cover / 载体图像 | 原始未修改图像 |
+| Encoded / 编码图像 | 嵌入消息与隐私残差后的图像 |
+| msg_residual | 消息残差（`msg_budget × tanh` 约束） |
+| prv_residual | 隐私残差（低通 + `prv_budget × tanh` + 纹理掩码约束） |
+| Escape / 逃逸 | 使编码图特征偏离原载体（CLIP/DINO 余弦相似度下降） |
+| Redirect / 有向重定向 | 把特征推向记忆库硬负样本方向，约束逃逸去向 |
+| Hard negative | 记忆库中与当前编码特征最相似的其他载体特征 |
+| Escape margin | 二次 Hinge 逃逸目标的边界（目标 sim < 1 − margin） |
+| Sprint / Balance / Refine | Phase 2 三段调度：纯逃逸冲刺 / 多目标平衡 / 终段精修配方 |
+| 内环蒸馏 | 每个 train step 内跑 N 步逐图优化得到教师残差并蒸进网络 |
+| 逐图精修 | 部署时冻结网络、仅优化单图隐私残差场的编码期优化 |
+| 不劣化保证 | 精修只在 bit_acc=100% 的可行状态内选优，初始候选为网络原始输出 |
+| 色度投影 | 精修收敛后剔除 prv 残差 8×8 网格低频色度分量的事后处理（门控回退） |
+| 摊销鸿沟 | 一次前向（摊销求解）与逐图最优解之间的性能差距 |
+| CBIR | 基于内容的图像检索（以图搜图），本系统的隐私威胁模型 |
+| 自检 | 检索评估中原图自查询应 100% top-1 的特征链路校验 |
+| 冒烟门控 | run_full_validation 在全量评估前的小规模自检关卡 |
+| 图库特征缓存 | `gallery_feats.pt` 按路径列表缓存图库 CLIP 特征，基线/精修检索脚本共用 |
+| uint8 往返 | 内存内模拟 PNG 8bit 量化的保存-重载循环 |
+| 断点续跑 | 评估脚本按 `results.json` 已完成记录自动跳过的增量执行 |
+| Recovery | bit_acc 低于阈值时在含噪完整编码图上重训 decoder 的机制 |
+| 热启动 | `new --continue-from-folder` 纯权重初始化（不携带绝对轮号） |

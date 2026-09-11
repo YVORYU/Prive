@@ -71,9 +71,11 @@ class FeatureMemoryBank:
     # 参数:
     #   features: 查询特征张量 [B, D]（应为归一化后的 CLIP/DINO 特征）
     #   k: 每个查询返回的 hard negative 数量，默认 5
+    #   exclude_sim: 候选排除阈值；与 query 相似度超过该值的候选（自身副本、
+    #     近重复图、同身份照片）被排除，避免重定向目标退化为"自己"
     # 返回:
     #   [B, k, D] 的 hard negative 特征张量；若记忆库为空则返回 None
-    def get_hard_negatives(self, features, k=5):
+    def get_hard_negatives(self, features, k=5, exclude_sim=None):
         # 记忆库尚未填充时直接返回 None，调用方需判空
         if self.memory_count == 0:
             return None
@@ -83,9 +85,12 @@ class FeatureMemoryBank:
         valid_memory = self.memory_bank[:self.memory_count]
         # 通过矩阵乘法计算查询与每个记忆特征的余弦相似度（因为已归一化）
         similarities = torch.mm(features, valid_memory.t())
+        # 排除过于相似的候选：它们会使重定向与 escape 目标对冲（拉向自己/同人）
+        if exclude_sim is not None:
+            similarities = similarities.masked_fill(similarities > exclude_sim, -1.0)
         # k 不能超过当前记忆库实际容量
         actual_k = min(k, self.memory_count)
-        # 取相似度最大的 k 个索引（这些是最"危险"的 hard negative）
+        # 取相似度最大的 k 个索引（这些是排除后最"危险"的 hard negative）
         _, indices = similarities.topk(actual_k, dim=1)
         # 根据索引从记忆库中取出对应特征
         hard_negatives = valid_memory[indices]
@@ -135,7 +140,8 @@ class Trainer:
             prv_budget=cfg.prv_budget,  # 隐私残差预算
             phase1_prv_noise_smooth_kernel=cfg.phase1_prv_noise_smooth_kernel,  # Phase1 隐私噪声平滑核大小
             texture_mask_strength=cfg.texture_mask_strength,  # 纹理掩码强度
-            texture_mask_smooth_kernel=cfg.texture_mask_smooth_kernel  # 纹理掩码平滑核大小
+            texture_mask_smooth_kernel=cfg.texture_mask_smooth_kernel,  # 纹理掩码平滑核大小
+            prv_lowres_size=getattr(cfg, 'prv_lowres_size', 96)  # 隐私残差低分辨率约束尺寸
         ).to(self.device)
         # 解码器：从（含噪）编码图像预测 message logits
         self.decoder = Decoder(message_length=cfg.message_length, n_channels=3).to(self.device)
@@ -144,9 +150,16 @@ class Trainer:
         # 内容识别器：冻结的 CLIP ViT-B/32，用于提取图像/文本特征并做归一化
         self.content_recognizer = ContentRecognizer(device=self.device).to(self.device)
 
-        # 编码器与解码器共用一个 Adam 优化器（不同学习率）
+        # 编码器与解码器共用一个 Adam 优化器（不同学习率）；
+        # prv_head 与 prv_trunk（隐私独立支路）共用单独参数组、学习率 ×prv_head_lr_mult：
+        # CLIP 逃逸方向逐图不同，Adam 在多目标拉扯下信噪比失效（权重放大 loss 不改变步长），
+        # 只有提高 lr 能放大其实际更新步长
+        prv_prefixes = ('prv_head', 'prv_trunk')
+        encoder_non_prv = [p for n, p in self.encoder.named_parameters() if not n.startswith(prv_prefixes)]
+        encoder_prv = [p for n, p in self.encoder.named_parameters() if n.startswith(prv_prefixes)]
         self.optimizer_encoder_decoder = optim.Adam([
-            {"params": self.encoder.parameters(), "lr": cfg.lr_encoder},  # 编码器学习率
+            {"params": encoder_non_prv, "lr": cfg.lr_encoder},  # 编码器主体学习率
+            {"params": encoder_prv, "lr": cfg.lr_encoder * getattr(cfg, 'prv_head_lr_mult', 5.0)},  # prv_head 加速
             {"params": self.decoder.parameters(), "lr": cfg.lr_decoder},  # 解码器学习率
         ])
         # 判别器单独的 Adam 优化器
@@ -164,10 +177,12 @@ class Trainer:
             escape_margin=cfg.privacy_margin_start,  # escape hinge 的初始 margin
             clip_redirect_weight=cfg.clip_redirect_weight,  # CLIP hard negative redirect 权重
             dino_redirect_weight=cfg.dino_redirect_weight,  # DINO hard negative redirect 权重
-            clip_redirect_margin=cfg.clip_redirect_margin,  # CLIP redirect margin
-            dino_redirect_margin=cfg.dino_redirect_margin,  # DINO redirect margin
+            clip_redirect_margin=cfg.clip_redirect_margin,  # CLIP redirect margin（遗留）
+            dino_redirect_margin=cfg.dino_redirect_margin,  # DINO redirect margin（遗留）
             clip_max_target_sim=cfg.clip_max_target_sim,  # CLIP 目标相似度上限
-            dino_max_target_sim=cfg.dino_max_target_sim  # DINO 目标相似度上限
+            dino_max_target_sim=cfg.dino_max_target_sim,  # DINO 目标相似度上限
+            clip_redirect_target_sim=getattr(cfg, 'clip_redirect_target_sim', 0.80),  # CLIP 重定向目标相似度
+            dino_redirect_target_sim=getattr(cfg, 'dino_redirect_target_sim', 0.55)  # DINO 重定向目标相似度
         ).to(self.device)
 
         self.use_clip_redirect = cfg.use_clip_redirect  # 是否启用 CLIP/DINO hard negative redirect
@@ -278,6 +293,10 @@ class Trainer:
         self.has_noise = not (len(self.noiser._layer_names) == 1 and self.noiser._layer_names[0] == 'identity')
 
         self.best_loss = float('inf')  # 记录历史最佳验证损失，用于 best checkpoint 判断
+        # best_loss 所属阶段：Phase 1 准则是 L_message，Phase 2 准则是 clip_sim+dino_sim，
+        # 两者数值不可比。train.py 检测到阶段切换时重置 best_loss，否则从 Phase 1
+        # 进入 Phase 2 后 best 分数永远高于 Phase 1 收敛的 L_message，best 冻结不再更新
+        self.best_loss_phase = None
         self.phase2_msg_head_frozen = False  # 标记 Phase 2 中 msg_head 是否已被冻结
 
     # 构建训练与验证的 DataLoader
@@ -350,14 +369,18 @@ class Trainer:
             param.requires_grad = True
         self.phase2_msg_head_frozen = False
 
-    # 冻结编码器的 prv_head：Phase 1 中使用，防止隐私残差头过早学习
+    # 冻结隐私支路（prv_head 与 prv_trunk）：Phase 1 中使用，防止隐私残差头过早学习
     def freeze_prv_head(self):
         for param in self.encoder.prv_head.parameters():
             param.requires_grad = False
+        for param in self.encoder.prv_trunk.parameters():
+            param.requires_grad = False
 
-    # 解冻 prv_head：Phase 2 中开启隐私残差头的训练
+    # 解冻隐私支路：Phase 2 中开启 prv_head 与 prv_trunk 的训练
     def unfreeze_prv_head(self):
         for param in self.encoder.prv_head.parameters():
+            param.requires_grad = True
+        for param in self.encoder.prv_trunk.parameters():
             param.requires_grad = True
 
     # 冻结共享层（conv_layers 与 after_concat_layer）
@@ -384,11 +407,18 @@ class Trainer:
             param.requires_grad = requires_grad
 
     # 计算 FFT 高频能量损失（仅 Phase 2 启用）
-    # 用途：惩罚隐私残差中的高频成分，避免在频域暴露隐写痕迹
-    # 参数: residual - 隐私残差张量 [B, 3, H, W]
-    # 返回: 标量损失（高频幅值均值的平方根）
+    # 用途：惩罚隐私残差中的高频成分，避免在频域暴露隐写痕迹/可见条纹
+    # 参数:
+    #   residual - 隐私残差张量 [B, 3, H, W]
+    #   radius_ratio - 高频判定半径占奈奎斯特半径的比例（0.25 覆盖周期<8px 的条纹频段）
+    # 返回: 标量损失（高频幅值均值，线性形式梯度稳定）
+    # 实现说明（修复点）：
+    #   1) 原半径 min(H,W)//4 只覆盖 r>64 的极高频，周期 4~8px 的可见条纹（r=32~64）完全豁免；
+    #      现半径由 radius_ratio 控制，默认奈奎斯特的 0.25 倍（256 图约 r=32）。
+    #   2) 原 sqrt(mean(A)) 形态梯度随违规增大而递减（病态）；现改为 mean(A) 线性形式，
+    #      梯度恒定，与违规程度成正比。
     @staticmethod
-    def _fft_high_freq_loss(residual):
+    def _fft_high_freq_loss(residual, radius_ratio=0.25):
         # 二维 FFT（正交归一化），得到复数频谱
         fft = torch.fft.fft2(residual, norm='ortho')
         amplitude = torch.abs(fft)  # 取幅值
@@ -401,10 +431,11 @@ class Trainer:
         x = torch.arange(W, device=residual.device).float().unsqueeze(0)
         # 到中心的欧氏距离矩阵
         dist = torch.sqrt((y - cy) ** 2 + (x - cx) ** 2)
-        radius = min(H, W) // 4  # 高频判定半径
+        # 奈奎斯特半径 = min(H,W)//2，按配置比例确定高频判定半径
+        radius = max(1, int((min(H, W) // 2) * radius_ratio))
         mask = (dist > radius).float()  # 半径之外为高频区域
-        # 返回高频幅值均值的平方根（加小常数防数值问题）
-        return torch.sqrt((amplitude * mask).mean() + 1e-8)
+        # 返回高频幅值均值（线性惩罚，梯度稳定）
+        return (amplitude * mask).mean()
 
     # 判别器 Hinge 损失：margin 默认 1.0
     # 参数:
@@ -473,6 +504,72 @@ class Trainer:
         metrics = self._disc_metrics(real_logits, fake_logits)
         return L_D, L_adv, discr_cover_bce, discr_encod_bce, metrics
 
+    # 内环逐图优化（方案 C 的教师生成器）：
+    # 冻结全部网络参数，把当前 batch 的低分辨率隐私残差场（与编码器内部低通约束
+    # 同一变量空间）作为唯一优化变量，跑 distill_inner_steps 步 Adam 直接优化。
+    # 目标函数与逐图精修试点（val/refine_encode.py，已实测 clip_sim 0.94→0.55~0.65
+    # 且 bit_acc/PSNR/SSIM 不劣化）完全一致：
+    #   escape(CLIP/DINO，margin 取 end 值) + 消息双分支 BCE + 视觉 MSE/SSIM
+    # 约束链与训练同构（低通→tanh×预算→纹理掩码→clamp）。
+    # 返回教师隐私残差（detached）；步数<=0 或无隐私残差时返回 None。
+    # 说明：内环反向只经过 delta（叶子），不触碰编码器参数；Balance 段 decoder
+    # 可训练时其梯度会被内环污染，但随后 train_step 的 zero_grad() 会清除，无副作用。
+    def _refine_teacher_residual(self, cover_image, message, msg_residual, prv_residual,
+                                 feat_cover, dino_cover):
+        cfg = self.cfg
+        steps = getattr(cfg, 'distill_inner_steps', 0)
+        if steps <= 0 or prv_residual is None:
+            return None
+        H, W = cover_image.shape[-2], cover_image.shape[-1]
+        lowres = getattr(cfg, 'prv_lowres_size', 96)
+        budget = self.encoder.prv_budget
+
+        # 从网络当前输出热启动（与逐图精修一致）：反解 tanh 前的低分辨率场
+        with torch.no_grad():
+            texture_mask = self.encoder._compute_texture_mask(cover_image)
+            ratio = (prv_residual.detach() / (budget * texture_mask + 1e-8)).clamp(-0.95, 0.95)
+            delta = F.adaptive_avg_pool2d(torch.atanh(ratio), (lowres, lowres))
+        delta = delta.detach().clone()
+        delta.requires_grad_(True)
+        opt = optim.Adam([delta], lr=getattr(cfg, 'distill_lr', 0.1))
+
+        w_privacy = getattr(cfg, 'distill_w_privacy', 12.0)
+        w_message = getattr(cfg, 'distill_w_message', 10.0)
+        w_visual = getattr(cfg, 'distill_w_visual', 15.0)
+        msg_residual = msg_residual.detach()
+
+        for _ in range(steps):
+            opt.zero_grad(set_to_none=True)
+            # 与编码器 Phase 2 相同的约束链：低通上采样 -> tanh 预算 -> 纹理掩码
+            prv_up = F.interpolate(delta, size=(H, W), mode='bicubic', align_corners=False)
+            prv = budget * torch.tanh(prv_up) * texture_mask
+            encoded = torch.clamp(cover_image + msg_residual + prv, -1, 1)
+
+            # 逃逸损失：escape-only（无 redirect），margin 固定 end 值（与验证配方一致）
+            feat_enc = self.content_recognizer(encoded)
+            dino_enc = self.extract_dino_features(encoded, allow_grad=True) if dino_cover is not None else None
+            L_priv, _ = self.retrieval_escape_loss(
+                feat_cover, feat_enc,
+                dino_cover=dino_cover, dino_encoded=dino_enc,
+                escape_margin=cfg.privacy_margin_end,
+                dino_escape_margin=cfg.dino_escape_margin_end
+            )
+
+            # 消息双分支：干净 + 含噪各 0.5（Phase 2 干净分支比例即 0.5）
+            L_msg = 0.5 * self.bce_with_logits_loss(self.decoder(encoded), message)
+            noised_enc, _ = self.noiser((encoded, cover_image))
+            L_msg = L_msg + 0.5 * self.bce_with_logits_loss(self.decoder(noised_enc), message)
+
+            L_vis = self.mse_loss(encoded, cover_image) + self.ssim_loss(cover_image, encoded)
+
+            L = w_privacy * L_priv + w_message * L_msg + w_visual * L_vis
+            L.backward()
+            opt.step()
+
+        with torch.no_grad():
+            prv_up = F.interpolate(delta, size=(H, W), mode='bicubic', align_corners=False)
+            return budget * torch.tanh(prv_up) * texture_mask
+
     # 根据阶段与 epoch 设置编码器各子模块的冻结状态
     # 参数:
     #   phase: 1 或 2
@@ -488,11 +585,19 @@ class Trainer:
             # Phase 2：冻结 msg_head（保护已学的消息嵌入），解冻 prv_head 学习隐私扰动
             self.freeze_msg_head()
             self.unfreeze_prv_head()
-            # 前 1/3 epoch 允许共享层参与训练以适应隐私目标，之后冻结以稳定消息能力
-            if epoch <= self.cfg.num_epochs_phase2 // 3:
-                self.unfreeze_shared_layers()
-            else:
-                self.freeze_shared_layers()
+            # 全程冻结共享层：隐私目标不再改动 shared 表征，
+            # 避免冻结的 msg_head 因输入分布漂移而导致解码率下跌
+            self.freeze_shared_layers()
+            # Sprint 段额外冻结 decoder：纯逃逸冲刺期间消息目标关闭（权重 0），
+            # decoder 无需更新也避免其适应暂时崩坏的残差分布；
+            # Refine 终段同样冻结 decoder（val/refine_encode.py 语义：残差自适应
+            # 既有解码器而非解码器迁就残差，学生目标中的消息锚直接穿过冻结
+            # 的 decoder 反向约束残差）；
+            # Balance 段解冻恢复训练。该冻结只影响生成器优化器侧的梯度回传，
+            # recovery_step 使用独立的临时优化器，不受此标记影响
+            sprint_epochs = getattr(self.cfg, 'phase2_sprint_epochs', 0)
+            in_refine = self.cfg.is_phase2_refine_segment(epoch)
+            self._set_requires_grad(self.decoder, epoch > sprint_epochs and not in_refine)
 
     # 单个训练 step：完成一次前向、损失计算、判别器更新、生成器更新
     # 参数:
@@ -522,8 +627,10 @@ class Trainer:
         # 对编码图像与原始载体施加随机噪声，模拟信道失真
         noised_encoded_image, noised_cover_image = self.noiser((encoded_image, cover_image))
 
-        # 解码器从含噪编码图像预测 message logits（注意：未加 sigmoid，BCE 内部处理）
+        # 解码器双分支前向：干净编码图 + 含噪编码图分别预测 message logits
+        # （注意：未加 sigmoid，BCE 内部处理）
         message_pred = self.decoder(noised_encoded_image)
+        message_pred_clean = self.decoder(encoded_image)
 
         # ===== 视觉损失（原始图像 vs 编码图像） =====
         L_pixel = self.mse_loss(encoded_image, cover_image)  # 像素 MSE
@@ -537,8 +644,16 @@ class Trainer:
         L_ssim_noised = self.ssim_loss(noised_encoded_image, visual_target_noised)
         L_visual_noised = self.cfg.lambda_pixel * L_pixel_noised + self.cfg.lambda_ssim * L_ssim_noised
 
-        # ===== 消息损失：BCEWithLogits，目标是原 message =====
-        L_message = self.bce_with_logits_loss(message_pred, message)
+        # ===== 消息损失：干净 + 含噪双分支 BCEWithLogits =====
+        # 干净分支保底提供稳定梯度通路（冷启动不再依赖含噪信号在噪声后的信噪比）；
+        # 含噪分支在解码器启动之后自然学会抗噪，相当于内置课程学习。
+        # 实测仅靠含噪单分支时，JPEG/resize 会摧毁随机初始化的微弱 msg 信号，
+        # 解码器永远等不到启动时刻，L_message 锁死在 ln2。
+        # 干净分支权重按 get_msg_clean_ratio 调度：Phase 1 前期 0.8（加速冷启动，
+        # 避免含噪分支的噪声梯度稀释有效梯度），后期退火到 0.5 均衡抗噪
+        clean_ratio = self.cfg.get_msg_clean_ratio(phase, epoch)
+        L_message = ((1.0 - clean_ratio) * self.bce_with_logits_loss(message_pred, message) +
+                     clean_ratio * self.bce_with_logits_loss(message_pred_clean, message))
 
         # ===== 判别器分支：计算判别损失并按门控更新判别器 =====
         # 选择判别器输入（含噪或原始）
@@ -564,62 +679,142 @@ class Trainer:
             self.optimizer_steganalyzer.step()
             D_updated = 1.0  # 标记本 step 已更新判别器
 
-        # ===== 生成器对抗损失：再前向一次以拿到可回传梯度的 stego_pred =====
-        self._set_requires_grad(self.steganalyzer, False)  # 临时关闭判别器梯度
-        steganalyzer_was_training = self.steganalyzer.training  # 记录原训练状态
-        self.steganalyzer.eval()  # 切到 eval 影响 BN/Dropout
-        stego_pred = self.steganalyzer(disc_stego_input)  # 此时梯度可回传到编码器
-        L_adv = self._gen_adv_loss(stego_pred)  # 生成器对抗损失
-        if steganalyzer_was_training:
-            self.steganalyzer.train()  # 恢复训练状态
-        self._set_requires_grad(self.steganalyzer, True)  # 恢复判别器可训练
+        # ===== 生成器对抗损失：仅当 adv 权重 > 0 时才前向一次拿到可回传梯度的 stego_pred =====
+        if weights.get('adv', 0.0) > 0:
+            self._set_requires_grad(self.steganalyzer, False)  # 临时关闭判别器梯度
+            steganalyzer_was_training = self.steganalyzer.training  # 记录原训练状态
+            self.steganalyzer.eval()  # 切到 eval 影响 BN/Dropout
+            stego_pred = self.steganalyzer(disc_stego_input)  # 此时梯度可回传到编码器
+            L_adv = self._gen_adv_loss(stego_pred)  # 生成器对抗损失
+            if steganalyzer_was_training:
+                self.steganalyzer.train()  # 恢复训练状态
+            self._set_requires_grad(self.steganalyzer, True)  # 恢复判别器可训练
+        else:
+            # adv=0：判别器仅作监控指标，不向编码器回传对抗梯度（避免引入伪影方向）
+            L_adv = torch.tensor(0.0, device=self.device)
 
-        # ===== CLIP 内容特征：用于 escape / redirect 损失 =====
+        # ===== CLIP/DINO 内容特征：用于 escape / redirect 损失 =====
         # 载体特征 detach，仅作为锚点
         feat_cover = self.content_recognizer(cover_image).detach()
-        # 编码图像特征保留梯度，使隐私损失能反传到编码器
-        feat_encoded = self.content_recognizer(encoded_image)
-
-        # DINO 特征：仅当启用 DINO 时返回张量，否则 None
         dino_cover = self.extract_dino_features(cover_image)
-        dino_encoded = self.extract_dino_features(encoded_image, allow_grad=True)
+
+        privacy_weight = weights.get('privacy', 0.0)
+        if privacy_weight > 0:
+            # Phase 2 双分支特征提取：
+            #   干净分支——梯度不经噪声层雅可比，质量高，作为逃逸训练的主力；
+            #     （quant 的傅里叶近似梯度在 1~21 倍间震荡、jpeg 近似梯度劣质，
+            #       若只在含噪图上提特征，2/3 的时间隐私梯度是坏信号，实测完全推不动）
+            #   含噪分支——保证逃逸对 jpeg/resize 等信道失真鲁棒（传播场景必经压缩）
+            feat_encoded_clean = self.content_recognizer(encoded_image)
+            feat_encoded_noised = self.content_recognizer(noised_encoded_image)
+            dino_encoded_clean = self.extract_dino_features(encoded_image, allow_grad=True)
+            dino_encoded_noised = self.extract_dino_features(noised_encoded_image, allow_grad=True)
+        else:
+            # Phase 1：privacy 不参与优化，仅提取干净分支特征作监控（无梯度，省算力）
+            with torch.no_grad():
+                feat_encoded_clean = self.content_recognizer(encoded_image)
+                dino_encoded_clean = self.extract_dino_features(encoded_image)
+            feat_encoded_noised = None
+            dino_encoded_noised = None
 
         clip_hard_negatives = None
         dino_hard_negatives = None
 
-        # 更新 CLIP 记忆库并取出当前批次的 hard negatives
-        if self.use_clip_redirect and self.clip_memory_bank is not None:
-            self.clip_memory_bank.update(feat_cover.detach())
+        # Refine 终段：redirect 关闭（val/refine_encode.py 精修配方为 escape-only）。
+        # redirect 把编码特征拉向 hard negative 人群（目标 0.85），而人群聚集在
+        # 原图邻域，与 escape 的"远离原图"存在方向对冲——精修试点证明
+        # escape-only 可达 0.57，终段以逃逸深度优先
+        in_refine = phase == 2 and self.cfg.is_phase2_refine_segment(epoch)
+
+        # 先从记忆库检索 hard negatives（先查询、后入库，避免当前 batch 命中自身）；
+        # exclude_sim 按特征空间分别标定，排除与 query 过近的候选（近重复/同身份照片），
+        # 防止重定向目标退化为"自己"而与 escape loss 对冲。
+        # 查询使用干净分支特征（与入库的 cover 特征同分布，redirect 目标也定义在干净空间）
+        if self.use_clip_redirect and self.clip_memory_bank is not None and not in_refine:
             clip_hard_negatives = self.clip_memory_bank.get_hard_negatives(
-                feat_encoded.detach(), k=self.clip_hard_negative_k
+                feat_encoded_clean.detach(), k=self.clip_hard_negative_k,
+                exclude_sim=getattr(self.cfg, 'clip_redirect_exclude_sim', 0.92)
             )
 
-        # 更新 DINO 记忆库并取出 hard negatives（仅当 DINO 启用且记忆库存在）
-        if self.use_clip_redirect and self.dino_memory_bank is not None and dino_cover is not None:
-            self.dino_memory_bank.update(dino_cover.detach())
+        # 检索 DINO 记忆库的 hard negatives（仅当 DINO 启用且记忆库存在）
+        if self.use_clip_redirect and self.dino_memory_bank is not None and dino_cover is not None and not in_refine:
             dino_hard_negatives = self.dino_memory_bank.get_hard_negatives(
-                dino_encoded.detach(), k=self.clip_hard_negative_k
+                dino_encoded_clean.detach(), k=self.clip_hard_negative_k,
+                exclude_sim=getattr(self.cfg, 'dino_redirect_exclude_sim', 0.87)
             )
 
-        # 当前阶段/epoch 的 escape margin（Hinge 边界，渐进扩大）
+        # 当前阶段/epoch 的 escape margin（Hinge 边界，渐进扩大；CLIP/DINO 独立调度）
         escape_margin = self.cfg.get_escape_margin(phase, epoch)
+        dino_escape_margin = self.cfg.get_dino_escape_margin(phase, epoch)
 
-        # 计算隐私 escape + redirect 损失，返回总损失与子项字典
-        L_privacy, privacy_loss_dict = self.retrieval_escape_loss(
-            feat_cover, feat_encoded,
+        # 干净分支隐私损失：escape + redirect（redirect 目标定义在干净特征空间，仅在此分支启用）
+        L_privacy_clean, privacy_loss_dict = self.retrieval_escape_loss(
+            feat_cover, feat_encoded_clean,
             dino_cover=dino_cover,
-            dino_encoded=dino_encoded,
+            dino_encoded=dino_encoded_clean,
             clip_hard_negatives=clip_hard_negatives,
             dino_hard_negatives=dino_hard_negatives,
-            escape_margin=escape_margin
+            escape_margin=escape_margin,
+            dino_escape_margin=dino_escape_margin
         )
+
+        if privacy_weight > 0 and feat_encoded_noised is not None:
+            # 含噪分支隐私损失：仅 escape（无 redirect），保证逃逸对信道失真鲁棒
+            L_privacy_noised, noised_privacy_dict = self.retrieval_escape_loss(
+                feat_cover, feat_encoded_noised,
+                dino_cover=dino_cover,
+                dino_encoded=dino_encoded_noised,
+                escape_margin=escape_margin,
+                dino_escape_margin=dino_escape_margin
+            )
+            # 双分支加权融合：干净分支主导逃逸方向（梯度质量高），
+            # 含噪分支仅锚定传播场景鲁棒性（其噪声层雅可比会稀释有效梯度）
+            # Sprint 段含噪权重经 get_privacy_noised_ratio 调度为 0（纯逃逸冲刺）
+            noised_ratio = self.cfg.get_privacy_noised_ratio(phase, epoch)
+            L_privacy = (1.0 - noised_ratio) * L_privacy_clean + noised_ratio * L_privacy_noised
+            # 传播场景的含噪 sim 单独记录（best checkpoint 判定面向传播效果）
+            privacy_loss_dict['clip_sim_noised'] = noised_privacy_dict.get('clip_sim', 0.0)
+            privacy_loss_dict['dino_sim_noised'] = noised_privacy_dict.get('dino_sim', 0.0)
+        else:
+            L_privacy = L_privacy_clean
+
+        # 检索完成后再将当前 batch 的 cover 特征入库，供后续 batch 作为候选
+        if self.use_clip_redirect and self.clip_memory_bank is not None:
+            self.clip_memory_bank.update(feat_cover.detach())
+        if self.use_clip_redirect and self.dino_memory_bank is not None and dino_cover is not None:
+            self.dino_memory_bank.update(dino_cover.detach())
+
+        # ===== 方案 C：内环逐图优化蒸馏（Phase 2）=====
+        # 教师：冻结网络，对当前 batch 的低分辨率隐私残差场做少量 Adam 步直接优化
+        # （与 val/refine_encode.py 逐图精修同一目标函数），得到探针级逃逸方向；
+        # 学生：把 prv_head 的输出拉向教师残差，把该方向蒸进单次前向。
+        # 教师目标含消息 BCE，蒸馏在 Sprint 段（message 权重 0）也起到保解码锚的作用
+        # 关键：损失必须按教师能量归一化成相对误差。原始残差空间 MSE 量级 ~1e-5
+        # （残差 RMS 仅 ~0.015，师生差异 RMS ~0.003），加权 10 后贡献 ~1e-4，
+        # 对比总损失 ~10+（privacy 15）完全不可见——实测 A100 训练全程
+        # L_distill 恒定 9e-5 不收敛，方案 C 数值上从未生效，Phase 2 只剩
+        # 跨图方向互相抵消的 escape 梯度（0.01/10 轮的慢速下降根源）。
+        # 归一化后 L_distill = 师生相对平方误差（当前约 0.4），加权 10 后
+        # 与 privacy 同量级，棘轮机制真正启动
+        L_distill = torch.tensor(0.0, device=self.device)
+        if phase == 2 and getattr(self.cfg, 'distill_inner_steps', 0) > 0 and prv_residual is not None:
+            teacher_prv = self._refine_teacher_residual(
+                cover_image, message, msg_residual, prv_residual, feat_cover, dino_cover
+            )
+            if teacher_prv is not None:
+                teacher_ref = teacher_prv.detach()
+                L_distill = self.mse_loss(prv_residual, teacher_ref) / (
+                    teacher_ref.pow(2).mean() + 1e-7
+                )
 
         # ===== 残差惩罚与 FFT 高频惩罚 =====
         residual_penalty_weight = weights.get('residual_penalty', 0.05)  # 残差预算惩罚权重
         fft_weight = weights.get('fft', 0.0)  # FFT 高频惩罚权重（仅 Phase 2 > 0）
         # 仅在启用 FFT 且存在隐私残差时计算
         if fft_weight > 0 and prv_residual is not None:
-            L_fft = self._fft_high_freq_loss(prv_residual)
+            L_fft = self._fft_high_freq_loss(
+                prv_residual, getattr(self.cfg, 'fft_high_freq_radius_ratio', 0.25)
+            )
         else:
             L_fft = torch.tensor(0.0, device=self.device)
         # 视觉损失加权（含噪版本按 noised 权重叠加）
@@ -630,8 +825,10 @@ class Trainer:
                        residual_penalty_weight * residual_penalty)
         L_privacy_weighted = weights['privacy'] * L_privacy  # 隐私损失加权
         L_fft_weighted = fft_weight * L_fft  # FFT 损失加权
-        # 总损失：视觉 + 非视觉 + 隐私 + FFT
-        L_total = L_visual_weighted + L_non_visual + L_privacy_weighted + L_fft_weighted
+        # 蒸馏损失加权（Phase 2 且启用内环蒸馏时 > 0）
+        L_distill_weighted = getattr(self.cfg, 'distill_weight', 0.0) * L_distill
+        # 总损失：视觉 + 非视觉 + 隐私 + FFT + 蒸馏
+        L_total = L_visual_weighted + L_non_visual + L_privacy_weighted + L_fft_weighted + L_distill_weighted
 
         # ===== 反向传播与生成器/编码器/解码器更新 =====
         self.optimizer_encoder_decoder.zero_grad()
@@ -647,11 +844,13 @@ class Trainer:
 
         self.optimizer_encoder_decoder.step()  # 执行一步参数更新
 
-        # ===== 计算 bit accuracy 用于监控 =====
+        # ===== 计算 bit accuracy 用于监控（含噪分支为主指标，干净分支辅助观察冷启动） =====
         with torch.no_grad():
             # 将 logits 转为二进制预测（>0.5 视为 1）
             message_pred_binary = (torch.sigmoid(message_pred) > 0.5).float()
             bit_accuracy = (message_pred_binary == message).float().mean().item()
+            message_pred_clean_binary = (torch.sigmoid(message_pred_clean) > 0.5).float()
+            bit_accuracy_clean = (message_pred_clean_binary == message).float().mean().item()
 
         # 汇总本 step 的所有损失与指标，供日志记录
         losses = {
@@ -669,8 +868,11 @@ class Trainer:
             'L_privacy': L_privacy.item(),  # 隐私 escape+redirect 损失
             'L_residual_penalty': residual_penalty.item(),  # 残差预算惩罚
             'L_fft': L_fft.item(),  # FFT 高频损失
-            'bit_accuracy': bit_accuracy,  # 比特准确率
-            'escape_margin': escape_margin,  # 当前 escape margin
+            'L_distill': L_distill.item(),  # 蒸馏损失（学生残差 vs 教师残差）
+            'bit_accuracy': bit_accuracy,  # 比特准确率（含噪分支，确权主指标）
+            'bit_accuracy_clean': bit_accuracy_clean,  # 干净分支比特准确率（冷启动观察用）
+            'escape_margin': escape_margin,  # 当前 CLIP escape margin
+            'dino_escape_margin': dino_escape_margin,  # 当前 DINO escape margin
             'prv_noise_ratio': prv_noise_ratio,  # 当前隐私噪声比例
             'D_updated': D_updated,  # 本 step 是否更新了判别器
             'adv_weight': weights.get('adv', 0.0)  # 对抗权重
@@ -679,13 +881,13 @@ class Trainer:
 
         # 合并隐私损失的子项（前缀 privacy_）
         for key, value in privacy_loss_dict.items():
-            losses[f'privacy_{key}'] = value if isinstance(value, float) else value
+            losses[f'privacy_{key}'] = value
 
         return losses
 
     # 解码器恢复步骤：当 Phase 2 中 bit accuracy 跌破阈值时调用
-    # 思路：冻结编码器与 prv_head，仅用"干净"编码图像（只含 msg_residual）
-    #       重新训练解码器若干 batch，恢复其消息解码能力
+    # 思路：冻结编码器，用"完整编码图像（含隐私残差 + 信道噪声）"
+    #       重新训练解码器若干 batch，使恢复分布与实际解码分布一致
     # 参数:
     #   train_loader: 训练数据加载器
     #   num_batches: 恢复训练的 batch 数量，默认 5
@@ -706,18 +908,16 @@ class Trainer:
             cover_image = batch['cover_image'].to(self.device)
             message = batch['message'].to(self.device)
 
-            # 编码器前向不需要梯度；以 Phase 1 模式生成纯消息残差
+            # 编码器前向不需要梯度；以 Phase 2 模式生成含隐私残差的完整编码图像
             with torch.no_grad():
-                _, _, msg_residual, _ = self.encoder(
-                    cover_image, message, phase=1, prv_noise_ratio=0.0
+                encoded_image, _, _, _ = self.encoder(
+                    cover_image, message, phase=2, prv_noise_ratio=0.0
                 )
-                # 仅叠加消息残差，不含隐私扰动，得到"干净"编码图像
-                clean_encoded = cover_image + msg_residual
-                # 限制到 [-1, 1] 与训练时一致
-                clean_encoded = torch.clamp(clean_encoded, -1, 1)
+                # 施加与训练一致的信道噪声，保证恢复分布 = 实际解码分布
+                noised_encoded, _ = self.noiser((encoded_image, cover_image))
 
-            # 解码器在干净编码图像上预测 message logits
-            message_pred = self.decoder(clean_encoded)
+            # 解码器在含噪完整编码图像上预测 message logits
+            message_pred = self.decoder(noised_encoded)
             # 仅用消息损失训练解码器
             L_msg = self.bce_with_logits_loss(message_pred, message)
 
@@ -761,9 +961,10 @@ class Trainer:
             selected_indices = random.sample(range(num_total_samples), max_samples)
         selected_indices_set = set(selected_indices)  # 转集合便于 O(1) 查找
 
-        # 验证时使用与训练一致的噪声比例与 escape margin
+        # 验证时使用与训练一致的噪声比例与 escape margin（CLIP/DINO 独立调度）
         prv_noise_ratio = self.cfg.get_prv_noise_ratio(epoch) if phase == 1 else 0.0
         escape_margin = self.cfg.get_escape_margin(phase, epoch)
+        dino_escape_margin = self.cfg.get_dino_escape_margin(phase, epoch)
 
         with torch.no_grad():  # 验证全程不需要梯度
             current_idx = 0  # 全局样本索引，用于匹配可视化选中索引
@@ -779,8 +980,9 @@ class Trainer:
                 )
                 # 施加噪声
                 noised_encoded_image, noised_cover_image = self.noiser((encoded_image, cover_image))
-                # 解码器预测
+                # 解码器双分支预测（与 train_step 一致）
                 message_pred = self.decoder(noised_encoded_image)
+                message_pred_clean = self.decoder(encoded_image)
 
                 # 视觉损失（原始）
                 L_pixel = self.mse_loss(encoded_image, cover_image)
@@ -793,8 +995,11 @@ class Trainer:
                 L_ssim_noised = self.ssim_loss(noised_encoded_image, visual_target_noised)
                 L_visual_noised = self.cfg.lambda_pixel * L_pixel_noised + self.cfg.lambda_ssim * L_ssim_noised
 
-                # 消息损失
-                L_message = self.bce_with_logits_loss(message_pred, message)
+                # 消息损失（干净 + 含噪双分支，与训练一致）
+                L_message = 0.5 * (
+                    self.bce_with_logits_loss(message_pred, message) +
+                    self.bce_with_logits_loss(message_pred_clean, message)
+                )
 
                 # 对抗损失（验证时只评估不更新）
                 disc_real_input, disc_stego_input = self._adversarial_inputs(
@@ -806,30 +1011,55 @@ class Trainer:
                     cover_pred, stego_pred
                 )
 
-                # CLIP/DINO 特征与隐私损失
+                # CLIP/DINO 特征与隐私损失（与训练一致的双分支结构）
                 feat_cover = self.content_recognizer(cover_image)
-                feat_encoded = self.content_recognizer(encoded_image)
+                feat_encoded_clean = self.content_recognizer(encoded_image)
 
                 dino_cover = self.extract_dino_features(cover_image)
-                dino_encoded = self.extract_dino_features(encoded_image)
+                dino_encoded_clean = self.extract_dino_features(encoded_image)
 
-                L_privacy, _ = self.retrieval_escape_loss(
-                    feat_cover, feat_encoded,
+                # 干净分支：escape（redirect 在验证时不查询 memory bank，与训练 Phase 1 行为一致）
+                L_privacy_clean, privacy_loss_dict = self.retrieval_escape_loss(
+                    feat_cover, feat_encoded_clean,
                     dino_cover=dino_cover,
-                    dino_encoded=dino_encoded,
-                    escape_margin=escape_margin
+                    dino_encoded=dino_encoded_clean,
+                    escape_margin=escape_margin,
+                    dino_escape_margin=dino_escape_margin
                 )
+
+                if weights.get('privacy', 0.0) > 0:
+                    # 含噪分支：仅 escape，锚定传播场景（与训练 Phase 2 一致）
+                    feat_encoded_noised = self.content_recognizer(noised_encoded_image)
+                    dino_encoded_noised = self.extract_dino_features(noised_encoded_image)
+                    L_privacy_noised, noised_privacy_dict = self.retrieval_escape_loss(
+                        feat_cover, feat_encoded_noised,
+                        dino_cover=dino_cover,
+                        dino_encoded=dino_encoded_noised,
+                        escape_margin=escape_margin,
+                        dino_escape_margin=dino_escape_margin
+                    )
+                    # 与训练一致的含噪分支权重（Sprint 段为 0）
+                    noised_ratio = self.cfg.get_privacy_noised_ratio(phase, epoch)
+                    L_privacy = (1.0 - noised_ratio) * L_privacy_clean + noised_ratio * L_privacy_noised
+                    privacy_loss_dict['clip_sim_noised'] = noised_privacy_dict.get('clip_sim', 0.0)
+                    privacy_loss_dict['dino_sim_noised'] = noised_privacy_dict.get('dino_sim', 0.0)
+                else:
+                    L_privacy = L_privacy_clean
 
                 # 残差惩罚与 FFT 损失
                 fft_weight = weights.get('fft', 0.0)
                 if fft_weight > 0 and prv_residual is not None:
-                    L_fft = self._fft_high_freq_loss(prv_residual)
+                    L_fft = self._fft_high_freq_loss(
+                        prv_residual, getattr(self.cfg, 'fft_high_freq_radius_ratio', 0.25)
+                    )
                 else:
                     L_fft = torch.tensor(0.0, device=self.device)
 
-                # 计算本 batch 的 bit accuracy
+                # 计算本 batch 的 bit accuracy（含噪主指标 + 干净分支）
                 message_pred_binary = (torch.sigmoid(message_pred) > 0.5).float()
                 bit_accuracy = (message_pred_binary == message).float().mean()
+                message_pred_clean_binary = (torch.sigmoid(message_pred_clean) > 0.5).float()
+                bit_accuracy_clean = (message_pred_clean_binary == message).float().mean()
 
                 # 累加各项标量损失（.item() 触发同步）
                 for key, value in [
@@ -841,7 +1071,8 @@ class Trainer:
                     ('discr_cover_bce', discr_cover_bce), ('discr_encod_bce', discr_encod_bce),
                     ('L_privacy', L_privacy), ('L_residual_penalty', residual_penalty),
                     ('L_fft', L_fft),
-                    ('bit_accuracy', bit_accuracy)
+                    ('bit_accuracy', bit_accuracy),
+                    ('bit_accuracy_clean', bit_accuracy_clean)
                 ]:
                     if key not in total_losses:
                         total_losses[key] = 0
@@ -861,6 +1092,14 @@ class Trainer:
                     if key not in total_losses:
                         total_losses[key] = 0
                     total_losses[key] += value
+
+                # 累加隐私相似度指标（用于多目标 best checkpoint 判定与日志监控）；
+                # _noised 后缀为传播场景（含噪）指标，Phase 2 才存在
+                for key in ['clip_sim', 'dino_sim', 'clip_sim_noised', 'dino_sim_noised']:
+                    if key in privacy_loss_dict:
+                        if key not in total_losses:
+                            total_losses[key] = 0
+                        total_losses[key] += privacy_loss_dict[key]
 
                 num_batches += 1
 
@@ -950,7 +1189,8 @@ class Trainer:
     # 参数:
     #   epoch: 当前 epoch
     #   phase: 当前训练阶段
-    def save_checkpoint(self, epoch, phase):
+    #   extra_path: 可选的额外保存路径（如 best checkpoint）
+    def save_checkpoint(self, epoch, phase, extra_path=None):
         # 组装 checkpoint 字典，包含模型、优化器与训练状态
         checkpoint = {
             'epoch': epoch,  # 当前 epoch
@@ -961,6 +1201,7 @@ class Trainer:
             'optimizer_encoder_decoder': self.optimizer_encoder_decoder.state_dict(),  # 编/解优化器状态
             'optimizer_steganalyzer': self.optimizer_steganalyzer.state_dict(),  # 判别器优化器状态
             'best_loss': self.best_loss,  # 历史最佳损失
+            'best_loss_phase': self.best_loss_phase,  # 该最佳值按哪个阶段的准则记录
             'phase2_msg_head_frozen': self.phase2_msg_head_frozen  # msg_head 冻结标记
         }
 
@@ -979,3 +1220,7 @@ class Trainer:
         # 同时覆盖最新的 checkpoint.pth，供 continue 命令直接读取
         latest_path = os.path.join(self.cfg.checkpoint_dir, 'checkpoint.pth')
         torch.save(checkpoint, latest_path)
+
+        # 可选：额外保存一份到指定路径（如 checkpoint_best.pth）
+        if extra_path is not None:
+            torch.save(checkpoint, extra_path)

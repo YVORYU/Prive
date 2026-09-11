@@ -21,16 +21,18 @@ class ConvBNRelu(nn.Module):
     # 卷积 + 批归一化 + ReLU 的组合模块，作为编码器的基本构建单元
     # 用于提取图像特征和共享表征，bias=False 是因为后接 BatchNorm，偏置可被吸收
 
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, dilation=1):
         # 构造函数：初始化 ConvBNRelu 模块
         # 参数：
         #   in_channels (int): 输入通道数
         #   out_channels (int): 输出通道数
+        #   dilation (int): 空洞卷积膨胀率，padding 同步取 dilation 保持空间尺寸不变
         super().__init__()
         # 使用 nn.Sequential 将 3x3 卷积、BN、ReLU 串联成一个不可拆分的子模块
         self.conv = nn.Sequential(
-            # 3x3 卷积，padding=1 保持空间尺寸，bias=False 因为后接 BN
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            # 3x3 卷积，padding=dilation 保持空间尺寸，bias=False 因为后接 BN
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=dilation,
+                      dilation=dilation, bias=False),
             # 批归一化，加速收敛并提升训练稳定性
             nn.BatchNorm2d(out_channels),
             # ReLU 激活，inplace=True 节省显存
@@ -53,7 +55,8 @@ class Encoder(nn.Module):
     def __init__(self, message_length=30, n_channels=3,
                  image_size=256, msg_budget=0.05, prv_budget=0.03,
                  phase1_prv_noise_smooth_kernel=7,
-                 texture_mask_strength=5.0, texture_mask_smooth_kernel=5):
+                 texture_mask_strength=5.0, texture_mask_smooth_kernel=5,
+                 prv_lowres_size=96):
         # 构造函数：初始化编码器
         # 参数：
         #   message_length (int): 二进制消息位数，默认 30
@@ -63,7 +66,10 @@ class Encoder(nn.Module):
         #   prv_budget (float): 隐私残差的预算上界，控制扰动强度
         #   phase1_prv_noise_smooth_kernel (int): Phase 1 随机隐私噪声的平滑核大小
         #   texture_mask_strength (float): 纹理掩码 sigmoid 的缩放强度
+        #     （保留兼容；当前掩码已改为分位数归一化，该参数不再参与计算）
         #   texture_mask_smooth_kernel (int): 纹理掩码梯度图的平滑核大小
+        #   prv_lowres_size (int): 隐私残差低分辨率约束尺寸；prv_head 输出先池化到
+        #     该尺寸再上采样回全分辨率，从结构上消除高频条纹自由度
         super(Encoder, self).__init__()
         # 保存消息位数，用于扩展消息到空间维度
         self.message_length = message_length
@@ -79,10 +85,12 @@ class Encoder(nn.Module):
         self.prv_budget = prv_budget
         # Phase 1 随机噪声平滑核大小
         self.phase1_prv_noise_smooth_kernel = phase1_prv_noise_smooth_kernel
-        # 纹理掩码 sigmoid 强度系数
+        # 纹理掩码 sigmoid 强度系数（保留兼容；当前掩码使用分位数归一化，不再使用该系数）
         self.texture_mask_strength = texture_mask_strength
         # 纹理掩码梯度图平滑核大小
         self.texture_mask_smooth_kernel = texture_mask_smooth_kernel
+        # 隐私残差低分辨率尺寸（结构性低通约束）
+        self.prv_lowres_size = prv_lowres_size
 
         # 共享特征通道数
         channels = 128
@@ -118,16 +126,29 @@ class Encoder(nn.Module):
             nn.Conv2d(channels, 3, kernel_size=1)
         )
 
-        # 隐私头：结构与 msg_head 相同，用于预测隐私残差
+        # 隐私独立支路（Phase 2 新增）：直接从载体图像提取特征，与冻结共享层并联。
+        # 动机：Phase 2 中 conv_layers/after_concat_layer 全程冻结且只为消息嵌入目标训练，
+        # prv_head 只能从冻结的消息特征里"猜"逃逸方向（信息瓶颈）；且原 prv_head 有效
+        # 感受野仅 5×5，算不出空间结构化的逐图攻击模式（容量瓶颈）。
+        # 本支路用空洞卷积（dilation 1/3/9/27）把感受野扩到 81×81，Phase 2 可训练，
+        # Phase 1 随 prv_head 一起冻结且不参与前向。
+        self.prv_trunk = nn.Sequential(
+            ConvBNRelu(3, channels),
+            ConvBNRelu(channels, channels, dilation=3),
+            ConvBNRelu(channels, channels, dilation=9),
+            ConvBNRelu(channels, channels, dilation=27)
+        )
+
+        # 隐私头：输入为 [冻结共享特征 ⊕ 独立支路特征]，从隐私残差
         # Phase 1 中此模块被冻结，Phase 2 中解冻参与训练
         self.prv_head = nn.Sequential(
-            # 3x3 卷积
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            # 3x3 卷积，输入通道 = 共享特征 128 + 独立支路特征 128
+            nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1, bias=False),
             # 批归一化
             nn.BatchNorm2d(channels),
             # ReLU 激活
             nn.ReLU(inplace=True),
-            # 第二个 3x3 卷积
+            # 第二个 3x3 卷积，进一步非线性变换
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
             # 批归一化
             nn.BatchNorm2d(channels),
@@ -143,6 +164,11 @@ class Encoder(nn.Module):
         #   cover_image (Tensor): 载体图像，形状 (B, 3, H, W)
         # 返回：
         #   Tensor: 纹理掩码，形状 (B, 1, H, W)，取值范围 [0.15, 1.0]
+        # 实现说明：
+        #   原实现 mask=sigmoid(grad*strength) 的动态范围过窄（实测 0.50~0.68），
+        #   平滑区仍承受约一半强度的扰动，掩码几乎无纹理区分度。
+        #   现改为逐图分位数归一化：平滑区映射到 0.05 附近，纹理区映射到 1.0 附近，
+        #   扰动真正聚集到人眼不敏感的纹理复杂区域。
         # 在无梯度上下文中计算，掩码本身不参与反向传播
         with torch.no_grad():
             # 将 RGB 转为单通道灰度图，用于计算图像梯度
@@ -166,10 +192,18 @@ class Encoder(nn.Module):
                     k += 1
                 # 使用平均池化平滑梯度图，stride=1 保持尺寸
                 grad = F.avg_pool2d(grad, kernel_size=k, stride=1, padding=k // 2)
-            # 通过 sigmoid 将梯度映射到 [0,1]，strength 控制掩码锐度
-            mask = torch.sigmoid(grad * self.texture_mask_strength)
-            # 将掩码下界 clamp 到 0.15，保证平滑区域仍保留一定扰动
-            mask = torch.clamp(mask, min=0.15, max=1.0)
+            # 逐图分位数归一化：q05/q95 作为该图梯度的"平滑/纹理"参考
+            B = grad.shape[0]
+            flat = grad.view(B, -1)
+            q05 = flat.quantile(0.05, dim=1).view(B, 1, 1, 1)
+            q95 = flat.quantile(0.95, dim=1).view(B, 1, 1, 1)
+            # 归一化到 [0,1]：低于 q05 的平滑区为 0，高于 q95 的强纹理区为 1
+            g_norm = ((grad - q05) / (q95 - q05 + 1e-6)).clamp(0.0, 1.0)
+            # 映射到 [0.15, 1.0]：平滑区保留 15% 扰动。
+            # 下限 0.15 的依据：天花板探针实测下限 0.05 时 CLIP 逃逸天花板为 sim≈0.72，
+            # 贴边 escape 目标 0.70 无优化余量；0.15 把天花板压到 ~0.68 以下，
+            # 平滑区实际扰动幅度仅 0.15×0.04≈0.006（[-1,1] 尺度），视觉代价可控
+            mask = 0.15 + 0.85 * g_norm
         return mask
 
     def forward(self, cover_image, message, phase=1, prv_noise_ratio=0.0):
@@ -236,8 +270,17 @@ class Encoder(nn.Module):
             residual_penalty = torch.mean(msg_residual ** 2) + torch.mean(dummy_prv ** 2)
         else:
             # ===== Phase 2：学习真实隐私残差 =====
+            # 独立支路直接从载体图像提特征（不经冻结的消息共享层），
+            # 与共享特征拼接后送入 prv_head，为逃逸方向提供独立信息来源
+            trunk_feat = self.prv_trunk(cover_image)
             # 通过 prv_head 预测隐私残差
-            prv_residual = self.prv_head(shared)
+            prv_residual = self.prv_head(torch.cat([shared, trunk_feat], dim=1))
+            # 低分辨率约束：先池化到 prv_lowres_size 再上采样回全分辨率，
+            # 将残差限制在低通子空间，从结构上消除高频条纹/伪影自由度。
+            # 低通化之后再做 tanh 预算约束，保证上采样插值不破坏幅值上界。
+            if self.prv_lowres_size and self.prv_lowres_size < min(self.H, self.W):
+                prv_lowres = F.adaptive_avg_pool2d(prv_residual, (self.prv_lowres_size, self.prv_lowres_size))
+                prv_residual = F.interpolate(prv_lowres, size=(self.H, self.W), mode='bicubic', align_corners=False)
             # 使用 tanh 约束到 [-prv_budget, prv_budget]
             prv_residual = self.prv_budget * torch.tanh(prv_residual)
             # 计算纹理掩码，将扰动集中在纹理复杂区域

@@ -6,7 +6,7 @@ import torch.nn as nn
 # 主要功能是：使用基于傅里叶级数的可微近似来实现像素值的量化（round）操作
 # 传统的 round 函数不可导，无法用于反向传播；本模块用三角函数级数近似 round 的导数
 # 量化范围映射到 [0, 255]，模拟 8 位图像的量化失真
-# 该噪声层由 noise_argparser.py 中的 quant 配置项控制（在 Noiser 中以 'QuantizationPlaceholder' 占位符传入）
+# 该噪声层由 noise_argparser.py 中的 quant 配置项构造，以实例形式传入 Noiser
 
 def transform(tensor, target_range):
     # 将张量线性映射到 target_range 指定的数值范围
@@ -109,26 +109,3 @@ class Quantization(nn.Module):
         # 将量化后的图像映射回原始输入的数值范围（保持数据分布一致）
         noised_image = transform(noised_image, (noised_and_cover[0].min(), noised_and_cover[0].max()))
         return (noised_image, noised_and_cover[1])
-
-
-# def main():
-#     import numpy as np
-#     qq = Quantization()
-#     min_value = -1.4566678979
-#     max_value = 2.334567325678
-#     data = torch.rand((12, 3, 64, 64))
-#     data = (max_value - min_value) * data + min_value
-#     print(f'data.min(): {data.min()}')
-#     print(f'data.max(): {data.max()}')
-#     print(f'data.avg(): {data.mean()}')
-#     data_tf, _ = qq.forward([data, None])
-#     print('perform quantization')
-#     print(f'data.min(): {data_tf.min()}')
-#     print(f'data.max(): {data_tf.max()}')
-#     print(f'data.avg(): {data_tf.mean()}')
-#
-#     print(f'mse diff:  {np.mean((data.numpy()-data_tf.numpy())**2)}')
-#     print(f'mabs diff: {np.mean(np.abs(data.numpy()-data_tf.numpy()))}')
-#
-# if __name__ == '__main__':
-#     main()

@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# SSIM损失函数，使编码后的图像与原图的SSIM值最大，SSMI值越大，说明两者越相似
+# SSIM损失函数，使编码后的图像与原图的SSIM值最大，SSIM值越大，说明两者越相似
 class SSIMLoss(nn.Module):
     # SSIM 计算中用于稳定分母的常数 C1 = (k1 * L)^2，k1=0.01，L=1（归一化像素范围）
     C1 = 0.01 ** 2
@@ -23,7 +23,6 @@ class SSIMLoss(nn.Module):
     #   window_size：局部滑动窗口大小，默认 11
     #   size_average：是否对所有像素取平均，True 返回标量，False 返回每张图的均值
     def __init__(self, window_size=11, size_average=True):
-        #局部窗口大小，用于计算SSIM值，将高斯窗口注册为模型参数
         # 调用父类 nn.Module 的构造函数
         super(SSIMLoss, self).__init__()
         # 保存局部窗口大小
@@ -34,12 +33,6 @@ class SSIMLoss(nn.Module):
         self.channel = 3
         # 创建高斯窗口并注册为 buffer（不参与梯度更新，但随模型一起迁移设备）
         self.register_buffer('_window', self.create_window(window_size, self.channel))
-
-    # 通过 property 暴露 _window，便于外部访问当前高斯窗口
-    @property
-    def window(self):
-        # 返回注册的高斯窗口张量
-        return self._window
 
     #高斯窗口生成，生成一维高斯窗口，用于计算SSIM值
     #sigma为高斯窗口的标准差，用于控制窗口的宽度

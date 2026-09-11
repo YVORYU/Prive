@@ -32,9 +32,7 @@ class SteganographyDataset(Dataset):
         self.image_size = image_size
         # 保存消息长度
         self.message_length = message_length
-        #默认的图像处理操作，包括调整大小、转换为张量、归一化
-        #如果提供了自定义的transform，就使用自定义的transform
-        # 若未提供自定义 transform，则构建默认预处理流水线
+        # 若未提供自定义 transform，则构建默认预处理流水线（resize/ToTensor/Normalize）
         if transform is None:
             # 组合 resize、转张量、归一化三个变换
             self.transform = transforms.Compose([
@@ -48,12 +46,8 @@ class SteganographyDataset(Dataset):
         else:
             # 使用调用方提供的自定义 transform
             self.transform = transform
-        #获取所有图像的路径
-        #递归地遍历目录，找到所有图像文件
-        #将图像文件的路径添加到列表中
-        # 初始化图像路径列表
+        # 初始化图像路径列表，使用 os.walk 递归遍历 root_dir 下所有子目录
         self.image_paths = []
-        # 使用 os.walk 递归遍历 root_dir 下的所有子目录
         for root, _, files in os.walk(root_dir):
             # 遍历当前目录下的所有文件
             for file in files:
@@ -74,11 +68,6 @@ class SteganographyDataset(Dataset):
     # 参数：idx - 样本索引
     # 返回：包含 cover_image、message、image_path 的字典
     def __getitem__(self, idx):
-        #根据索引获取图像路径
-        #打开图像文件，将其转换为RGB模式
-        #如果提供了transform，就应用transform
-        #生成随机消息
-        #返回包含图像、消息和路径的字典
         # 取出指定索引对应的图像路径
         image_path = self.image_paths[idx]
         # 使用 PIL 打开图像并转换为 RGB 三通道模式（避免 RGBA/灰度带来的通道不一致）

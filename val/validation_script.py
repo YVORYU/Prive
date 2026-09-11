@@ -5,12 +5,17 @@
 #   - decode (解码): 从编码图像中预测消息比特
 #   - discriminator (判别器): 检测图像是否被隐写分析器判定为含密
 #   - similarity (相似度): 对比编码图与载体图的 CLIP/DINO/SSIM/PSNR 相似度
-#   - full (完整): 一次性执行编码-解码-验证-判别-相似度检查
-# 命令示例: python validation_script.py -c checkpoint.pth -i test.jpg -m "101000..." --mode full -o output
+#   - full (完整): 编码 -> 逐图精修 -> 解码-验证-判别-相似度检查
+# full 模式默认在编码后执行逐图精修（与 refine_encode.py 同配方）：冻结全部网络，
+# 仅对 96x96 低分辨率隐私残差场跑 Adam 优化，只在比特 100% 正确的状态里挑
+# clip_sim 最低者，并以网络原始残差为初始候选——保证精修结果不劣于直接编码。
+# (--refine-steps 0 可关闭精修；--refine-budget/--refine-margin 可覆盖约束与目标)
+# 命令示例: python val/validation_script.py -c checkpoint.pth -i test.jpg -m "101000..." --mode full -o output
 # 图像归一化到 [-1, 1] 区间，便于模型推理
 
 import os  # 操作系统接口，用于文件路径检查与目录创建
 import argparse  # 命令行参数解析
+import time  # 计时模块，用于精修耗时统计
 import torch  # PyTorch 主库，张量计算与模型推理
 import torch.nn.functional as F  # PyTorch 函数式接口，提供 interpolate/cosine_similarity 等
 import numpy as np  # 数值计算库，用于数组运算
@@ -18,9 +23,46 @@ from PIL import Image  # 图像读取与保存
 from torchvision import transforms  # 图像预处理流水线 (Resize/ToTensor/Normalize)
 import timm  # PyTorch Image Models，用于加载 DINOv2 ViT 模型
 
+# 本脚本位于 val/ 子目录：定位项目根并加入 sys.path（import models/losses/config 等根模块），
+# 同时把工作目录切到项目根，保证 ./models/dinov2_vits14_pretrain.pth 等相对路径
+# 与从项目根直接运行时的行为完全一致
+import sys
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+os.chdir(_PROJECT_ROOT)
+
 from models import Encoder, Decoder, Steganalyzer, ContentRecognizer  # 项目核心模型组件
 from losses import SSIMLoss  # 结构相似性损失，用于评估编码图像质量
+from losses.advanced_privacy_loss import FeatureRedirectionLoss  # CLIP/DINO escape 损失，精修目标
+from noise_layers.noiser import Noiser  # 信道噪声采样器，精修消息分支的含噪项
 import config  # 项目配置模块，提供 Config 类
+
+
+# _project_out_chroma_lowfreq 函数功能: 剔除隐私残差的 8x8 网格低频色度分量，返回修正后的残差。
+# 背景：深挖配方实测残差能量 77% 落在色度通道、低频占其 44%，且总残差低频色度的 97% 来自
+# prv_residual——构成"发灰/蒙层"感知劣化主体（PSNR/SSIM 对其失明）。梯度惩罚实测无效
+# （逃逸梯度与色度方向高度平行，w=40~5000 均被淹没），故用结构化事后投影：精修收敛后把
+# prv 的低频色度整支剔除。只动 8x8 网格（32px 块）尺度——更粗尺度是逃逸承重结构
+# （实测剔除 16/32 网格后 clip 升至 0.57/0.80）。调用方需门控：投影后 bit_acc 必须
+# 100% 且 clip_sim ≤ (1-margin)，否则回退未投影结果。
+def _project_out_chroma_lowfreq(prv, grid=8):
+    # prv: (B,3,H,W) RGB 隐私残差
+    r, g, b = prv[:, 0:1], prv[:, 1:2], prv[:, 2:3]
+    # BT.601 RGB->YCbCr 色度行
+    cb = -0.168736 * r - 0.331264 * g + 0.5 * b
+    cr = 0.5 * r - 0.418688 * g - 0.081312 * b
+    # 低频分量: grid x grid 自适应均值池化后双线性上采样回全分辨率
+    cb_low = F.interpolate(F.adaptive_avg_pool2d(cb, grid), size=prv.shape[-2:],
+                           mode='bilinear', align_corners=False)
+    cr_low = F.interpolate(F.adaptive_avg_pool2d(cr, grid), size=prv.shape[-2:],
+                           mode='bilinear', align_corners=False)
+    # 逆变换剔除低频色度 (Y 不变): dR=1.402 dCr, dG=-0.344 dCb-0.714 dCr, dB=1.772 dCb
+    out = prv.clone()
+    out[:, 0:1] = out[:, 0:1] - 1.402 * cr_low
+    out[:, 1:2] = out[:, 1:2] + 0.344136 * cb_low + 0.714136 * cr_low
+    out[:, 2:3] = out[:, 2:3] - 1.772 * cb_low
+    return out
 
 
 # ValidationScript 类职责:
@@ -39,13 +81,15 @@ class ValidationScript:
         # 实例化配置对象，从中读取所有模型超参与默认值
         self.cfg = config.Config()
 
-        # 构造编码器，使用 Config 中的消息长度、通道数、图像尺寸与残差预算
+        # 构造编码器，使用 Config 中的消息长度、通道数、图像尺寸与残差预算；
+        # prv_lowres_size 必须与训练一致（它不改变权重形状，只改变 forward 的低通约束行为）
         self.encoder = Encoder(
             message_length=self.cfg.message_length,
             n_channels=3,
             image_size=self.cfg.image_size,
             msg_budget=self.cfg.msg_budget,
-            prv_budget=self.cfg.prv_budget
+            prv_budget=self.cfg.prv_budget,
+            prv_lowres_size=self.cfg.prv_lowres_size
         ).to(self.device)
 
         # 构造解码器，从编码图像预测消息比特 logits
@@ -62,6 +106,9 @@ class ValidationScript:
 
         # 构造 SSIM 损失模块，用于衡量编码图像与载体图的结构相似性
         self.ssim_loss = SSIMLoss().to(self.device)
+
+        # 信道噪声采样器（精修含噪消息分支使用），懒加载并缓存
+        self._noiser = None
 
         # 加载 DINOv2 模型
         # 仅当 Config.dino_weight > 0 时启用 DINOv2，否则跳过以节省显存
@@ -154,6 +201,8 @@ class ValidationScript:
     # 加载过程会打印缺失键与多余键，并对 steganalyzer 的 fc_layers 命名做兼容性映射。
     def load_checkpoint(self, checkpoint_path):
         print(f"加载检查点: {checkpoint_path}")
+        # 记录 checkpoint 路径，供可视化报告的元信息展示
+        self.checkpoint_path = checkpoint_path
         # 加载 checkpoint 字典到目标设备，weights_only=False 允许加载非张量结构
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
@@ -167,7 +216,17 @@ class ValidationScript:
 
         # 若 checkpoint 包含编码器权重则加载
         if 'encoder_state_dict' in checkpoint:
-            result = self.encoder.load_state_dict(checkpoint['encoder_state_dict'], strict=False)
+            # 形状过滤：prv_head 输入已扩为 256 通道（新增 prv_trunk 独立支路），
+            # 旧 checkpoint 的隐私头卷积权重形状不匹配，跳过后隐私残差部分随机初始化
+            # （消息通路权重完整加载，解码能力不受影响）；新结构 checkpoint 全量加载
+            encoder_state = checkpoint['encoder_state_dict']
+            model_state = self.encoder.state_dict()
+            compatible = {k: v for k, v in encoder_state.items()
+                          if k in model_state and model_state[k].shape == v.shape}
+            skipped = [k for k in encoder_state if k not in compatible]
+            if skipped:
+                print(f"[encoder] 跳过 {len(skipped)} 个形状不兼容的权重（旧隐私头结构，隐私残差不可信）: {skipped[:6]}")
+            result = self.encoder.load_state_dict(compatible, strict=False)
             _report('encoder', result)
         # 若 checkpoint 包含解码器权重则加载
         if 'decoder_state_dict' in checkpoint:
@@ -286,6 +345,270 @@ class ValidationScript:
         # 打印残差惩罚值，用于监控编码强度
         print(f"残差惩罚值: {residual_penalty.item():.6f}")
         return encoded_image, residual_penalty
+
+    # _extract_dino_features_grad 方法功能: 提取 DINOv2 特征但保留输入梯度。
+    # 与 extract_dino_features 的预处理完全一致，仅去掉 no_grad 包装——
+    # 逐图精修需要对编码图像求梯度，不能在提取特征时截断计算图。
+    # 参数:
+    #   image (torch.Tensor): 输入图像张量，范围 [-1, 1]。
+    # 返回:
+    #   torch.Tensor|None: L2 归一化的 DINOv2 特征；模型未启用时返回 None。
+    def _extract_dino_features_grad(self, image):
+        if self.dino_model is None:
+            return None
+        image_resized = F.interpolate(image, size=(224, 224), mode='bilinear', align_corners=False)
+        x = (image_resized + 1) / 2
+        x = (x - self.dino_mean) / self.dino_std
+        feats = self.dino_model(x)
+        return feats / (feats.norm(dim=-1, keepdim=True) + 1e-7)
+
+    # _build_noiser 方法功能: 按训练噪声配置懒加载并缓存信道采样器。
+    # 解析逻辑与 trainer.py 一致；精修的含噪消息分支用它模拟传播信道。
+    # 返回:
+    #   Noiser: 信道噪声采样器（首次调用时构建，之后复用缓存）。
+    def _build_noiser(self):
+        if self._noiser is None:
+            from noise_argparser import parse_crop, parse_cropout, parse_dropout, parse_resize
+            from noise_layers.jpeg_compression import JpegCompression
+            from noise_layers.quantization import Quantization
+            layers = []
+            if self.cfg.noise_config != 'identity':
+                for command in self.cfg.noise_config.split('+'):
+                    command = command.replace(' ', '')
+                    if command.startswith('cropout'):
+                        layers.append(parse_cropout(command))
+                    elif command.startswith('crop'):
+                        layers.append(parse_crop(command))
+                    elif command.startswith('dropout'):
+                        layers.append(parse_dropout(command))
+                    elif command.startswith('resize'):
+                        layers.append(parse_resize(command))
+                    elif command.startswith('jpeg'):
+                        layers.append(JpegCompression(self.device))
+                    elif command.startswith('quant'):
+                        layers.append(Quantization(self.device))
+            self._noiser = Noiser(layers, self.device).to(self.device)
+        return self._noiser
+
+    # _refine_metrics 方法功能: 以验证同口径计算精修过程的监控指标。
+    # 参数:
+    #   encoded (torch.Tensor): 编码图像张量。
+    #   message (torch.Tensor): 目标消息张量。
+    #   cover (torch.Tensor): 载体图像张量（计算 PSNR/SSIM 用）。
+    #   feat_cover_clip/feat_cover_dino (torch.Tensor|None): 预提取的载体特征（避免重复前向）。
+    #   prv (torch.Tensor|None): 隐私残差（计算 RMS 用）。
+    # 返回:
+    #   dict: clip_sim/dino_sim/bit_acc/psnr/ssim/prv_rms。
+    def _refine_metrics(self, encoded, message, cover, feat_cover_clip, feat_cover_dino, prv=None):
+        with torch.no_grad():
+            feat_enc = self.content_recognizer(encoded)
+            clip_sim = F.cosine_similarity(feat_cover_clip, feat_enc, dim=1).item()
+            dino_sim = None
+            if feat_cover_dino is not None:
+                dino_enc = self._extract_dino_features_grad(encoded)
+                dino_sim = F.cosine_similarity(feat_cover_dino, dino_enc, dim=1).item()
+            pred = (torch.sigmoid(self.decoder(encoded)) > 0.5).float()
+            bit_acc = (pred == message).float().mean().item()
+            mse = torch.mean((encoded - cover) ** 2).item()
+            psnr = 10 * np.log10(4.0 / mse) if mse > 0 else float('inf')
+            ssim = 1 - self.ssim_loss(cover, encoded).item()
+            result = {'clip_sim': clip_sim, 'dino_sim': dino_sim, 'bit_acc': bit_acc,
+                      'psnr': psnr, 'ssim': ssim}
+            if prv is not None:
+                result['prv_rms'] = prv.pow(2).mean().sqrt().item()
+                # 色度 RMS：蒙层监测指标（色度残差 RMS，感知劣化主体，PSNR/SSIM 测不到）
+                r, g, b = prv[:, 0:1], prv[:, 1:2], prv[:, 2:3]
+                cb = -0.168736 * r - 0.331264 * g + 0.5 * b
+                cr = 0.5 * r - 0.418688 * g - 0.081312 * b
+                result['chroma_rms'] = torch.sqrt((cb ** 2 + cr ** 2).mean()).item()
+        return result
+
+    # refine_encoded_image 方法功能: 编码期逐图精修（与 refine_encode.py 完全同配方）。
+    # 冻结全部网络参数，仅把 96x96 低分辨率隐私残差场作为优化变量跑 steps 步 Adam:
+    #   L = w_privacy*(CLIP/DINO escape) + w_message*(干净+含噪 BCE) + w_visual*(MSE+SSIM)
+    #   收敛后可选色度蒙层投影（chroma_projection, 见 _project_out_chroma_lowfreq）
+    # 约束链与训练同构: 96 低通 -> 双三次上采样 -> tanh*prv_budget -> 纹理掩码 -> clamp。
+    # 消息残差 msg_residual 完全取自冻结网络、不参与优化；只在比特 100% 正确的状态里
+    # 挑选 clip_sim 最低者，且以网络原始残差作为初始候选——保证精修结果不劣于直接编码。
+    # 参数:
+    #   cover_image (torch.Tensor): 载体图像张量 (1,3,H,W)，范围 [-1,1]。
+    #   message (torch.Tensor): 消息张量 (1,message_length)。
+    #   steps (int): Adam 优化步数。
+    #   lr (float): Adam 学习率。
+    #   w_privacy/w_message/w_visual (float): 精修目标三项权重（验证配方 12/10/15）。
+    #   margin_end (float|None): CLIP escape margin 覆盖，None 取 Config 默认。
+    #   prv_budget (float|None): 隐私残差预算覆盖，None 取 Config 默认。
+    #   log_interval (int): 指标打印间隔步数。
+    #   verbose (bool): 是否打印精修过程日志（批量评估时可关闭以减少输出）。
+    #   chroma_projection (bool|None): 收敛后剔除 prv 低频色度蒙层（None 取 Config 默认）。
+    # 返回:
+    #   (encoded_refined, report): 精修后的编码图像；report 含基线/精修指标与逐步日志。
+    def refine_encoded_image(self, cover_image, message, steps=60, lr=0.1,
+                             w_privacy=12.0, w_message=10.0, w_visual=15.0,
+                             margin_end=None, prv_budget=None, log_interval=10,
+                             verbose=True, chroma_projection=None):
+        cfg = self.cfg
+        H, W = cover_image.shape[-2], cover_image.shape[-1]
+        budget = prv_budget if prv_budget is not None else cfg.prv_budget
+        margin = margin_end if margin_end is not None else cfg.privacy_margin_end
+        # 色度蒙层事后投影：None 取 Config 默认（False = 关闭，回退原精修配方）
+        if chroma_projection is None:
+            chroma_projection = getattr(cfg, 'refine_chroma_projection', False)
+
+        if verbose:
+            print("\n" + "="*60)
+            print(f"开始逐图精修 (steps={steps}, lr={lr}, budget={budget}, margin={margin}, "
+                  f"chroma_projection={chroma_projection})...")
+
+        # 冻结编码器/解码器参数（记录原状态，结束后恢复）
+        saved_states = []
+        for module in (self.encoder, self.decoder):
+            for p in module.parameters():
+                saved_states.append((p, p.requires_grad))
+                p.requires_grad = False
+
+        try:
+            with torch.no_grad():
+                # 基线编码：消息残差与初始隐私残差均取自冻结网络
+                encoded_base, _, msg_residual, prv_residual = self.encoder(
+                    cover_image, message, phase=2, prv_noise_ratio=0.0
+                )
+                feat_cover_clip = self.content_recognizer(cover_image)
+                feat_cover_dino = self._extract_dino_features_grad(cover_image)
+                texture_mask = self.encoder._compute_texture_mask(cover_image)
+                base_metrics = self._refine_metrics(
+                    encoded_base, message, cover_image,
+                    feat_cover_clip, feat_cover_dino, prv=prv_residual
+                )
+
+            # 精修变量初始化: 逆约束链（纹理掩码/tanh 预算）把网络残差映射回
+            # 低分辨率 pre-tanh 场，从网络已学方向热启动
+            with torch.no_grad():
+                ratio = (prv_residual / (budget * texture_mask + 1e-8)).clamp(-0.95, 0.95)
+                delta0 = F.adaptive_avg_pool2d(
+                    torch.atanh(ratio), (cfg.prv_lowres_size, cfg.prv_lowres_size)
+                )
+
+            def build_encoded(d):
+                # 与训练同构的约束链: 低分辨率场 -> 双三次上采样 -> tanh*预算 -> 纹理掩码 -> clamp
+                prv_up = F.interpolate(d, size=(H, W), mode='bicubic', align_corners=False)
+                prv = budget * torch.tanh(prv_up) * texture_mask
+                return torch.clamp(cover_image + msg_residual + prv, -1, 1), prv
+
+            def eval_delta(d):
+                with torch.no_grad():
+                    enc, prv = build_encoded(d)
+                    return self._refine_metrics(
+                        enc, message, cover_image, feat_cover_clip, feat_cover_dino, prv=prv
+                    )
+
+            # 网络原始残差作为初始最优候选（精修不劣化保证）
+            m_init = eval_delta(delta0)
+            best = (m_init['clip_sim'], delta0.clone(), m_init) if m_init['bit_acc'] >= 1.0 else None
+
+            delta = torch.nn.Parameter(delta0.clone())
+            opt = torch.optim.Adam([delta], lr=lr)
+            bce = torch.nn.BCEWithLogitsLoss()
+            mse = torch.nn.MSELoss()
+            escape = FeatureRedirectionLoss(
+                clip_weight=1.0, dino_weight=cfg.dino_weight,
+                escape_margin=margin,
+                clip_redirect_weight=0.0, dino_redirect_weight=0.0
+            )
+            noiser = self._build_noiser()
+            clean_ratio = cfg.get_msg_clean_ratio(2, 1)
+
+            t0 = time.time()
+            log = []
+            for step in range(1, steps + 1):
+                opt.zero_grad(set_to_none=True)
+                encoded, _ = build_encoded(delta)
+
+                # 隐私逃逸: CLIP/DINO 二次 Hinge escape
+                feat_enc = self.content_recognizer(encoded)
+                dino_enc = self._extract_dino_features_grad(encoded) if feat_cover_dino is not None else None
+                L_priv, _ = escape(
+                    feat_cover_clip, feat_enc,
+                    dino_cover=feat_cover_dino, dino_encoded=dino_enc,
+                    escape_margin=margin,
+                    dino_escape_margin=cfg.dino_escape_margin_end
+                )
+
+                # 消息锚: 干净 + 含噪双分支 BCE（残差不得破坏解码）
+                L_msg = clean_ratio * bce(self.decoder(encoded), message)
+                noised_enc, _ = noiser((encoded, cover_image))
+                L_msg = L_msg + (1.0 - clean_ratio) * bce(self.decoder(noised_enc), message)
+
+                # 视觉锚: MSE + SSIM
+                L_vis = mse(encoded, cover_image) + self.ssim_loss(cover_image, encoded)
+
+                L = w_privacy * L_priv + w_message * L_msg + w_visual * L_vis
+                L.backward()
+                opt.step()
+
+                if step == 1 or step % log_interval == 0 or step == steps:
+                    m = eval_delta(delta)
+                    log.append({'step': step, **m})
+                    if verbose:
+                        dino_str = f"{m['dino_sim']:.4f}" if m['dino_sim'] is not None else '  --  '
+                        chroma_str = (f"{m['chroma_rms']:.4f}"
+                                      if m.get('chroma_rms') is not None else '  --  ')
+                        print(f"    step {step:3d} | clip {m['clip_sim']:.4f} | dino {dino_str} | "
+                              f"bit {m['bit_acc']*100:5.1f}% | psnr {m['psnr']:5.2f} | "
+                              f"ssim {m['ssim']:.4f} | prv_rms {m['prv_rms']:.4f} "
+                              f"| chroma_rms {chroma_str}")
+                    # 最优状态必须比特全对，且 clip_sim 最低
+                    if m['bit_acc'] >= 1.0 and (best is None or m['clip_sim'] < best[0]):
+                        best = (m['clip_sim'], delta.detach().clone(), m)
+
+            # 没有任何比特全对的状态时退回最终步（诚实暴露消息失败）
+            final_delta = best[1] if best is not None else delta.detach().clone()
+            with torch.no_grad():
+                encoded_refined, prv_refined = build_encoded(final_delta)
+                # 色度蒙层事后投影: 剔除 prv 的 8x8 网格低频色度（"发灰/蒙层"主体，
+                # 梯度惩罚实测无效——逃逸方向与色度方向高度平行，只能结构化剔除）。
+                # 门控: 投影后 bit_acc 必须 100% 且 clip_sim 仍 ≤ (1-margin) 逃逸目标，
+                # 否则回退未投影结果（投影是增益项，绝不允许劣化两个硬约束）
+                projected = False
+                if chroma_projection:
+                    prv_proj = _project_out_chroma_lowfreq(prv_refined)
+                    enc_proj = torch.clamp(cover_image + msg_residual + prv_proj, -1, 1)
+                    m_proj = self._refine_metrics(
+                        enc_proj, message, cover_image,
+                        feat_cover_clip, feat_cover_dino, prv=prv_proj
+                    )
+                    if m_proj['bit_acc'] >= 1.0 and m_proj['clip_sim'] <= 1.0 - margin:
+                        encoded_refined, prv_refined = enc_proj, prv_proj
+                        projected = True
+                refined_metrics = self._refine_metrics(
+                    encoded_refined, message, cover_image,
+                    feat_cover_clip, feat_cover_dino, prv=prv_refined
+                )
+            refine_time = time.time() - t0
+
+            if verbose:
+                b, r = base_metrics, refined_metrics
+                chroma_note = (f" | chroma {b.get('chroma_rms', float('nan')):.4f}"
+                               f"->{r.get('chroma_rms', float('nan')):.4f}"
+                               ) if r.get('chroma_rms') is not None else ""
+                proj_note = " | 色度投影已应用" if projected else ""
+                print(f"精修完成: clip {b['clip_sim']:.4f} -> {r['clip_sim']:.4f} | "
+                      f"bit {r['bit_acc']*100:.2f}% | psnr {r['psnr']:.2f} | "
+                      f"ssim {r['ssim']:.4f}{chroma_note}{proj_note} | 用时 {refine_time:.0f}s")
+
+            report = {
+                'base_metrics': base_metrics,
+                'refined_metrics': refined_metrics,
+                'log': log,
+                'time_sec': refine_time,
+                'steps': steps, 'lr': lr, 'budget': budget, 'margin': margin,
+                'chroma_projection_applied': projected
+            }
+            return encoded_refined, report
+        finally:
+            # 恢复网络参数的原 requires_grad 状态
+            for p, state in saved_states:
+                p.requires_grad = state
 
     # decode_message 方法功能: 调用解码器从编码图像中预测消息比特。
     # 参数:
@@ -506,14 +829,22 @@ class ValidationScript:
         image.save(save_path)
         print(f"图像已保存: {save_path}")
 
-    # run_full_validation 方法功能: 执行完整的验证流程，包括编码、解码、消息验证、判别器预测、相似度检查。
+    # run_full_validation 方法功能: 执行完整的验证流程，包括编码、逐图精修、解码、消息验证、判别器预测、相似度检查。
     # 参数:
     #   image_path (str): 载体图像路径。
     #   message (str): 待嵌入的二进制消息或消息文件路径。
     #   output_dir (str|None): 输出目录路径，若为 None 则在原图旁创建 <name>_stego_output 目录。
+    #   refine_steps (int): 逐图精修步数（默认 60；0 关闭精修）。
+    #   refine_lr (float): 精修 Adam 学习率。
+    #   refine_budget (float|None): 精修隐私残差预算覆盖，None 取 Config 默认。
+    #   refine_margin (float|None): 精修 CLIP escape margin 覆盖，None 取 Config 默认。
+    #   refine_chroma_projection (int|None): 收敛后剔除 prv 低频色度蒙层（None 取 Config 默认）。
     # 返回:
-    #   dict: 包含比特准确率、判别器概率、隐私相似度结果等汇总指标。
-    def run_full_validation(self, image_path, message, output_dir=None):
+    #   dict: 包含比特准确率、判别器概率、隐私相似度结果、精修报告等汇总指标。
+    def run_full_validation(self, image_path, message, output_dir=None,
+                            refine_steps=30, refine_lr=0.1,
+                            refine_budget=None, refine_margin=None,
+                            refine_chroma_projection=None):
         print("\n" + "#"*60)
         print("# 完整验证流程")
         print("#"*60)
@@ -523,8 +854,21 @@ class ValidationScript:
         # 2. 处理消息字符串/文件，得到消息张量与原始长度
         message_tensor, message_str, original_length = self.process_message(message)
 
-        # 3. 调用编码器将消息嵌入载体图像
+        # 3. 调用编码器将消息嵌入载体图像（基线编码）
         encoded_image, residual_penalty = self.encode_image(cover_image, message_tensor)
+
+        # 3.5 逐图精修（默认开启）: 对隐私残差再优化 refine_steps 步深挖逃逸，
+        # 消息与视觉质量由精修目标函数硬保证；后续所有验证步骤（解码/判别器/
+        # 相似度/保存）都基于精修后的图像，确保输出图像达标
+        refine_report = None
+        if refine_steps and refine_steps > 0:
+            encoded_image, refine_report = self.refine_encoded_image(
+                cover_image, message_tensor,
+                steps=refine_steps, lr=refine_lr,
+                margin_end=refine_margin, prv_budget=refine_budget,
+                chroma_projection=(None if refine_chroma_projection is None
+                                   else bool(refine_chroma_projection))
+            )
 
         # 4. 调用解码器从编码图像中提取消息
         decoded_message, decoded_prob = self.decode_message(encoded_image)
@@ -558,6 +902,40 @@ class ValidationScript:
         self.save_image(encoded_image, encoded_save_path)
         print(f"\n输出目录: {output_dir}")
 
+        # 9. 生成可视化报告 report.html（自包含 HTML，浏览器直接打开；
+        #    matplotlib 缺失或生成失败时跳过，不影响验证流程本身）
+        try:
+            from visual_report import generate_html_report
+            report_path = generate_html_report(
+                output_dir,
+                cover_image=cover_image,
+                encoded_image=encoded_image,
+                message_bits=message_tensor.squeeze(0).cpu().numpy(),
+                decoded_bits=decoded_message.squeeze(0).cpu().numpy(),
+                decoded_probs=decoded_prob.squeeze(0).cpu().numpy(),
+                bit_accuracy=bit_accuracy,
+                correct_bits=correct_bits,
+                total_bits=total_bits,
+                cover_prob=cover_prob,
+                stego_prob=stego_prob,
+                privacy_results=privacy_results,
+                refine_report=refine_report,
+                meta={
+                    'checkpoint': getattr(self, 'checkpoint_path', None) or '(not provided)',
+                    'input image': os.path.basename(image_path),
+                    'device': str(self.device),
+                    'refine steps': refine_steps if refine_steps else 'off',
+                    'refine budget': refine_budget if refine_budget is not None else self.cfg.prv_budget,
+                    'refine margin': refine_margin if refine_margin is not None else self.cfg.privacy_margin_end,
+                    'message length': total_bits,
+                    'dino_margin': self.cfg.dino_escape_margin_end,
+                }
+            )
+            if report_path:
+                print(f"可视化报告: {report_path}")
+        except Exception as e:
+            print(f"可视化报告生成失败: {e}")
+
         # 打印验证结果汇总
         print("\n" + "#"*60)
         print("# 验证结果汇总")
@@ -571,6 +949,14 @@ class ValidationScript:
         if privacy_results.get('dino_similarity') is not None:
             print(f"DINO 隐私相似度: {privacy_results['dino_similarity_probability']*100:.2f}%")
             print(f"DINO 隐私保护程度: {(1-privacy_results['dino_similarity_probability'])*100:.2f}%")
+        # 逐图精修前后对比（精修开启时）
+        if refine_report is not None:
+            b, r = refine_report['base_metrics'], refine_report['refined_metrics']
+            print(f"逐图精修: CLIP 相似度 {b['clip_sim']:.4f} -> {r['clip_sim']:.4f} "
+                  f"(隐私保护 {(1-b['clip_sim'])*100:.2f}% -> {(1-r['clip_sim'])*100:.2f}%)")
+            print(f"          比特准确率 {b['bit_acc']*100:.2f}% -> {r['bit_acc']*100:.2f}% | "
+                  f"PSNR {b['psnr']:.2f} -> {r['psnr']:.2f} dB | "
+                  f"SSIM {b['ssim']:.4f} -> {r['ssim']:.4f}")
         print("#"*60)
 
         # 返回汇总结果字典
@@ -578,7 +964,8 @@ class ValidationScript:
             'bit_accuracy': bit_accuracy,
             'cover_discriminator_prob': cover_prob,
             'stego_discriminator_prob': stego_prob,
-            'privacy_results': privacy_results
+            'privacy_results': privacy_results,
+            'refine_report': refine_report
         }
 
     # run_discriminator_only 方法功能: 仅运行判别器模式，对输入图像做隐写检测。
@@ -712,6 +1099,23 @@ def main():
     # --mode: 验证模式枚举，默认 full
     parser.add_argument('--mode', type=str, choices=['full', 'discriminator', 'decode', 'similarity'], default='full',
                         help='验证模式: full=完整验证, discriminator=仅判别器预测, decode=仅解码消息, similarity=相似度判断')
+    # --refine-steps: full 模式编码后的逐图精修步数（与 refine_encode.py 同配方）
+    parser.add_argument('--refine-steps', type=int, default=30,
+                        help='逐图精修步数 (0=关闭精修, 默认 30; 精修后图像用于全部后续验证与保存)')
+    # --refine-lr: 精修 Adam 学习率
+    parser.add_argument('--refine-lr', type=float, default=0.1,
+                        help='逐图精修 Adam 学习率 (默认 0.1)')
+    # --refine-budget: 精修隐私残差预算覆盖（默认 0.08 深挖配方）
+    parser.add_argument('--refine-budget', type=float, default=0.08,
+                        help='精修隐私残差预算 (默认 0.08 深挖配方)')
+    # --refine-margin: 精修 CLIP escape margin 覆盖（默认 0.50 深挖配方）
+    parser.add_argument('--refine-margin', type=float, default=0.50,
+                        help='精修 CLIP escape margin (默认 0.50 深挖配方)')
+    # --refine-chroma-projection: 收敛后剔除隐私残差 8x8 网格低频色度（消"蒙层/发灰"；1 开 0 关）
+    parser.add_argument('--refine-chroma-projection', type=int, default=None,
+                        help='精修收敛后剔除 prv 低频色度蒙层 (默认取 Config.refine_chroma_projection; '
+                             '1 开启 / 0 关闭)。门控: 投影后 bit_acc 须 100%% 且 clip_sim 仍达标, '
+                             '否则自动回退未投影结果')
 
     # 解析命令行参数
     args = parser.parse_args()
@@ -746,7 +1150,12 @@ def main():
         validator.run_full_validation(
             image_path=args.image,
             message=args.message,
-            output_dir=args.output_dir
+            output_dir=args.output_dir,
+            refine_steps=args.refine_steps,
+            refine_lr=args.refine_lr,
+            refine_budget=args.refine_budget,
+            refine_margin=args.refine_margin,
+            refine_chroma_projection=args.refine_chroma_projection
         )
     elif args.mode == 'discriminator':
         # 仅判别器预测模式

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 # 主要功能是：模拟 JPEG 压缩过程对图像造成的失真，包括 RGB->YUV 色彩空间转换、
 # 8x8 分块 DCT 变换、按 Zigzag 顺序保留低频系数（高频截断）、IDCT 反变换、YUV->RGB 转换
 # 通过卷积层实现 DCT/IDCT，使整个压缩过程可微，便于反向传播训练
-# 该噪声层由 noise_argparser.py 中的 jpeg 配置项控制（在 Noiser 中以 'JpegPlaceholder' 占位符传入）
+# 该噪声层由 noise_argparser.py 中的 jpeg 配置项构造，以实例形式传入 Noiser
 
 def gen_filters(size_x: int, size_y: int, dct_or_idct_fun: callable) -> np.ndarray:
     # 生成 DCT 或 IDCT 的卷积滤波器组
@@ -31,17 +31,6 @@ def gen_filters(size_x: int, size_y: int, dct_or_idct_fun: callable) -> np.ndarr
                                                                                                             k_x,
                                                                                                             size_x)
     return filters
-
-# def zigzag_indices(shape: (int, int), count):
-#     x_range, y_range = shape
-#     index_order = sorted(((x, y) for x in range(x_range) for y in range(y_range)),
-#                          key=lambda p: (p[0] + p[1], -p[1] if (p[0] + p[1]) % 2 else p[1]))
-#
-#     mask = np.zeros(shape)
-#     for r, c in index_order[:count]:
-#         mask[r,c] = 1
-#
-#     return mask
 
 def get_jpeg_yuv_filter_mask(image_shape: tuple, window_size: int, keep_count: int):
     # 生成 JPEG 量化截断掩码：按 Zigzag 顺序保留前 keep_count 个 DCT 系数，其余置 0
@@ -151,7 +140,7 @@ class JpegCompression(nn.Module):
         # 在第 1 维增加通道维度
         self.idct_conv_weights.unsqueeze_(1)
 
-        self.yuv_keep_weighs = yuv_keep_weights  # 保存各通道保留系数个数（注意：原代码此处拼写为 weighs）
+        self.yuv_keep_weights = yuv_keep_weights  # 保存各通道保留系数个数
 
         self.jpeg_mask = None  # 当前缓存的 JPEG 截断掩码
 
@@ -168,7 +157,7 @@ class JpegCompression(nn.Module):
             # 初始化掩码张量，形状 (3, H, W)，分别对应 Y/U/V 三个通道
             self.jpeg_mask = torch.empty((3,) + requested_shape, device=self.device)
             # 为每个通道生成对应的 Zigzag 截断掩码
-            for channel, weights_to_keep in enumerate(self.yuv_keep_weighs):
+            for channel, weights_to_keep in enumerate(self.yuv_keep_weights):
                 mask = torch.from_numpy(get_jpeg_yuv_filter_mask(requested_shape, 8, weights_to_keep))
                 self.jpeg_mask[channel] = mask
 
@@ -225,7 +214,6 @@ class JpegCompression(nn.Module):
             # 使用非原地 unsqueeze 避免原地修改破坏计算图
             image_conv = image_conv.unsqueeze(1)
 
-            # image_conv = F.conv2d()
             image_conv_channels.append(image_conv)
 
         # 在通道维度上拼接所有通道的结果

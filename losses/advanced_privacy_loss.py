@@ -31,7 +31,8 @@ class FeatureRedirectionLoss(nn.Module):
     def __init__(self, clip_weight=1.0, dino_weight=0.5, escape_margin=0.5,
                  clip_redirect_weight=0.3, dino_redirect_weight=0.2,
                  clip_redirect_margin=0.3, dino_redirect_margin=0.3,
-                 clip_max_target_sim=0.55, dino_max_target_sim=0.55):
+                 clip_max_target_sim=0.88, dino_max_target_sim=0.65,
+                 clip_redirect_target_sim=0.80, dino_redirect_target_sim=0.55):
         # 调用父类 nn.Module 的构造函数，完成模块初始化
         super().__init__()
         # 保存 CLIP escape loss 权重
@@ -44,14 +45,19 @@ class FeatureRedirectionLoss(nn.Module):
         self.clip_redirect_weight = clip_redirect_weight
         # 保存 DINOv2 redirect loss 权重
         self.dino_redirect_weight = dino_redirect_weight
-        # 保存 CLIP redirect 的目标 margin
+        # 保存 CLIP redirect 的目标 margin（遗留参数，目标相似度现由 redirect_target_sim 控制）
         self.clip_redirect_margin = clip_redirect_margin
-        # 保存 DINOv2 redirect 的目标 margin
+        # 保存 DINOv2 redirect 的目标 margin（遗留参数）
         self.dino_redirect_margin = dino_redirect_margin
-        # 保存 CLIP redirect 控制项的相似度上限
+        # 保存 CLIP redirect 控制项的相似度上限（必须大于 clip_redirect_target_sim）
         self.clip_max_target_sim = clip_max_target_sim
         # 保存 DINOv2 redirect 控制项的相似度上限
         self.dino_max_target_sim = dino_max_target_sim
+        # 重定向目标相似度（按特征空间分别标定）：将编码特征拉近 hard negative 直至达到该值。
+        # 取值必须高于该空间典型 hard negative 相似度（CLIP≈0.73 / DINO≈0.47），
+        # 否则 relu(target - sim) 恒为 0，redirect 名存实亡
+        self.clip_redirect_target_sim = clip_redirect_target_sim
+        self.dino_redirect_target_sim = dino_redirect_target_sim
 
     # 计算 escape loss：将编码特征推离载体特征
     # 参数：
@@ -81,24 +87,23 @@ class FeatureRedirectionLoss(nn.Module):
     # 参数：
     #   feat_encoded：编码图像特征，shape 为 [B, D]
     #   hard_negatives：memory bank 中的难负样本特征，shape 为 [B, K, D]，K 为负样本数
-    #   margin：redirect 的目标 margin
-    #   max_target_sim：相似度控制上限，超过则施加惩罚以防止过度靠近负样本
+    #   target_sim：重定向目标相似度，将编码特征拉近负样本直至达到该值
+    #   max_target_sim：相似度控制上限（必须大于 target_sim），超过则施加惩罚
     # 返回：
     #   redirect_loss：标量重定向损失张量
     #   control_loss：标量控制损失张量，用于约束相似度不超过 max_target_sim
-    def redirect_loss(self, feat_encoded, hard_negatives, margin, max_target_sim):
+    def redirect_loss(self, feat_encoded, hard_negatives, target_sim, max_target_sim):
         # 计算每个编码特征与所有难负样本的余弦相似度，shape 为 [B, K]
         sim_to_neg = F.cosine_similarity(feat_encoded.unsqueeze(1), hard_negatives, dim=2)
         # 在 K 维度上找到相似度最大的负样本索引，shape 为 [B]
+        # （调用方已在候选阶段排除自身/近重复，argmax 得到的是"最相似的他人"）
         hardest_idx = sim_to_neg.argmax(dim=1)
         # 根据索引取出每个样本对应的最难负样本特征，shape 为 [B, D]
         hardest_neg = hard_negatives[torch.arange(feat_encoded.size(0)), hardest_idx]
         # 计算编码特征与最难负样本的余弦相似度，shape 为 [B]
         sim_to_hardest = F.cosine_similarity(feat_encoded, hardest_neg, dim=1)
-        # redirect 目标相似度阈值
-        redirect_target = 1 - margin
-        # 主重定向损失：使用 softplus 形式（log1p(exp(·))），鼓励相似度靠近 redirect_target
-        redirect_loss = torch.mean(torch.log1p(torch.exp(redirect_target - sim_to_hardest)))
+        # 主重定向损失：线性 Hinge，把相似度拉升到 target_sim 即停止（避免过度推动）
+        redirect_loss = torch.mean(F.relu(target_sim - sim_to_hardest))
         # 控制损失：当相似度超过 max_target_sim 时施加 Hinge 惩罚，防止过度靠近负样本
         control_loss = torch.mean(F.relu(sim_to_hardest - max_target_sim))
         # 返回重定向损失与控制损失
@@ -112,15 +117,21 @@ class FeatureRedirectionLoss(nn.Module):
     #   dino_encoded：DINOv2 编码特征，可选，shape 为 [B, D_d]
     #   clip_hard_negatives：CLIP 难负样本，可选，shape 为 [B, K, D_c]
     #   dino_hard_negatives：DINOv2 难负样本，可选，shape 为 [B, K, D_d]
-    #   escape_margin：可选，覆盖默认 escape margin（用于渐进调度）
+    #   escape_margin：可选，覆盖默认 CLIP escape margin（用于渐进调度）
+    #   dino_escape_margin：可选，DINOv2 独立的 escape margin（DINO 目标通常更宽松）；
+    #     缺省时回退到 escape_margin，保持旧行为
     # 返回：
     #   total_loss：标量总损失张量
     #   loss_dict：包含各项子损失数值的字典，用于日志记录
     def forward(self, clip_cover, clip_encoded, dino_cover=None, dino_encoded=None,
-                clip_hard_negatives=None, dino_hard_negatives=None, escape_margin=None):
+                clip_hard_negatives=None, dino_hard_negatives=None, escape_margin=None,
+                dino_escape_margin=None):
         # 若调用方未提供 escape_margin，则使用构造时设置的默认值
         if escape_margin is None:
             escape_margin = self.escape_margin
+        # DINOv2 缺省时与 CLIP 共用同一 margin（向后兼容）
+        if dino_escape_margin is None:
+            dino_escape_margin = escape_margin
 
         # 总损失初始化为 0.0（标量），后续累加各路加权损失
         total_loss = 0.0
@@ -138,13 +149,14 @@ class FeatureRedirectionLoss(nn.Module):
 
         # 如果提供了 CLIP 难负样本，且 redirect 权重大于 0，则计算 CLIP redirect loss
         if clip_hard_negatives is not None and self.clip_redirect_weight > 0:
-            # 计算 CLIP 重定向损失与控制损失
+            # 计算 CLIP 重定向损失与控制损失（目标/上限均使用相似度直值，避免 margin 反推造成的目标冲突）
             clip_redir, clip_ctrl = self.redirect_loss(
                 clip_encoded, clip_hard_negatives,
-                self.clip_redirect_margin, self.clip_max_target_sim
+                self.clip_redirect_target_sim, self.clip_max_target_sim
             )
-            # 累加加权后的 CLIP redirect loss 至总损失
-            total_loss += self.clip_redirect_weight * clip_redir
+            # 累加加权后的 CLIP redirect loss 与 control loss 至总损失
+            # （control loss 必须参与优化，否则相似度上限约束不生效）
+            total_loss += self.clip_redirect_weight * (clip_redir + clip_ctrl)
             # 记录 CLIP redirect loss 数值
             loss_dict['clip_redirect'] = clip_redir.item()
             # 记录 CLIP control loss 数值
@@ -152,8 +164,8 @@ class FeatureRedirectionLoss(nn.Module):
 
         # 如果同时提供了 DINOv2 的载体与编码特征，则计算 DINOv2 分支损失
         if dino_cover is not None and dino_encoded is not None:
-            # 计算 DINOv2 escape loss 及当前 DINOv2 相似度
-            dino_escape, dino_sim = self.escape_loss(dino_cover, dino_encoded, escape_margin)
+            # 计算 DINOv2 escape loss（使用独立的 dino_escape_margin）及当前 DINOv2 相似度
+            dino_escape, dino_sim = self.escape_loss(dino_cover, dino_encoded, dino_escape_margin)
             # 累加加权后的 DINOv2 escape loss 至总损失
             total_loss += self.dino_weight * dino_escape
             # 记录 DINOv2 escape loss 数值
@@ -166,10 +178,10 @@ class FeatureRedirectionLoss(nn.Module):
                 # 计算 DINOv2 重定向损失与控制损失
                 dino_redir, dino_ctrl = self.redirect_loss(
                     dino_encoded, dino_hard_negatives,
-                    self.dino_redirect_margin, self.dino_max_target_sim
+                    self.dino_redirect_target_sim, self.dino_max_target_sim
                 )
-                # 累加加权后的 DINOv2 redirect loss 至总损失
-                total_loss += self.dino_redirect_weight * dino_redir
+                # 累加加权后的 DINOv2 redirect loss 与 control loss 至总损失
+                total_loss += self.dino_redirect_weight * (dino_redir + dino_ctrl)
                 # 记录 DINOv2 redirect loss 数值
                 loss_dict['dino_redirect'] = dino_redir.item()
                 # 记录 DINOv2 control loss 数值

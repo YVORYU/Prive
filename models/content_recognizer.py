@@ -3,7 +3,7 @@
 # 职责：封装冻结的 CLIP ViT-B/32 模型，用于提取图像和文本的特征向量，
 #       并对输出做 L2 归一化以便后续计算 cosine similarity。
 #       在 PrivSteg 中，主要用于：
-#         1) 计算 FeatureReductionLoss 中的 CLIP escape loss，引导编码图像的 CLIP
+#         1) 计算 FeatureRedirectionLoss 中的 CLIP escape loss，引导编码图像的 CLIP
 #            特征远离原始载体图像的特征，降低 CBIR 检索关联风险；
 #         2) 在验证脚本中计算编码图像与原始载体图像的 CLIP 相似度，评估隐私保护效果。
 # 注意：CLIP 模型参数完全冻结，不参与反向传播。
