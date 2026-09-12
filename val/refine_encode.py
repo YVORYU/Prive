@@ -31,7 +31,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from validation_script import ValidationScript, _project_out_chroma_lowfreq
+from validation_script import ValidationScript, _project_out_chroma_lowfreq, _delta_e_map
 from losses.advanced_privacy_loss import FeatureRedirectionLoss
 from noise_layers.noiser import Noiser
 
@@ -120,8 +120,15 @@ def noise_robustness_eval(vs, noiser, cover, message, encoded, feat_cover_clip, 
 def refine_image(vs, cfg, cover, message, args, noiser):
     device = vs.device
     H, W = cover.shape[-2], cover.shape[-1]
-    # 预算可 CLI 覆盖：用于编码期试探更大预算下的逃逸深度
+    # 精修配方默认统一取 Config.refine_*（2026-09 视觉-逃逸解耦配方），CLI 显式传参覆盖
     # （热启动比例与新约束链自动一致，无需额外处理）
+    steps = args.steps if getattr(args, 'steps', None) is not None else getattr(cfg, 'refine_steps', 60)
+    lr = args.lr if getattr(args, 'lr', None) is not None else 0.1
+    w_privacy = args.w_privacy if getattr(args, 'w_privacy', None) is not None else getattr(cfg, 'refine_w_privacy', 12.0)
+    w_message = args.w_message if getattr(args, 'w_message', None) is not None else getattr(cfg, 'refine_w_message', 10.0)
+    w_visual = args.w_visual if getattr(args, 'w_visual', None) is not None else getattr(cfg, 'refine_w_visual', 15.0)
+    w_de = args.w_de if getattr(args, 'w_de', None) is not None else getattr(cfg, 'refine_w_de', 0.0)
+    de_tau = args.de_tau if getattr(args, 'de_tau', None) is not None else getattr(cfg, 'refine_de_tau', 2.0)
     budget = args.prv_budget if getattr(args, 'prv_budget', None) else cfg.prv_budget
 
     # ===== 冻结全部网络，准备常量 =====
@@ -147,12 +154,15 @@ def refine_image(vs, cfg, cover, message, args, noiser):
         delta0 = F.adaptive_avg_pool2d(pre_tanh, (cfg.prv_lowres_size, cfg.prv_lowres_size))
 
     delta = torch.nn.Parameter(delta0.clone())
-    opt = torch.optim.Adam([delta], lr=args.lr)
+    cur_lr = lr
+    opt = torch.optim.Adam([delta], lr=cur_lr)
     bce = torch.nn.BCEWithLogitsLoss()
     mse = torch.nn.MSELoss()
     # escape margin 可 CLI 覆盖：二次 Hinge 在 sim < (1-margin) 后梯度归零，
-    # margin 决定逃逸地板——放大 margin 是压穿 0.70 平台的最直接杠杆
-    margin_end = args.margin_end if getattr(args, 'margin_end', None) else cfg.privacy_margin_end
+    # margin 决定逃逸地板——放大 margin 是压穿 0.70 平台的最直接杠杆。
+    # None 取 Config.refine_margin_end（与训练期 privacy_margin_end 独立）
+    margin_end = (args.margin_end if getattr(args, 'margin_end', None) is not None
+                  else getattr(cfg, 'refine_margin_end', cfg.privacy_margin_end))
     # 色度蒙层事后投影：None 取 Config 默认（False = 关闭）
     chroma_projection = (args.chroma_projection
                          if getattr(args, 'chroma_projection', None) is not None
@@ -173,7 +183,9 @@ def refine_image(vs, cfg, cover, message, args, noiser):
     log = []
     best = None  # (clip_sim, delta克隆, 指标dict)
     t0 = time.time()
-    for step in range(1, args.steps + 1):
+    stop_step = None  # 提前终止发生的步数 (跑满 steps 则为 None)
+    guard_fails = 0  # 数值防护触发次数
+    for step in range(1, steps + 1):
         opt.zero_grad(set_to_none=True)
         encoded, prv = build_encoded(delta)
 
@@ -188,15 +200,66 @@ def refine_image(vs, cfg, cover, message, args, noiser):
 
         logits_clean = vs.decoder(encoded)
         L_msg = clean_ratio * bce(logits_clean, message)
+
+        # ===== 提前终止: 地板以下 CLIP hinge 梯度归零，触底后继续迭代只剩
+        # 消息/视觉项往回拉，纯浪费步数。条件: 干净分支 bit 100% 且
+        # clip_sim ≤ 地板+0.005 (sim/bit 均取自本步已算好的前向, 检查零开销,
+        # 且放在反向传播之前——触底那步连 backward 都省掉)。
+        # 容差 0.005: 全量实测容差 0.02 会把逐图 sim 钉在地板+0.02,
+        # 直接损失 ~6 个点检索逃逸率 (90%→84%), 收紧到 0.005 基本无损失
+        bit_now = (torch.sigmoid(logits_clean) > 0.5).float().eq(message).float().mean().item()
+        if bit_now >= 1.0 and pinfo['clip_sim'] <= (1.0 - margin_end) + 0.005:
+            with torch.no_grad():
+                enc_stop, _ = build_encoded(delta)
+                m_stop = compute_metrics(vs, cover, message, enc_stop,
+                                         feat_cover_clip, feat_cover_dino, prv=prv)
+            log.append({'step': step, **m_stop})
+            if m_stop['bit_acc'] >= 1.0 and (best is None or m_stop['clip_sim'] < best[0]):
+                best = (m_stop['clip_sim'], delta.detach().clone(), m_stop)
+            print(f"    [提前终止] step {step}: clip {pinfo['clip_sim']:.4f} "
+                  f"已达逃逸地板且 bit 100%, 停止优化")
+            stop_step = step
+            break
+
         noised_enc, _ = noiser((encoded, cover))
         logits_noised = vs.decoder(noised_enc)
         L_msg = L_msg + (1.0 - clean_ratio) * bce(logits_noised, message)
 
         L_vis = mse(encoded, cover) + vs.ssim_loss(cover, encoded)
 
-        L = args.w_privacy * L_priv + args.w_message * L_msg + args.w_visual * L_vis
+        # 感知色差锚 (可选, w_de>0): 对 ΔE>tau 的像素二次惩罚, 压制色罩/蒙层类失真
+        # (逃逸最省力方向是低频色度偏移, PSNR/SSIM 对其失明)
+        if w_de > 0:
+            L_dE = (torch.relu(_delta_e_map(encoded, cover) - de_tau) ** 2).mean()
+        else:
+            L_dE = torch.zeros((), device=cover.device)
+
+        L = w_privacy * L_priv + w_message * L_msg + w_visual * L_vis + w_de * L_dE
+        if not torch.isfinite(L):
+            # 数值防护: 精修发散 (NaN/Inf) 时丢弃该步
+            opt.zero_grad(set_to_none=True)
+            continue
+        prev_delta = delta.detach().clone()
         L.backward()
         opt.step()
+        # 钳制 pre-tanh 场值域: tanh 在 |x|>4 已完全饱和, 钳制不改变有效残差,
+        # 但阻止 delta 无界增长导致的步长爆炸
+        torch.clamp_(delta.data, -8.0, 8.0)
+        if not torch.isfinite(delta).all():
+            # 数值防护: L 有限但梯度非有限时 Adam 会把优化变量写坏（终局是 NaN 图像）。
+            # 回退 + 随机抖动移离病态点 + 重建优化器（非有限梯度下任何学习率都无效,
+            # 抖动绕开才是有效手段）。连续失败超过上限则终止本图, 沿用最后有限状态
+            delta.data.copy_(prev_delta)
+            guard_fails += 1
+            if guard_fails > 10:
+                print(f"    [数值防护] step {step} 重试次数已用尽, 沿用最后有限状态")
+                break
+            delta.data.add_(torch.randn_like(delta.data) * (0.02 + 0.01 * guard_fails))
+            torch.clamp_(delta.data, -8.0, 8.0)
+            opt = torch.optim.Adam([delta], lr=cur_lr)
+            opt.zero_grad(set_to_none=True)
+            print(f"    [数值防护] step {step} 梯度非有限, 回退+抖动重试 (第 {guard_fails} 次)")
+            continue
 
         if step == 1 or step % args.log_interval == 0:
             with torch.no_grad():
@@ -216,6 +279,9 @@ def refine_image(vs, cfg, cover, message, args, noiser):
 
     refine_time = time.time() - t0
     final_delta = best[1] if best is not None else delta.detach().clone()
+    if not torch.isfinite(final_delta).all():
+        # 兜底: 产出绝不允许 NaN，回退网络自身残差
+        final_delta = delta0.clone()
     with torch.no_grad():
         encoded_refined, prv_refined = build_encoded(final_delta)
         # 色度蒙层事后投影: 剔除 prv 的 8x8 网格低频色度（与 validation_script
@@ -237,6 +303,7 @@ def refine_image(vs, cfg, cover, message, args, noiser):
         'encoded_base': encoded_base, 'encoded_refined': encoded_refined,
         'base_metrics': base_metrics, 'refined_metrics': refined_metrics,
         'log': log, 'time_sec': refine_time, 'chroma_projection_applied': projected,
+        'stop_step': stop_step,
         'feat_cover_clip': feat_cover_clip, 'feat_cover_dino': feat_cover_dino
     }
 
@@ -249,22 +316,34 @@ def main():
                         default='101000100110100101100011100010')
     parser.add_argument('--output-dir', '-o', type=str, default='./other/refine_output')
     parser.add_argument('--device', type=str, default=None)
-    parser.add_argument('--steps', type=int, default=60)
-    parser.add_argument('--lr', type=float, default=0.1)
+    parser.add_argument('--steps', type=int, default=None,
+                        help='精修步数 (None=取 Config.refine_steps, 默认 150)')
+    parser.add_argument('--lr', type=float, default=None,
+                        help='Adam 学习率 (None=默认 0.1)')
     parser.add_argument('--log-interval', type=int, default=10)
-    parser.add_argument('--w-privacy', type=float, default=12.0)
-    parser.add_argument('--w-message', type=float, default=10.0)
-    parser.add_argument('--w-visual', type=float, default=15.0)
-    parser.add_argument('--prv-budget', type=float, default=0.08,
-                        help='覆盖隐私残差预算（默认 0.08 深挖配方）；'
+    parser.add_argument('--w-privacy', type=float, default=None,
+                        help='隐私(逃逸)锚权重 (None=取 Config.refine_w_privacy, 默认 12.0)')
+    parser.add_argument('--w-message', type=float, default=None,
+                        help='消息锚权重 (None=取 Config.refine_w_message, 默认 20.0)')
+    parser.add_argument('--w-visual', type=float, default=None,
+                        help='视觉锚权重 (None=取 Config.refine_w_visual, 默认 15.0)')
+    parser.add_argument('--prv-budget', type=float, default=None,
+                        help='覆盖隐私残差预算 (None=取 Config.prv_budget, 默认 0.08 深挖配方)；'
                              '逃逸深度近似随预算平方增长')
-    parser.add_argument('--margin-end', type=float, default=0.50,
-                        help='覆盖 CLIP escape margin（默认 0.50 深挖配方）。'
-                             '二次 Hinge 梯度在 sim<(1-margin) 后归零，压穿 0.70 平台需放大此值')
+    parser.add_argument('--margin-end', type=float, default=None,
+                        help='覆盖 CLIP escape margin (None=取 Config.refine_margin_end, '
+                             '默认 0.60)。二次 Hinge 梯度在 sim<(1-margin) 后归零，'
+                             'margin 即逃逸地板')
     parser.add_argument('--chroma-projection', type=int, default=None,
                         help='收敛后剔除 prv 低频色度蒙层 (默认取 Config.refine_chroma_projection; '
                              '1 开启 / 0 关闭)。门控: bit_acc 须 100%% 且 clip_sim 达标, 否则回退。'
-                             '消解"蒙层/发灰"感知劣化 (残差 77%% 能量在色度通道, 其中低频为主)')
+                             '注意: 深逃逸(margin>=0.55)下投影门控基本不会满足, 且投影直接'
+                             '削掉逃逸方向, 推荐保持关闭')
+    parser.add_argument('--w-de', type=float, default=None,
+                        help='感知色差锚权重 (None=取 Config.refine_w_de, 默认 200)。对 ΔE>tau 的像素二次惩罚, '
+                             '压制 PSNR/SSIM 测不到的色罩/蒙层类失真')
+    parser.add_argument('--de-tau', type=float, default=None,
+                        help='感知色差锚阈值 (None=取 Config.refine_de_tau, 默认 4.0)')
     parser.add_argument('--noise-eval', type=int, default=8, help='信道鲁棒性采样次数')
     parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()

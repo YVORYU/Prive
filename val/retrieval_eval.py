@@ -143,16 +143,25 @@ def main():
                         help='查询图像数 (从图库中采样, 原图保留在图库内)')
     parser.add_argument('--gallery-size', type=int, default=1000,
                         help='主图库大小 (val 目录采样)')
-    parser.add_argument('--refine-steps', type=int, default=30,
-                        help='查询编码后的逐图精修步数 (0=关闭精修)')
+    parser.add_argument('--refine-steps', type=int, default=None,
+                        help='查询编码后的逐图精修步数 (0=关闭精修; None=取 Config.refine_steps, 默认 150)')
     parser.add_argument('--refine-lr', type=float, default=0.1)
-    parser.add_argument('--refine-budget', type=float, default=0.08,
-                        help='精修隐私残差预算 (默认 0.08 深挖配方)')
-    parser.add_argument('--refine-margin', type=float, default=0.50,
-                        help='精修 CLIP escape margin (默认 0.50 深挖配方)')
+    parser.add_argument('--refine-budget', type=float, default=None,
+                        help='精修隐私残差预算 (None=取 Config.prv_budget, 默认 0.08)')
+    parser.add_argument('--refine-margin', type=float, default=None,
+                        help='精修 CLIP escape margin (None=取 Config.refine_margin_end, 默认 0.60)')
     parser.add_argument('--refine-chroma-projection', type=int, default=None,
                         help='精修收敛后剔除 prv 低频色度蒙层 (默认取 Config.refine_chroma_projection; '
                              '1 开启 / 0 关闭)。门控: bit_acc 须 100%% 且 clip_sim 达标, 否则回退')
+    parser.add_argument('--refine-w-de', type=float, default=None,
+                        help='精修感知色差锚权重 (None=取 Config.refine_w_de, 默认 200; 0=关闭)。'
+                             '对 ΔE>tau 的像素二次惩罚, 压制 PSNR/SSIM 测不到的色罩/蒙层类失真')
+    parser.add_argument('--refine-de-tau', type=float, default=None,
+                        help='感知色差锚阈值 de_tau (None=取 Config.refine_de_tau, 默认 4.0)')
+    parser.add_argument('--refine-w-message', type=float, default=None,
+                        help='精修消息锚权重 (None=取 Config.refine_w_message, 默认 20)')
+    parser.add_argument('--refine-w-privacy', type=float, default=None,
+                        help='精修隐私(逃逸)锚权重 (None=取 Config.refine_w_privacy, 默认 12)')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--report-only', action='store_true',
                         help='不跑评估, 直接从已有 results.json 重新生成可视化报告')
@@ -205,7 +214,9 @@ def main():
     # 保存评估元信息（图库规模等, 供可视化报告读取）
     with open(os.path.join(args.output_dir, 'eval_meta.json'), 'w', encoding='utf-8') as f:
         json.dump({'gallery_size': len(gallery_paths), 'num_queries': len(query_paths),
-                   'refine_steps': args.refine_steps}, f, ensure_ascii=False, indent=2)
+                   'refine_steps': args.refine_steps,
+                   'refine_w_de': args.refine_w_de, 'refine_de_tau': args.refine_de_tau},
+                  f, ensure_ascii=False, indent=2)
 
     # ===== 模型与图库特征 =====
     vs = ValidationScript(checkpoint_path=args.checkpoint, device=device)
@@ -233,13 +244,16 @@ def main():
             encoded_base, _, _, _ = vs.encoder(cover, msg, phase=2, prv_noise_ratio=0.0)
 
         # 逐图精修
-        if args.refine_steps > 0:
+        # refine_steps None = 取 Config.refine_steps (由 refine_encoded_image 内部解析)
+        if args.refine_steps is None or args.refine_steps > 0:
             encoded_refined, report = vs.refine_encoded_image(
                 cover, msg, steps=args.refine_steps, lr=args.refine_lr,
                 margin_end=args.refine_margin, prv_budget=args.refine_budget,
                 verbose=False,
                 chroma_projection=(None if args.refine_chroma_projection is None
-                                   else bool(args.refine_chroma_projection))
+                                   else bool(args.refine_chroma_projection)),
+                w_de=args.refine_w_de, de_tau=args.refine_de_tau,
+                w_message=args.refine_w_message, w_privacy=args.refine_w_privacy
             )
         else:
             encoded_refined, report = encoded_base, None

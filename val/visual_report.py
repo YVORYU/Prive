@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 
 # 图表与报告文本统一使用英文：matplotlib 默认 DejaVu Sans 含完整英文字形，
-# 任何平台（Windows/Linux 服务器）无需额外字体文件
+# 任何平台（Windows/Linux 服务器）无需额外字  体文件
 plt.rcParams['axes.unicode_minus'] = False
 
 _CSS = """

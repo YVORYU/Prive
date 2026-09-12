@@ -100,6 +100,58 @@ def _chroma_args(a):
     return ['--refine-chroma-projection', str(a.refine_chroma_projection)]
 
 
+def _wde_args(a):
+    # 感知色差锚参数转发 (None 安全): None = 取 Config.refine_w_de/refine_de_tau 默认, 不传参
+    out = []
+    if a.refine_w_de is not None:
+        out += ['--refine-w-de', str(a.refine_w_de)]
+    if a.refine_de_tau is not None:
+        out += ['--refine-de-tau', str(a.refine_de_tau)]
+    return out
+
+
+def _refine_args(a):
+    # 精修配方参数转发 (None 安全): None = 取 Config.refine_* 默认, 不传参;
+    # 非 None 逐项显式覆盖子脚本默认
+    out = []
+    if a.refine_steps is not None:
+        out += ['--refine-steps', str(a.refine_steps)]
+    if a.refine_lr is not None:
+        out += ['--refine-lr', str(a.refine_lr)]
+    if a.refine_budget is not None:
+        out += ['--refine-budget', str(a.refine_budget)]
+    if a.refine_margin is not None:
+        out += ['--refine-margin', str(a.refine_margin)]
+    if a.refine_w_message is not None:
+        out += ['--refine-w-message', str(a.refine_w_message)]
+    if a.refine_w_privacy is not None:
+        out += ['--refine-w-privacy', str(a.refine_w_privacy)]
+    return out
+
+
+def _effective_refine_cfg(a):
+    # 显示/汇总用: 把 None 解析为 Config.refine_* 的实际生效值
+    # (子脚本对 None 的解析与本处一致, 保证汇总记录的就是真实配方)
+    from config import Config
+    return {
+        'steps': a.refine_steps if a.refine_steps is not None
+                 else getattr(Config, 'refine_steps', 30),
+        'lr': a.refine_lr if a.refine_lr is not None else 0.1,
+        'budget': a.refine_budget if a.refine_budget is not None else Config.prv_budget,
+        'margin': a.refine_margin if a.refine_margin is not None
+                  else getattr(Config, 'refine_margin_end', Config.privacy_margin_end),
+        'w_de': a.refine_w_de if a.refine_w_de is not None
+                else getattr(Config, 'refine_w_de', 0.0),
+        'de_tau': a.refine_de_tau if a.refine_de_tau is not None
+                  else getattr(Config, 'refine_de_tau', 2.0),
+        'w_message': a.refine_w_message if a.refine_w_message is not None
+                     else getattr(Config, 'refine_w_message', 10.0),
+        'w_privacy': a.refine_w_privacy if a.refine_w_privacy is not None
+                     else getattr(Config, 'refine_w_privacy', 12.0),
+        'chroma_projection': a.refine_chroma_projection,
+    }
+
+
 # ============================ 各阶段 ============================
 
 def _reset_smoke_dir(out_root):
@@ -128,10 +180,8 @@ def run_smoke(a):
     run_stage('smoke/batch_eval (1 张, 含精修)',
               [sys.executable, os.path.join(_VAL_DIR, 'batch_eval.py'),
                '-c', a.checkpoint, '--val-dir', a.val_dir,
-               '--num-images', '1', '--noise-eval', '2', '--no-save-images',
-               '--refine-steps', str(a.refine_steps), '--refine-lr', str(a.refine_lr),
-               '--refine-budget', str(a.refine_budget), '--refine-margin', str(a.refine_margin)] \
-              + _chroma_args(a) + [
+               '--num-images', '1', '--noise-eval', '2', '--no-save-images'] \
+              + _refine_args(a) + _chroma_args(a) + _wde_args(a) + [
                '--seed', str(a.seed),
                '-o', os.path.join(smoke_root, 'batch_eval')] + _device_args(a))
     if _DRY_RUN:
@@ -177,10 +227,8 @@ def run_single(a):
               f"子脚本可能报错, 请确认消息长度。")
     run_stage('single (单图全链路 full 模式)',
               [sys.executable, os.path.join(_VAL_DIR, 'validation_script.py'),
-               '-c', a.checkpoint, '-i', paths[0], '-m', a.message, '--mode', 'full',
-               '--refine-steps', str(a.refine_steps), '--refine-lr', str(a.refine_lr),
-               '--refine-budget', str(a.refine_budget), '--refine-margin', str(a.refine_margin)] \
-              + _chroma_args(a) + [
+               '-c', a.checkpoint, '-i', paths[0], '-m', a.message, '--mode', 'full'] \
+              + _refine_args(a) + _chroma_args(a) + _wde_args(a) + [
                '-o', os.path.join(a.output_root, 'single')] + _device_args(a))
 
 
@@ -204,10 +252,8 @@ def run_retrieval_baseline(a, gallery):
 def run_batch_eval(a, n_eval):
     cmd = [sys.executable, os.path.join(_VAL_DIR, 'batch_eval.py'),
            '-c', a.checkpoint, '--val-dir', a.val_dir,
-           '--num-images', str(n_eval), '--noise-eval', str(a.noise_eval),
-           '--refine-steps', str(a.refine_steps), '--refine-lr', str(a.refine_lr),
-           '--refine-budget', str(a.refine_budget), '--refine-margin', str(a.refine_margin)] \
-          + _chroma_args(a) + [
+           '--num-images', str(n_eval), '--noise-eval', str(a.noise_eval)] \
+          + _refine_args(a) + _chroma_args(a) + _wde_args(a) + [
            '--seed', str(a.seed), '-o', os.path.join(a.output_root, 'batch_eval')]
     if a.no_save_images:
         cmd.append('--no-save-images')
@@ -226,10 +272,8 @@ def run_retrieval_eval(a, gallery):
             print('[缓存复用] 已复制基线阶段 gallery_feats.pt -> retrieval_eval (同图库配置直接命中)')
     cmd = [sys.executable, os.path.join(_VAL_DIR, 'retrieval_eval.py'),
            '-c', a.checkpoint, '--val-dir', a.val_dir,
-           '--num-queries', str(a.num_queries), '--gallery-size', str(gallery),
-           '--refine-steps', str(a.refine_steps), '--refine-lr', str(a.refine_lr),
-           '--refine-budget', str(a.refine_budget), '--refine-margin', str(a.refine_margin)] \
-          + _chroma_args(a) + [
+           '--num-queries', str(a.num_queries), '--gallery-size', str(gallery)] \
+          + _refine_args(a) + _chroma_args(a) + _wde_args(a) + [
            '--seed', str(a.seed), '-o', os.path.join(a.output_root, 'retrieval_eval')]
     run_stage('retrieval_eval (检索精修评估, 复用图库缓存)', cmd + _extra_gallery_args(a) + _device_args(a))
 
@@ -262,7 +306,9 @@ def batch_rows(bb, be):
             ('DINO 相似度', 'DINO similarity', 'dino_sim', '{:.4f}'),
             ('比特准确率', 'Bit accuracy', 'bit_acc', '{:.1%}'),
             ('PSNR (dB)', 'PSNR (dB)', 'psnr', '{:.2f}'),
-            ('SSIM', 'SSIM', 'ssim', '{:.4f}')]:
+            ('SSIM', 'SSIM', 'ssim', '{:.4f}'),
+            ('感知色差 ΔE (均值)', 'Perceptual ΔE (mean)', 'dE_mean', '{:.2f}'),
+            ('ΔE>5 像素占比', 'ΔE>5 pixel ratio', 'dE_gt5_ratio', '{:.1%}')]:
         rows.append((zh, en, ms(bbm, key, fmt), ms(bem, key, fmt), ms(brm, key, fmt)))
 
     def pct3(v1, v2, v3):
@@ -373,6 +419,8 @@ def run_summary(out_root, a):
               f'(直出值越低 = 内环蒸馏摊销越成功; 差值 = 逐图精修的额外收益)')
 
     # ---- 写 full_summary.json / full_summary.md ----
+    rc = _effective_refine_cfg(a)
+
     def to_dicts(rows):
         return [{'metric_zh': zh, 'metric': en, 'direct': c1, 'direct_in_run': c2, 'refined': c3}
                 for zh, en, c1, c2, c3 in rows]
@@ -380,9 +428,11 @@ def run_summary(out_root, a):
     consolidated = {
         'meta': {
             'checkpoint': a.checkpoint, 'val_dir': a.val_dir, 'seed': a.seed,
-            'refine': {'steps': a.refine_steps, 'lr': a.refine_lr,
-                       'budget': a.refine_budget, 'margin': a.refine_margin,
-                       'chroma_projection': a.refine_chroma_projection},
+            'refine': {'steps': rc['steps'], 'lr': rc['lr'],
+                       'budget': rc['budget'], 'margin': rc['margin'],
+                       'w_de': rc['w_de'], 'de_tau': rc['de_tau'],
+                       'w_message': rc['w_message'], 'w_privacy': rc['w_privacy'],
+                       'chroma_projection': rc['chroma_projection']},
             'num_images_evaluated': n_batch,
             'num_queries': meta_re.get('num_queries'), 'gallery_size': meta_re.get('gallery_size'),
             'generated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -401,9 +451,10 @@ def run_summary(out_root, a):
           f"- Images evaluated (batch): {n_batch}",
           f"- Retrieval: {meta_re.get('num_queries', '-')} queries / "
           f"{meta_re.get('gallery_size', '-')} gallery",
-          f"- Seed: {a.seed} | Refinement: steps={a.refine_steps}, lr={a.refine_lr}, "
-          f"budget={a.refine_budget}, margin={a.refine_margin}, "
-          f"chroma_projection={a.refine_chroma_projection if a.refine_chroma_projection is not None else 'cfg default'}",
+          f"- Seed: {a.seed} | Refinement: steps={rc['steps']}, lr={rc['lr']}, "
+          f"budget={rc['budget']}, margin={rc['margin']}, w_de={rc['w_de']}, "
+          f"de_tau={rc['de_tau']}, w_message={rc['w_message']}, w_privacy={rc['w_privacy']}, "
+          f"chroma_projection={rc['chroma_projection'] if rc['chroma_projection'] is not None else 'cfg default'}",
           f"- Generated: {consolidated['meta']['generated']}", '',
           '## 1. Batch quantitative evaluation', '',
           '| Metric | Encoder direct | Encoder direct (in-run) | Per-image refined |',
@@ -466,15 +517,26 @@ def main():
     parser.add_argument('--extra-gallery-dir', type=str, default=None,
                         help='可选: 检索图库扩充目录 (如 train 集, 增大干扰池)')
     parser.add_argument('--extra-gallery-size', type=int, default=0)
-    parser.add_argument('--refine-steps', type=int, default=30)
-    parser.add_argument('--refine-lr', type=float, default=0.1)
-    parser.add_argument('--refine-budget', type=float, default=0.08,
-                        help='精修隐私残差预算 (默认 0.08 深挖配方)')
-    parser.add_argument('--refine-margin', type=float, default=0.50,
-                        help='精修 CLIP escape margin (默认 0.50 深挖配方)')
+    parser.add_argument('--refine-steps', type=int, default=None,
+                        help='精修步数 (None=取 Config.refine_steps, 默认 150)')
+    parser.add_argument('--refine-lr', type=float, default=None,
+                        help='精修 Adam 学习率 (None=取子脚本默认 0.1)')
+    parser.add_argument('--refine-budget', type=float, default=None,
+                        help='精修隐私残差预算 (None=取 Config.prv_budget, 默认 0.08)')
+    parser.add_argument('--refine-margin', type=float, default=None,
+                        help='精修 CLIP escape margin (None=取 Config.refine_margin_end, 默认 0.60)')
     parser.add_argument('--refine-chroma-projection', type=int, default=None,
                         help='精修收敛后剔除 prv 低频色度蒙层 (默认取 Config.refine_chroma_projection; '
                              '1 开启 / 0 关闭)。门控: bit_acc 须 100%% 且 clip_sim 达标, 否则回退')
+    parser.add_argument('--refine-w-de', type=float, default=None,
+                        help='精修感知色差锚权重 (None=取 Config.refine_w_de, 默认 200; 0=关闭)。'
+                             '对 ΔE>tau 像素二次惩罚, 压制 PSNR/SSIM 测不到的色罩/蒙层类失真')
+    parser.add_argument('--refine-de-tau', type=float, default=None,
+                        help='感知色差锚阈值 de_tau (None=取 Config.refine_de_tau, 默认 4.0)')
+    parser.add_argument('--refine-w-message', type=float, default=None,
+                        help='精修消息锚权重 (None=取 Config.refine_w_message, 默认 20)')
+    parser.add_argument('--refine-w-privacy', type=float, default=None,
+                        help='精修隐私(逃逸)锚权重 (None=取 Config.refine_w_privacy, 默认 12)')
     parser.add_argument('--noise-eval', type=int, default=8)
     parser.add_argument('--message', type=str, default='101000100110100101100011100010',
                         help='单图全链路验证使用的消息 (默认 30 bit)')
@@ -534,6 +596,7 @@ def main():
     ordered = [s for s in STAGE_ORDER if s in set(stages)]
 
     # ---- 计划 ----
+    rc = _effective_refine_cfg(args)
     print(BANNER)
     print('# PrivSteg 全链路验证')
     print(BANNER)
@@ -541,8 +604,9 @@ def main():
     print(f'测试集     : {args.val_dir} ({n_img} 张)')
     print(f'评估规模   : 批量 {n_eval} 张 | 检索 查询 {args.num_queries} / 图库 {gallery} 张 '
           f'(随机 top-1 命中概率 {100.0 / gallery:.2f}%)')
-    print(f'配置       : seed={args.seed} | 精修 steps={args.refine_steps} '
-          f'budget={args.refine_budget} margin={args.refine_margin} '
+    print(f'配置       : seed={args.seed} | 精修 steps={rc["steps"]} '
+          f'budget={rc["budget"]} margin={rc["margin"]} w_de={rc["w_de"]} '
+          f'de_tau={rc["de_tau"]} w_message={rc["w_message"]} w_privacy={rc["w_privacy"]} '
           f'chroma_projection={args.refine_chroma_projection if args.refine_chroma_projection is not None else "cfg默认"} '
           f'| noise-eval={args.noise_eval}')
     print(f'device     : {args.device or "auto (子脚本自动选择 CUDA/CPU)"}')

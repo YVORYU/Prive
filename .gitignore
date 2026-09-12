@@ -48,6 +48,7 @@ dataset1/
 dataset2/
 data/train/
 data/val/
+paper/
 
 # IDE
 .vscode/

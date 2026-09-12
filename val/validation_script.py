@@ -65,6 +65,40 @@ def _project_out_chroma_lowfreq(prv, grid=8):
     return out
 
 
+# _RGB2LAB_M/_RGB2LAB_W: sRGB->CIELAB 线性化 RGB->XYZ 变换常量 (D65 白点)。
+# 用途: 感知色差 ΔE。低频色度偏移（色罩/蒙层/红眼）是隐私逃逸最省力方向，而
+# PSNR/SSIM 对这类空间相干的色度误差基本失明；ΔE 在 JND（约 2.3）附近与人眼
+# 可辨度一致，因此同时用作精修的感知约束项与逐图评测指标。
+_RGB2LAB_M = torch.tensor([
+    [0.4124564, 0.3575761, 0.1804375],
+    [0.2126729, 0.7151522, 0.0721750],
+    [0.0193339, 0.1191920, 0.9503041]
+])
+_RGB2LAB_W = torch.tensor([0.95047, 1.0, 1.08883])
+
+
+def _rgb_to_lab(x):
+    # 可微 sRGB->CIELAB。x: (B,3,H,W) 取值 [-1,1]，返回 Lab 三通道 (B,3,H,W)
+    linear = (x.clamp(-1, 1) + 1) / 2
+    linear = torch.where(linear <= 0.04045, linear / 12.92,
+                         ((linear + 0.055) / 1.055) ** 2.4)
+    xyz = torch.einsum('ij,bjhw->bihw', _RGB2LAB_M.to(x.device), linear) \
+        / _RGB2LAB_W.to(x.device).view(1, 3, 1, 1)
+    delta = 6 / 29
+    # clamp(min=0) 仅为 pow 的数值安全（xyz<0 时 where 走线性分支，无梯度回传）
+    f = torch.where(xyz > delta ** 3, xyz.clamp(min=0) ** (1 / 3),
+                    xyz / (3 * delta ** 2) + 4 / 29)
+    L = 116 * f[:, 1:2] - 16
+    a = 500 * (f[:, 0:1] - f[:, 1:2])
+    b = 200 * (f[:, 1:2] - f[:, 2:3])
+    return torch.cat([L, a, b], dim=1)
+
+
+def _delta_e_map(encoded, cover):
+    # 逐像素 CIELAB ΔE76 色差图 (B,1,H,W)。加 eps 保证 0 差处梯度有限，处处可微
+    return torch.sqrt(((_rgb_to_lab(encoded) - _rgb_to_lab(cover)) ** 2).sum(dim=1, keepdim=True) + 1e-8)
+
+
 # ValidationScript 类职责:
 #   封装 PrivSteg 项目单图验证流程所需的所有组件与功能。
 #   在初始化阶段构建编码器、解码器、隐写分析器、内容识别器 (CLIP)、
@@ -412,8 +446,12 @@ class ValidationScript:
             mse = torch.mean((encoded - cover) ** 2).item()
             psnr = 10 * np.log10(4.0 / mse) if mse > 0 else float('inf')
             ssim = 1 - self.ssim_loss(cover, encoded).item()
+            # 感知色差: 均值与"明显可见"(ΔE>5, 约 2 倍 JND) 像素占比
+            dE = _delta_e_map(encoded, cover)
             result = {'clip_sim': clip_sim, 'dino_sim': dino_sim, 'bit_acc': bit_acc,
-                      'psnr': psnr, 'ssim': ssim}
+                      'psnr': psnr, 'ssim': ssim,
+                      'dE_mean': dE.mean().item(),
+                      'dE_gt5_ratio': (dE > 5.0).float().mean().item()}
             if prv is not None:
                 result['prv_rms'] = prv.pow(2).mean().sqrt().item()
                 # 色度 RMS：蒙层监测指标（色度残差 RMS，感知劣化主体，PSNR/SSIM 测不到）
@@ -423,9 +461,10 @@ class ValidationScript:
                 result['chroma_rms'] = torch.sqrt((cb ** 2 + cr ** 2).mean()).item()
         return result
 
-    # refine_encoded_image 方法功能: 编码期逐图精修（与 refine_encode.py 完全同配方）。
-    # 冻结全部网络参数，仅把 96x96 低分辨率隐私残差场作为优化变量跑 steps 步 Adam:
-    #   L = w_privacy*(CLIP/DINO escape) + w_message*(干净+含噪 BCE) + w_visual*(MSE+SSIM)
+# refine_encoded_image 方法功能: 编码期逐图精修（与 refine_encode.py 完全同配方）。
+# 冻结全部网络参数，仅把 96x96 低分辨率隐私残差场作为优化变量跑 steps 步 Adam:
+#   L = w_privacy*(CLIP/DINO escape) + w_message*(干净+含噪 BCE) + w_visual*(MSE+SSIM)
+#       + w_de*relu(ΔE-de_tau)^2   (感知色差锚, w_de>0 启用; 压制色罩/蒙层类失真)
     #   收敛后可选色度蒙层投影（chroma_projection, 见 _project_out_chroma_lowfreq）
     # 约束链与训练同构: 96 低通 -> 双三次上采样 -> tanh*prv_budget -> 纹理掩码 -> clamp。
     # 消息残差 msg_residual 完全取自冻结网络、不参与优化；只在比特 100% 正确的状态里
@@ -433,24 +472,45 @@ class ValidationScript:
     # 参数:
     #   cover_image (torch.Tensor): 载体图像张量 (1,3,H,W)，范围 [-1,1]。
     #   message (torch.Tensor): 消息张量 (1,message_length)。
-    #   steps (int): Adam 优化步数。
+    #   steps (int|None): Adam 优化步数，None 取 Config.refine_steps（默认 150）。
     #   lr (float): Adam 学习率。
-    #   w_privacy/w_message/w_visual (float): 精修目标三项权重（验证配方 12/10/15）。
-    #   margin_end (float|None): CLIP escape margin 覆盖，None 取 Config 默认。
+    #   w_privacy/w_message/w_visual (float|None): 精修目标三项权重，None 分别取
+    #       Config.refine_w_privacy/w_message/w_visual（默认 12/20/15）。
+    #   margin_end (float|None): CLIP escape margin 覆盖，None 取 Config.refine_margin_end
+    #       （默认 0.60，与训练期 privacy_margin_end 独立）。
     #   prv_budget (float|None): 隐私残差预算覆盖，None 取 Config 默认。
     #   log_interval (int): 指标打印间隔步数。
     #   verbose (bool): 是否打印精修过程日志（批量评估时可关闭以减少输出）。
     #   chroma_projection (bool|None): 收敛后剔除 prv 低频色度蒙层（None 取 Config 默认）。
+    #   w_de (float|None): 感知色差锚权重，None 取 Config.refine_w_de（默认 200）。
+    #   de_tau (float|None): 感知色差锚阈值，None 取 Config.refine_de_tau（默认 4.0）。
     # 返回:
     #   (encoded_refined, report): 精修后的编码图像；report 含基线/精修指标与逐步日志。
-    def refine_encoded_image(self, cover_image, message, steps=60, lr=0.1,
-                             w_privacy=12.0, w_message=10.0, w_visual=15.0,
+    def refine_encoded_image(self, cover_image, message, steps=None, lr=0.1,
+                             w_privacy=None, w_message=None, w_visual=None,
                              margin_end=None, prv_budget=None, log_interval=10,
-                             verbose=True, chroma_projection=None):
+                             verbose=True, chroma_projection=None,
+                             w_de=None, de_tau=None):
         cfg = self.cfg
+        # 精修配方默认统一取 Config.refine_*（2026-09 视觉-逃逸解耦配方，
+        # 见 other/visual_exp/README.md）；显式传参仍可逐项覆盖。
+        # getattr 回退旧默认，保证对无新字段的旧 Config 实例保持 API 兼容
+        if steps is None:
+            steps = getattr(cfg, 'refine_steps', 60)
+        if w_privacy is None:
+            w_privacy = getattr(cfg, 'refine_w_privacy', 12.0)
+        if w_message is None:
+            w_message = getattr(cfg, 'refine_w_message', 10.0)
+        if w_visual is None:
+            w_visual = getattr(cfg, 'refine_w_visual', 15.0)
+        if w_de is None:
+            w_de = getattr(cfg, 'refine_w_de', 0.0)
+        if de_tau is None:
+            de_tau = getattr(cfg, 'refine_de_tau', 2.0)
         H, W = cover_image.shape[-2], cover_image.shape[-1]
         budget = prv_budget if prv_budget is not None else cfg.prv_budget
-        margin = margin_end if margin_end is not None else cfg.privacy_margin_end
+        margin = (margin_end if margin_end is not None
+                  else getattr(cfg, 'refine_margin_end', cfg.privacy_margin_end))
         # 色度蒙层事后投影：None 取 Config 默认（False = 关闭，回退原精修配方）
         if chroma_projection is None:
             chroma_projection = getattr(cfg, 'refine_chroma_projection', False)
@@ -507,7 +567,8 @@ class ValidationScript:
             best = (m_init['clip_sim'], delta0.clone(), m_init) if m_init['bit_acc'] >= 1.0 else None
 
             delta = torch.nn.Parameter(delta0.clone())
-            opt = torch.optim.Adam([delta], lr=lr)
+            cur_lr = lr
+            opt = torch.optim.Adam([delta], lr=cur_lr)
             bce = torch.nn.BCEWithLogitsLoss()
             mse = torch.nn.MSELoss()
             escape = FeatureRedirectionLoss(
@@ -520,6 +581,8 @@ class ValidationScript:
 
             t0 = time.time()
             log = []
+            stop_step = None  # 提前终止发生的步数 (跑满 steps 则为 None)
+            guard_fails = 0  # 数值防护触发次数
             for step in range(1, steps + 1):
                 opt.zero_grad(set_to_none=True)
                 encoded, _ = build_encoded(delta)
@@ -527,7 +590,7 @@ class ValidationScript:
                 # 隐私逃逸: CLIP/DINO 二次 Hinge escape
                 feat_enc = self.content_recognizer(encoded)
                 dino_enc = self._extract_dino_features_grad(encoded) if feat_cover_dino is not None else None
-                L_priv, _ = escape(
+                L_priv, pinfo = escape(
                     feat_cover_clip, feat_enc,
                     dino_cover=feat_cover_dino, dino_encoded=dino_enc,
                     escape_margin=margin,
@@ -535,16 +598,72 @@ class ValidationScript:
                 )
 
                 # 消息锚: 干净 + 含噪双分支 BCE（残差不得破坏解码）
-                L_msg = clean_ratio * bce(self.decoder(encoded), message)
+                logits_clean = self.decoder(encoded)
+                L_msg = clean_ratio * bce(logits_clean, message)
+
+                # ===== 提前终止: 地板以下 CLIP hinge 梯度归零，触底后继续迭代
+                # 只剩消息/视觉项往回拉，纯浪费步数。条件: 干净分支 bit 100% 且
+                # clip_sim ≤ 地板+0.005。sim/bit 均取自本步已算好的前向，检查零开销，
+                # 且放在反向传播之前——触底那步连 backward 都省掉。
+                # 容差 0.005: 全量实测容差 0.02 会把逐图 sim 钉在地板+0.02，
+                # 直接损失 ~6 个点检索逃逸率 (90%→84%)，收紧到 0.005 基本无损失
+                bit_now = (torch.sigmoid(logits_clean) > 0.5).float().eq(message).float().mean().item()
+                if bit_now >= 1.0 and pinfo['clip_sim'] <= (1.0 - margin) + 0.005:
+                    m_stop = eval_delta(delta)
+                    log.append({'step': step, **m_stop})
+                    if m_stop['bit_acc'] >= 1.0 and (best is None or m_stop['clip_sim'] < best[0]):
+                        best = (m_stop['clip_sim'], delta.detach().clone(), m_stop)
+                    if verbose:
+                        print(f"    [提前终止] step {step}: clip {pinfo['clip_sim']:.4f} "
+                              f"已达逃逸地板且 bit 100%, 停止优化")
+                    stop_step = step
+                    break
                 noised_enc, _ = noiser((encoded, cover_image))
                 L_msg = L_msg + (1.0 - clean_ratio) * bce(self.decoder(noised_enc), message)
 
                 # 视觉锚: MSE + SSIM
                 L_vis = mse(encoded, cover_image) + self.ssim_loss(cover_image, encoded)
 
-                L = w_privacy * L_priv + w_message * L_msg + w_visual * L_vis
+                # 感知色差锚 (可选, w_de>0 启用): 对 ΔE>de_tau 的像素做二次惩罚。
+                # 逃逸最省力方向是低频色度偏移（色罩），PSNR/SSIM 对其失明，
+                # 必须用感知量显式约束，否则优化器把全部误差挤进这个盲区。
+                # de_tau 取 2.0（约等于 JND），低于阈值的像素不产生梯度。
+                if w_de > 0:
+                    L_dE = (torch.relu(_delta_e_map(encoded, cover_image) - de_tau) ** 2).mean()
+                else:
+                    L_dE = torch.zeros((), device=cover_image.device)
+
+                L = w_privacy * L_priv + w_message * L_msg + w_visual * L_vis + w_de * L_dE
+                if not torch.isfinite(L):
+                    # 数值防护: 个别图像上精修发散 (NaN/Inf) 时丢弃该步，保持上一步状态
+                    opt.zero_grad(set_to_none=True)
+                    continue
+                prev_delta = delta.detach().clone()
                 L.backward()
                 opt.step()
+                # 钳制 pre-tanh 场值域: tanh 在 |x|>4 已完全饱和, 钳制不改变有效残差,
+                # 但阻止 delta 无界增长导致的步长爆炸
+                torch.clamp_(delta.data, -8.0, 8.0)
+                if not torch.isfinite(delta).all():
+                    # 数值防护 2: L 有限但梯度非有限时（特定残差形态下的退化点），
+                    # Adam 会把优化变量写坏，之后所有步都被上面的 L 检查跳过、
+                    # 最终回退出 NaN 残差。处置: 回退本步 + 小幅随机抖动移离病态点
+                    # + 重建优化器（动量缓存已被坏梯度污染）。注意非有限梯度下
+                    # 任何学习率都会写坏变量（NaN×lr=NaN），抖动绕开才是有效手段。
+                    # 连续失败超过上限则终止本图，沿用最后有限状态
+                    delta.data.copy_(prev_delta)
+                    guard_fails += 1
+                    if guard_fails > 10:
+                        if verbose:
+                            print(f"    [数值防护] step {step} 重试次数已用尽, 沿用最后有限状态")
+                        break
+                    delta.data.add_(torch.randn_like(delta.data) * (0.02 + 0.01 * guard_fails))
+                    torch.clamp_(delta.data, -8.0, 8.0)
+                    opt = torch.optim.Adam([delta], lr=cur_lr)
+                    opt.zero_grad(set_to_none=True)
+                    if verbose:
+                        print(f"    [数值防护] step {step} 梯度非有限, 回退+抖动重试 (第 {guard_fails} 次)")
+                    continue
 
                 if step == 1 or step % log_interval == 0 or step == steps:
                     m = eval_delta(delta)
@@ -556,13 +675,18 @@ class ValidationScript:
                         print(f"    step {step:3d} | clip {m['clip_sim']:.4f} | dino {dino_str} | "
                               f"bit {m['bit_acc']*100:5.1f}% | psnr {m['psnr']:5.2f} | "
                               f"ssim {m['ssim']:.4f} | prv_rms {m['prv_rms']:.4f} "
-                              f"| chroma_rms {chroma_str}")
+                              f"| chroma_rms {chroma_str} | dE {m['dE_mean']:.2f}"
+                              f"/{m['dE_gt5_ratio']*100:.1f}%")
                     # 最优状态必须比特全对，且 clip_sim 最低
                     if m['bit_acc'] >= 1.0 and (best is None or m['clip_sim'] < best[0]):
                         best = (m['clip_sim'], delta.detach().clone(), m)
 
             # 没有任何比特全对的状态时退回最终步（诚实暴露消息失败）
             final_delta = best[1] if best is not None else delta.detach().clone()
+            if not torch.isfinite(final_delta).all():
+                # 兜底: 即使以上防护全部命中前已存在坏状态（旧记录/外部中断），
+                # 也回退到网络自身残差——保证产出图像永远有限
+                final_delta = delta0.clone()
             with torch.no_grad():
                 encoded_refined, prv_refined = build_encoded(final_delta)
                 # 色度蒙层事后投影: 剔除 prv 的 8x8 网格低频色度（"发灰/蒙层"主体，
@@ -602,6 +726,7 @@ class ValidationScript:
                 'log': log,
                 'time_sec': refine_time,
                 'steps': steps, 'lr': lr, 'budget': budget, 'margin': margin,
+                'stop_step': stop_step,
                 'chroma_projection_applied': projected
             }
             return encoded_refined, report
@@ -834,17 +959,18 @@ class ValidationScript:
     #   image_path (str): 载体图像路径。
     #   message (str): 待嵌入的二进制消息或消息文件路径。
     #   output_dir (str|None): 输出目录路径，若为 None 则在原图旁创建 <name>_stego_output 目录。
-    #   refine_steps (int): 逐图精修步数（默认 60；0 关闭精修）。
+    #   refine_steps (int|None): 逐图精修步数，None 取 Config.refine_steps（0 关闭精修）。
     #   refine_lr (float): 精修 Adam 学习率。
     #   refine_budget (float|None): 精修隐私残差预算覆盖，None 取 Config 默认。
-    #   refine_margin (float|None): 精修 CLIP escape margin 覆盖，None 取 Config 默认。
+    #   refine_margin (float|None): 精修 CLIP escape margin 覆盖，None 取 Config.refine_margin_end。
     #   refine_chroma_projection (int|None): 收敛后剔除 prv 低频色度蒙层（None 取 Config 默认）。
     # 返回:
     #   dict: 包含比特准确率、判别器概率、隐私相似度结果、精修报告等汇总指标。
     def run_full_validation(self, image_path, message, output_dir=None,
-                            refine_steps=30, refine_lr=0.1,
+                            refine_steps=None, refine_lr=0.1,
                             refine_budget=None, refine_margin=None,
-                            refine_chroma_projection=None):
+                            refine_chroma_projection=None,
+                            refine_w_de=None, refine_de_tau=None):
         print("\n" + "#"*60)
         print("# 完整验证流程")
         print("#"*60)
@@ -867,7 +993,8 @@ class ValidationScript:
                 steps=refine_steps, lr=refine_lr,
                 margin_end=refine_margin, prv_budget=refine_budget,
                 chroma_projection=(None if refine_chroma_projection is None
-                                   else bool(refine_chroma_projection))
+                                   else bool(refine_chroma_projection)),
+                w_de=refine_w_de, de_tau=refine_de_tau
             )
 
         # 4. 调用解码器从编码图像中提取消息
@@ -1100,22 +1227,30 @@ def main():
     parser.add_argument('--mode', type=str, choices=['full', 'discriminator', 'decode', 'similarity'], default='full',
                         help='验证模式: full=完整验证, discriminator=仅判别器预测, decode=仅解码消息, similarity=相似度判断')
     # --refine-steps: full 模式编码后的逐图精修步数（与 refine_encode.py 同配方）
-    parser.add_argument('--refine-steps', type=int, default=30,
-                        help='逐图精修步数 (0=关闭精修, 默认 30; 精修后图像用于全部后续验证与保存)')
+    parser.add_argument('--refine-steps', type=int, default=None,
+                        help='逐图精修步数 (0=关闭精修; None=取 Config.refine_steps, 默认 150; '
+                             '精修后图像用于全部后续验证与保存)')
     # --refine-lr: 精修 Adam 学习率
     parser.add_argument('--refine-lr', type=float, default=0.1,
                         help='逐图精修 Adam 学习率 (默认 0.1)')
-    # --refine-budget: 精修隐私残差预算覆盖（默认 0.08 深挖配方）
-    parser.add_argument('--refine-budget', type=float, default=0.08,
-                        help='精修隐私残差预算 (默认 0.08 深挖配方)')
-    # --refine-margin: 精修 CLIP escape margin 覆盖（默认 0.50 深挖配方）
-    parser.add_argument('--refine-margin', type=float, default=0.50,
-                        help='精修 CLIP escape margin (默认 0.50 深挖配方)')
+    # --refine-budget: 精修隐私残差预算覆盖（默认取 Config.prv_budget 0.08 深挖配方）
+    parser.add_argument('--refine-budget', type=float, default=None,
+                        help='精修隐私残差预算 (None=取 Config.prv_budget, 默认 0.08)')
+    # --refine-margin: 精修 CLIP escape margin 覆盖（默认取 Config.refine_margin_end 0.60）
+    parser.add_argument('--refine-margin', type=float, default=None,
+                        help='精修 CLIP escape margin (None=取 Config.refine_margin_end, 默认 0.60)')
     # --refine-chroma-projection: 收敛后剔除隐私残差 8x8 网格低频色度（消"蒙层/发灰"；1 开 0 关）
     parser.add_argument('--refine-chroma-projection', type=int, default=None,
                         help='精修收敛后剔除 prv 低频色度蒙层 (默认取 Config.refine_chroma_projection; '
                              '1 开启 / 0 关闭)。门控: 投影后 bit_acc 须 100%% 且 clip_sim 仍达标, '
                              '否则自动回退未投影结果')
+    # --refine-w-de: 精修感知色差锚权重 (None=取 Config.refine_w_de 默认 200)。
+    # 对 ΔE>tau 的像素二次惩罚, 压制 PSNR/SSIM 测不到的色罩/蒙层类失真
+    parser.add_argument('--refine-w-de', type=float, default=None,
+                        help='精修感知色差锚权重 (None=取 Config.refine_w_de, 默认 200; 0=关闭)')
+    # --refine-de-tau: 感知色差锚阈值 (None=取 Config.refine_de_tau 默认 4.0)
+    parser.add_argument('--refine-de-tau', type=float, default=None,
+                        help='感知色差锚阈值 de_tau (None=取 Config.refine_de_tau, 默认 4.0)')
 
     # 解析命令行参数
     args = parser.parse_args()
@@ -1155,7 +1290,9 @@ def main():
             refine_lr=args.refine_lr,
             refine_budget=args.refine_budget,
             refine_margin=args.refine_margin,
-            refine_chroma_projection=args.refine_chroma_projection
+            refine_chroma_projection=args.refine_chroma_projection,
+            refine_w_de=args.refine_w_de,
+            refine_de_tau=args.refine_de_tau
         )
     elif args.mode == 'discriminator':
         # 仅判别器预测模式

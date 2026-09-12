@@ -96,7 +96,8 @@ def summarize(recs):
     out = {}
     for cond in ['base', 'refined']:
         out[f'{cond}_metrics'] = {}
-        for key in ['clip_sim', 'dino_sim', 'bit_acc', 'psnr', 'ssim']:
+        for key in ['clip_sim', 'dino_sim', 'bit_acc', 'psnr', 'ssim',
+                    'dE_mean', 'dE_gt5_ratio']:
             values = [r[f'{cond}_metrics'][key] for r in recs if r[f'{cond}_metrics'][key] is not None]
             if values:
                 out[f'{cond}_metrics'][key] = metric_stats(values)
@@ -129,6 +130,7 @@ def print_summary(summary, num_images):
     rows = [
         ('CLIP 相似度', 'clip_sim'), ('DINO 相似度', 'dino_sim'),
         ('比特准确率', 'bit_acc'), ('PSNR (dB)', 'psnr'), ('SSIM', 'ssim'),
+        ('感知色差 ΔE (均值)', 'dE_mean'), ('ΔE>5 像素占比', 'dE_gt5_ratio'),
     ]
     for label, key in rows:
         if key in bm and key in rm:
@@ -154,7 +156,8 @@ def write_csv(recs, csv_path):
     # 逐图明细 CSV (可直接导入论文表格或进一步分析)
     fields = ['image']
     for cond in ['base', 'refined']:
-        for key in ['clip_sim', 'dino_sim', 'bit_acc', 'psnr', 'ssim']:
+        for key in ['clip_sim', 'dino_sim', 'bit_acc', 'psnr', 'ssim',
+                    'dE_mean', 'dE_gt5_ratio']:
             fields.append(f'{cond}_{key}')
         fields += [f'{cond}_noise_bit_mean', f'{cond}_noise_bit_min', f'{cond}_noise_clip_mean',
                    f'{cond}_roundtrip_bit', f'{cond}_roundtrip_clip']
@@ -164,7 +167,8 @@ def write_csv(recs, csv_path):
         for r in recs:
             row = {'image': r['image']}
             for cond in ['base', 'refined']:
-                for key in ['clip_sim', 'dino_sim', 'bit_acc', 'psnr', 'ssim']:
+                for key in ['clip_sim', 'dino_sim', 'bit_acc', 'psnr', 'ssim',
+                            'dE_mean', 'dE_gt5_ratio']:
                     row[f'{cond}_{key}'] = r[f'{cond}_metrics'][key]
                 row[f'{cond}_noise_bit_mean'] = r[f'{cond}_noise']['bit_acc_mean']
                 row[f'{cond}_noise_bit_min'] = r[f'{cond}_noise']['bit_acc_min']
@@ -180,16 +184,26 @@ def main():
     parser.add_argument('--val-dir', type=str, default='./dataset1/val')
     parser.add_argument('--num-images', type=int, default=200,
                         help='评估图像数 (从 val 目录随机采样)')
-    parser.add_argument('--refine-steps', type=int, default=30,
-                        help='逐图精修步数 (0=关闭精修)')
+    parser.add_argument('--refine-steps', type=int, default=None,
+                        help='逐图精修步数 (0=关闭精修; None=取 Config.refine_steps, 默认 150)')
     parser.add_argument('--refine-lr', type=float, default=0.1)
-    parser.add_argument('--refine-budget', type=float, default=0.08,
-                        help='精修隐私残差预算 (默认 0.08 深挖配方)')
-    parser.add_argument('--refine-margin', type=float, default=0.50,
-                        help='精修 CLIP escape margin (默认 0.50 深挖配方)')
+    parser.add_argument('--refine-budget', type=float, default=None,
+                        help='精修隐私残差预算 (None=取 Config.prv_budget, 默认 0.08)')
+    parser.add_argument('--refine-margin', type=float, default=None,
+                        help='精修 CLIP escape margin (None=取 Config.refine_margin_end, 默认 0.60)')
     parser.add_argument('--refine-chroma-projection', type=int, default=None,
                         help='精修收敛后剔除 prv 低频色度蒙层 (默认取 Config.refine_chroma_projection; '
                              '1 开启 / 0 关闭)。门控: bit_acc 须 100%% 且 clip_sim 达标, 否则回退')
+    parser.add_argument('--refine-w-de', type=float, default=None,
+                        help='精修感知色差锚权重 (None=取 Config.refine_w_de, 默认 200; 0=关闭)。'
+                             '对 ΔE>tau 的像素二次惩罚, 压制 PSNR/SSIM 测不到的色罩/蒙层类失真')
+    parser.add_argument('--refine-de-tau', type=float, default=None,
+                        help='感知色差锚阈值 de_tau (None=取 Config.refine_de_tau, 默认 4.0)')
+    parser.add_argument('--refine-w-message', type=float, default=None,
+                        help='精修消息锚权重 (None=取 Config.refine_w_message, 默认 20)。'
+                             'ΔE 锚把残差推向高频后需更强锚保住信道后解码率')
+    parser.add_argument('--refine-w-privacy', type=float, default=None,
+                        help='精修隐私(逃逸)锚权重 (None=取 Config.refine_w_privacy, 默认 12)')
     parser.add_argument('--noise-eval', type=int, default=8,
                         help='信道鲁棒性噪声采样次数')
     parser.add_argument('--save-images', dest='save_images', action='store_true', default=True,
@@ -249,13 +263,16 @@ def main():
         message = torch.tensor(bits, dtype=torch.float32).unsqueeze(0).to(vs.device)
 
         # 编码 + 精修 (report 内含基线/精修两套指标; 基线张量重新编码一次, 单次前向)
-        if args.refine_steps > 0:
+        # refine_steps None = 取 Config.refine_steps (由 refine_encoded_image 内部解析)
+        if args.refine_steps is None or args.refine_steps > 0:
             encoded_refined, report = vs.refine_encoded_image(
                 cover, message, steps=args.refine_steps, lr=args.refine_lr,
                 margin_end=args.refine_margin, prv_budget=args.refine_budget,
                 verbose=False,
                 chroma_projection=(None if args.refine_chroma_projection is None
-                                   else bool(args.refine_chroma_projection))
+                                   else bool(args.refine_chroma_projection)),
+                w_de=args.refine_w_de, de_tau=args.refine_de_tau,
+                w_message=args.refine_w_message, w_privacy=args.refine_w_privacy
             )
             with torch.no_grad():
                 encoded_base, _, _, _ = vs.encoder(cover, message, phase=2, prv_noise_ratio=0.0)
