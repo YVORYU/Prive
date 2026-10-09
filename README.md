@@ -1,127 +1,189 @@
-# PrivSteg: 隐私保护图像隐写系统
+# PrivSteg: Privacy-Preserving Image Steganography
 
-基于深度学习的隐私保护图像隐写框架：在载体图像中嵌入二进制消息（水印/溯源），同时通过 CLIP/DINOv2 特征偏移使编码图像逃逸基于内容的图像检索（CBIR），防止被以图搜图关联到原始载体。
+A deep-learning framework that embeds a binary message (watermark / provenance tag) into a
+cover image while shifting the encoded image away from its cover in CLIP and DINOv2 feature
+space, so that content-based image retrieval (CBIR) can no longer link a published image back
+to its source photograph.
 
-系统由三层组成：**网络**（一次前向完成编码，具备泛化逃逸能力）+ **训练内蒸馏**（把逐图最优逃逸方向蒸进网络权重）+ **编码期逐图精修**（部署时对单图深挖逃逸，CLIP 相似度可压至 0.44~0.55，同时比特准确率与视觉质量不劣化）。深挖配方（prv_budget=0.08、margin=0.50、色度投影）已全部设为代码默认值。
+The system has three layers: a **network** (a single forward pass produces an encoded image
+with generalised evasion ability) + **in-training distillation** (per-image optimal evasion
+directions are distilled into the network weights) + **publication-time per-image refinement**
+(evasion is deepened for the individual image being released, driving CLIP similarity down to
+0.44–0.55 without degrading bit accuracy or visual quality). The deep-escape recipe
+(`prv_budget=0.08`, `margin=0.50`, chroma projection) is the code default.
 
-## 核心特性
+## Checkpoint
 
-- **消息嵌入与提取**：30 bit 二进制消息，uint8 往返与信道噪声（JPEG/缩放/量化）下可靠解码
-- **双残差编码架构**：消息头（msg_head）与隐私头（prv_head）分离，消息嵌入与隐私逃逸解耦
-- **隐私独立支路（prv_trunk）**：空洞卷积（dilation 1/3/9/27，感受野 81×81）直接从载体图像提特征，绕开只为消息目标训练且全程冻结的共享层，解决信息瓶颈与容量瓶颈
-- **低分辨率残差约束**：隐私残差先池化到 96×96 再双三次上采样，结构性消除高频条纹（96 网格 ≈ 2.7px/格，恰好覆盖 CLIP ViT-B/32 最敏感的 patch 尺度中频段）
-- **纹理感知扰动**：逐图分位数归一化纹理掩码（q05/q95 → [0.15, 1.0]），扰动集中在人眼不敏感的纹理复杂区
-- **三段式 Phase 2 调度**：Sprint（纯逃逸冲刺）→ Balance（多目标平衡）→ Refine（终段精修配方），配合判别器/消息头/共享层/解码器分阶段冻结
-- **内环逐图优化蒸馏**：每个训练步对当前 batch 跑 10 步逐图优化得到教师残差，蒸进网络单次前向
-- **编码期逐图精修**：`val/validation_script.py` full 模式默认开启，`val/refine_encode.py` 可独立使用；冻结网络仅优化 96×96 残差场 30 步，只在比特 100% 正确的状态里选最优（不劣化保证）；收敛后默认执行色度低频投影（消"发灰/蒙层"感知劣化，PSNR/SSIM 失明项）
-- **完整评估工具链**：单图验证（含基线版）、批量定量评估（含基线版，20~30 倍速）、CBIR 检索逃逸评估（攻击者视角以图搜图实测）、全链路一键编排（冒烟门控 + 汇总对照表）
-- **噪声鲁棒性**：支持裁剪、JPEG、量化、缩放等可微噪声层随机组合训练
+The trained model behind every number in the paper is attached to the
+[latest release](../../releases/latest). Download `checkpoint_best.pth` and either drop it into
+`checkpoints/` or pass its path to any validation script with `-c`. Model weights are not stored
+in git because of their size.
 
-## 项目结构
+## Key features
+
+- **Message embedding and extraction** — a 30-bit binary message, decodable after a uint8
+  round trip and under channel noise (JPEG / resizing / quantization)
+- **Dual-residual encoder** — separate message head (`msg_head`) and privacy head (`prv_head`)
+  so that payload embedding and privacy evasion no longer compete for one capacity budget
+- **Independent privacy branch (`prv_trunk`)** — dilated convolutions (rates 1/3/9/27, 81×81
+  receptive field) extract features straight from the cover, bypassing the shared trunk that is
+  trained only for the message objective and frozen throughout Phase 2; this removes both the
+  information bottleneck and the capacity bottleneck
+- **Low-resolution residual constraint** — the privacy residual is pooled to 96×96 and then
+  bicubically upsampled, which removes high-frequency stripes structurally (96 cells ≈ 2.7 px
+  per cell, covering exactly the patch-scale mid-frequency band that CLIP ViT-B/32 is most
+  sensitive to)
+- **Texture-aware perturbation** — a per-image quantile-normalised texture mask
+  (q05/q95 → [0.15, 1.0]) concentrates the perturbation in visually complex regions
+- **Three-stage Phase 2 schedule** — Sprint (pure evasion) → Balance (multi-objective) →
+  Refine (final-stage refinement recipe), with staged freezing of the discriminator, message
+  head, shared trunk and decoder
+- **Inner-loop distillation** — every training step runs 10 per-image optimisation steps on the
+  current batch to obtain a teacher residual, which is distilled into the single forward pass
+- **Publication-time refinement** — enabled by default in `val/validation_script.py --mode full`
+  and available standalone as `val/refine_encode.py`; all network weights are frozen and only a
+  96×96 residual field is optimised for 30 steps, selecting only among states with 100% bit
+  accuracy (non-degradation guarantee). On convergence it applies a gated low-frequency chroma
+  projection that removes the "grey veil" artefact that PSNR and SSIM are blind to
+- **Complete evaluation toolchain** — single-image validation (plus a baseline variant), batch
+  quantitative evaluation (plus a baseline variant, 20–30× faster), CBIR retrieval-evasion
+  evaluation (the attacker's view, measured by image search), and one-command end-to-end
+  orchestration (smoke gate + summary tables)
+- **Noise robustness** — differentiable noise layers (crop, JPEG, quantization, resizing) in
+  randomly combined training configurations
+
+## Repository layout
 
 ```
 PrivSteg/
-├── config.py                  # 全局配置（超参数、损失权重、阶段调度）
-├── train.py                   # 训练入口（new/continue、热启动、CLI 参数）
-├── trainer.py                 # 训练器（阶段冻结、内环蒸馏、recovery、记忆库）
-├── noise_argparser.py         # 噪声层命令行参数解析
-├── val/                        # 验证与评估脚本目录（从项目根运行，如 python val/batch_eval.py）
-│   ├── validation_script.py   # 单图验证（编码+精修+解码+判别器+相似度+可视化报告）
-│   ├── baseline_validation.py # 单图基线验证（网络直出，无精修）
-│   ├── refine_encode.py       # 独立逐图精修（不训练网络，试探逃逸天花板）
-│   ├── batch_eval.py          # 批量定量评估（精修版：统计/鲁棒性/uint8 往返，断点续跑）
-│   ├── batch_baseline.py      # 批量基线评估（网络直出，速度约 20~30 倍）
-│   ├── retrieval_eval.py      # CBIR 检索逃逸评估（精修版，断点续跑）
-│   ├── retrieval_baseline.py  # CBIR 检索逃逸基线评估（网络直出）
-│   ├── run_full_validation.py # 全链路一键验证编排（冒烟→单图→基线→精修→汇总）
-│   ├── visual_report.py       # 单图验证可视化报告生成器
-│   └── eval_visualizer.py     # 批量/检索评估可视化报告生成器
+├── config.py                   # Global configuration (hyperparameters, loss weights, schedule)
+├── train.py                    # Training entry point (new/continue, warm start, CLI flags)
+├── trainer.py                  # Trainer (stage freezing, inner-loop distillation, recovery, memory bank)
+├── noise_argparser.py          # Command-line parsing for noise-layer strings
+├── requirements.txt            # Python dependencies
+├── val/                        # Validation and evaluation scripts (run from the repo root)
+│   ├── validation_script.py    # Single image: encode + refine + decode + discriminator + similarity + report
+│   ├── baseline_validation.py  # Single image, network output only (no refinement)
+│   ├── refine_encode.py        # Standalone per-image refinement (no training; probes the evasion ceiling)
+│   ├── batch_eval.py           # Batch quantitative evaluation, refined (statistics / robustness / uint8, resumable)
+│   ├── batch_baseline.py       # Batch evaluation, network output only (≈20–30× faster)
+│   ├── retrieval_eval.py       # CBIR retrieval-evasion evaluation, refined (resumable)
+│   ├── retrieval_baseline.py   # CBIR retrieval-evasion evaluation, network output only
+│   ├── channel_retrieval_eval.py # Retrieval after the transmission channel (C2 × C4)
+│   ├── transfer_eval.py        # Retrieval in uncalibrated third-party feature spaces
+│   ├── external_baseline.py    # Cross-system comparison against TrustMark
+│   ├── run_full_validation.py  # End-to-end orchestration (smoke → single → baseline → refined → summary)
+│   ├── visual_report.py        # Single-image visual report generator
+│   └── eval_visualizer.py      # Batch / retrieval visual report generator
 ├── models/
-│   ├── encoder.py             # 编码器（双残差头 + prv_trunk 独立支路 + 纹理掩码）
-│   ├── decoder.py             # 解码器（CNN + 全连接消息提取）
-│   ├── steganalyzer.py        # 隐写分析器（判别器，SpectralNorm）
-│   └── content_recognizer.py  # 内容识别器（冻结 CLIP ViT-B/32）
+│   ├── encoder.py              # Encoder (dual residual heads + independent prv_trunk + texture mask)
+│   ├── decoder.py              # Decoder (CNN + fully connected message extraction)
+│   ├── steganalyzer.py         # Steganalysis discriminator (SpectralNorm)
+│   └── content_recognizer.py   # Content recogniser (frozen CLIP ViT-B/32)
 ├── losses/
-│   ├── ssim_loss.py           # SSIM 损失
-│   └── advanced_privacy_loss.py  # 特征逃逸 + 有向重定向损失（CLIP + DINOv2）
+│   ├── ssim_loss.py            # SSIM loss
+│   └── advanced_privacy_loss.py  # Feature escape + directed redirection (CLIP + DINOv2)
 ├── noise_layers/
-│   ├── noiser.py              # 噪声层组合器（随机选择激活）
-│   ├── crop.py / cropout.py    # 裁剪类噪声
-│   ├── dropout.py / resize.py  # 丢弃/缩放噪声
-│   ├── jpeg_compression.py    # JPEG 压缩噪声（DCT 域量化）
-│   └── quantization.py        # 傅里叶近似量化噪声
-├── data/
-│   └── dataset.py             # 隐写数据集（图像加载 + 随机消息生成）
-├── docs/
-│   └── PAPER_MATERIAL.md      # 论文写作素材（背景/相关工作/设计理念/实验设计）
-└── CLIP/                      # vendored OpenAI CLIP 包
+│   ├── noiser.py               # Noise-layer combiner (random activation)
+│   ├── crop.py / cropout.py    # Cropping noise
+│   ├── dropout.py / resize.py  # Dropout / resizing noise
+│   ├── jpeg_compression.py     # JPEG compression noise (DCT-domain quantization)
+│   └── quantization.py         # Fourier-approximation quantization noise
+└── data/
+    └── dataset.py              # Steganography dataset (image loading + random message generation)
 ```
 
-## 网络架构
+`CLIP/` (OpenAI's CLIP package) is deliberately **not** vendored here; `requirements.txt`
+installs it from source. See [Installation](#installation).
 
-### 编码器（Encoder）
+## Architecture
 
-- 共享层：16 个 ConvBNRelu（128 通道，3×3）→ 消息空间扩展拼接 → 融合层（30+128+3=161 → 128）
-- **消息头（msg_head）**：2 层 3×3 ConvBNRelu + 1×1 卷积 → `msg_budget × tanh` → 消息残差
-- **隐私独立支路（prv_trunk）**：4 层 ConvBNRelu，空洞率 1/3/9/27，感受野 81×81，直接从载体图像提特征；Phase 1 冻结，Phase 2 与 prv_head 一起训练（共用 ×5 学习率加速参数组）
-- **隐私头（prv_head）**：输入为 `cat([共享特征, prv_trunk(cover)])`（256 通道），2 层 3×3 ConvBNRelu + 1×1 卷积 → 96×96 低分辨率场 → 双三次上采样 → `prv_budget × tanh` → 纹理掩码加权 → 隐私残差
-- Phase 1：编码图 = 原图 + 消息残差 + 渐进引入的平滑随机噪声（隐私支路预适应）
-- Phase 2：编码图 = 原图 + 消息残差 + 纹理掩码加权的隐私残差
+### Encoder
 
-### 解码器（Decoder）
+- Shared trunk: 16 ConvBNRelu blocks (128 channels, 3×3) → message broadcast and concatenation
+  → fusion layer (30+128+3 = 161 → 128)
+- **Message head (`msg_head`)** — 2 × 3×3 ConvBNRelu + 1×1 convolution → `msg_budget × tanh` →
+  message residual
+- **Independent privacy branch (`prv_trunk`)** — 4 ConvBNRelu blocks with dilation rates
+  1/3/9/27 (81×81 receptive field) reading directly from the cover image; frozen in Phase 1,
+  trained together with `prv_head` in Phase 2 (shared ×5 learning-rate multiplier)
+- **Privacy head (`prv_head`)** — input is `cat([shared features, prv_trunk(cover)])`
+  (256 channels); 2 × 3×3 ConvBNRelu + 1×1 convolution → 96×96 low-resolution field → bicubic
+  upsampling → `prv_budget × tanh` → texture-mask weighting → privacy residual
+- Phase 1: encoded image = cover + message residual + progressively introduced smoothed random
+  noise (pre-adaptation of the privacy branch)
+- Phase 2: encoded image = cover + message residual + texture-mask-weighted privacy residual
 
-- 8 层 ConvBNRelu（64 通道）+ ConvBNRelu(64→30) + AdaptiveAvgPool + 全连接层
-- 输出消息 logits (B, L)，配合 BCEWithLogitsLoss
+### Decoder
 
-### 隐写分析器（Steganalyzer）
+- 8 ConvBNRelu blocks (64 channels) + ConvBNRelu(64→30) + AdaptiveAvgPool + fully connected layer
+- Outputs message logits `(B, L)`; trained with `BCEWithLogitsLoss`
 
-- 8 层 SpectralNorm 卷积（64→512 渐进通道）+ 全局平均池化 + 双层全连接判别头
-- 当前配置（各阶段 adv 权重均为 0）仅作监控，不向编码器回传梯度
+### Steganalysis discriminator
 
-### 特征提取器
+- 8 SpectralNorm convolutions (64→512, progressively wider channels) + global average pooling +
+  a two-layer classification head
+- With the current configuration (all adversarial weights set to 0 in every stage) it only
+  monitors; no gradient is propagated back to the encoder
 
-- **CLIP ViT-B/32**（冻结）：512 维 L2 归一化图像特征，主逃逸目标
-- **DINOv2 ViT-S/14**（冻结，`timm` 加载，权重 `./models/dinov2_vits14_pretrain.pth`）：384 维特征，鲁棒性对冲（防攻击者改用自监督特征做近重复检测）
+### Feature extractors
 
-## 损失函数
+- **CLIP ViT-B/32** (frozen) — 512-dimensional L2-normalised image features; the primary
+  evasion target
+- **DINOv2 ViT-S/14** (frozen, loaded through `timm` from
+  `./models/dinov2_vits14_pretrain.pth`) — 384-dimensional features; robustness hedge against an
+  attacker switching to self-supervised features for near-duplicate detection
 
-| 损失            | 说明                                          |
-| ------------- | ------------------------------------------- |
-| L_pixel / L_ssim | 视觉重建损失（MSE + SSIM）                    |
-| L_message     | 消息 BCEWithLogits 损失（干净 + 含噪双分支）      |
-| L_adv         | 生成器对抗损失（Softplus 非饱和形式；当前权重 0）   |
-| L_D           | 判别器 Hinge Loss（margin=1.0，准确率门控更新）   |
-| L_privacy     | CLIP + DINOv2 特征逃逸（二次 Hinge + Softplus 预热）+ 可选 hard-negative 有向重定向 |
-| L_distill     | 内环蒸馏损失（学生残差对教师残差的能量归一化 MSE，权重 25）  |
-| L_residual    | 残差惩罚（控制残差幅度）                        |
-| L_fft         | FFT 高频能量惩罚（仅 Balance 段；线性幅值，半径 0.25 奈奎斯特比例） |
+## Losses
 
-隐私损失双分支设计：干净编码图分支承载逃逸主力（噪声层雅可比会毒化 CLIP 梯度），含噪分支仅锚定传播场景鲁棒性，按 0.3 加权融合。
+| Loss | Description |
+| --- | --- |
+| `L_pixel` / `L_ssim` | Visual reconstruction (MSE + SSIM) |
+| `L_message` | Message BCEWithLogits loss (dual branch: clean + noised) |
+| `L_adv` | Generator adversarial loss (non-saturating Softplus; weight 0 in the current configuration) |
+| `L_D` | Discriminator hinge loss (margin = 1.0, accuracy-gated updates) |
+| `L_privacy` | CLIP + DINOv2 feature escape (quadratic hinge + Softplus warm-up) plus optional hard-negative directed redirection |
+| `L_distill` | Inner-loop distillation (energy-normalised MSE between student and teacher residuals, weight 25) |
+| `L_residual` | Residual-norm penalty |
+| `L_fft` | FFT high-frequency energy penalty (Balance stage only; linear amplitude, radius 0.25 of Nyquist) |
 
-## 两阶段训练
+The privacy loss is dual-branch by design: the clean-encoding branch carries the escape
+objective (noise-layer Jacobians poison the CLIP gradient), while the noised branch only anchors
+robustness in the propagation scenario; the two are combined with a 0.3 weight.
 
-### Phase 1（默认 150 epochs）：基础隐写
+## Two-phase training
 
-- 训练消息通路（共享层 + msg_head + decoder），隐私支路冻结并注入渐进随机噪声做预适应
-- 权重：message 15、visual 10、adv 0（当前配置）、privacy 0
+### Phase 1 (default 150 epochs): basic steganography
 
-### Phase 2（默认 100 epochs）：隐私逃逸
+- Trains the message path (shared trunk + `msg_head` + decoder); the privacy branch is frozen and
+  receives progressively introduced random noise as pre-adaptation
+- Weights: message 15, visual 10, adv 0 (current configuration), privacy 0
 
-msg_head 与共享层全程冻结，采用三段调度（`sprint-epochs` / `refine-epochs` 可调）：
+### Phase 2 (default 100 epochs): privacy evasion
 
-| 段          | 轮数    | decoder | message | visual | privacy | fft / residual | 说明 |
-| ---------- | ------ | ------- | ------- | ------ | ------- | -------------- | ---- |
-| Sprint     | 前 40   | 冻结    | 0       | 1.5    | 12      | 清零           | 纯逃逸冲刺，只用干净分支梯度 |
-| Balance    | 中段    | 解冻    | 20/15/10 | 15    | 4/8/12  | 50 / 0.5      | 多目标平衡，recovery 兜底 |
-| Refine     | 末 30   | 冻结    | 10      | 15     | 12      | 清零           | refine_encode.py 同配方目标（可用 `--refine-epochs 0` 关闭） |
+`msg_head` and the shared trunk stay frozen for the whole phase, which uses a three-stage
+schedule (`--sprint-epochs` / `--refine-epochs` adjust the boundaries):
 
-**内环逐图优化蒸馏**（Phase 2 全程，`distill-steps 0` 可关闭）：每个训练步冻结网络，对当前 batch 的低分辨率残差场跑 10 步 Adam（目标与逐图精修同配方），得到教师残差后以 `distill_weight(25) × 能量归一化 MSE` 蒸进单次前向。代价：单步耗时约 2~4 倍。
+| Stage | Epochs | Decoder | Message | Visual | Privacy | fft / residual | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Sprint | first 40 | frozen | 0 | 1.5 | 12 | zeroed | Pure evasion; clean-branch gradients only |
+| Balance | middle | unfrozen | 20/15/10 | 15 | 4/8/12 | 50 / 0.5 | Multi-objective balance; recovery fallback |
+| Refine | last 30 | frozen | 10 | 15 | 12 | zeroed | Same recipe as `refine_encode.py` (disable with `--refine-epochs 0`) |
 
-**best checkpoint 判定**：Phase 1 按验证 L_message；Phase 2 在 `bit_accuracy ≥ 0.90` 约束下最小化 `clip_sim_noised + dino_sim_noised`（含噪传播场景指标优先，未达标加 10.0 惩罚分）。
+**Inner-loop distillation** (throughout Phase 2, disable with `--distill-steps 0`): at every
+training step the network is frozen, 10 Adam steps are run on the low-resolution residual field
+of the current batch (same objective as per-image refinement) to obtain a teacher residual, and
+that residual is distilled into the single forward pass with
+`distill_weight(25) × energy-normalised MSE`. Cost: roughly 2–4× slower per step.
 
-### 热启动重训隐私支路（推荐工作流）
+**Best-checkpoint criterion**: Phase 1 selects on validation `L_message`; Phase 2 minimises
+`clip_sim_noised + dino_sim_noised` subject to `bit_accuracy ≥ 0.90` (noised-propagation metrics
+first; a 10.0 penalty is added when the constraint is missed).
 
-`new --continue-from-folder` 是纯权重初始化（不携带绝对轮号），消息通路完整复用、隐私支路重训：
+### Warm-start retraining of the privacy branch (recommended workflow)
+
+`new --continue-from-folder` is pure weight initialisation (it does not carry absolute epoch
+numbers): the message path is reused intact and the privacy branch is retrained.
 
 ```bash
 python train.py new --data-dir ./dataset --name privacy_v2 \
@@ -129,7 +191,7 @@ python train.py new --data-dir ./dataset --name privacy_v2 \
   --epochs-phase1 0 --epochs-phase2 100
 ```
 
-### 隐私深挖配方（现已设为代码默认值；显式写出便于回溯）
+### Deep-escape recipe (now the code default; written out explicitly for traceability)
 
 ```bash
 python train.py new --name deep_escape \
@@ -138,34 +200,47 @@ python train.py new --name deep_escape \
   --prv-budget 0.08 --privacy-margin-end 0.50 --dino-margin-end 0.20
 ```
 
-**逃逸杠杆优先级**（CPU 逐图精修实测，同一 checkpoint、60 步、bit_acc 全程 100%）：
+**Escape levers, in order of strength** (CPU per-image refinement, same checkpoint, 60 steps,
+bit accuracy 100% throughout):
 
-- **margin 是第一杠杆**：二次 Hinge 在 sim < (1−margin) 后梯度归零，margin 0.30/0.40/0.50（budget 0.08）对应 CLIP sim 0.575/0.547/0.440
-- **预算是第二杠杆**：budget 0.04/0.06/0.08（margin 0.30）对应 0.634/0.603/0.575
-- 视觉权重 15→8 无影响（幅度由 margin 驱动的 hinge 平衡决定）
-- margin 0.50 + budget 0.08 时 PSNR 38.95 / SSIM 0.957，仍属高质量区间
+- **Margin is the first lever** — the quadratic hinge has zero gradient below
+  `sim < (1 − margin)`; margins 0.30/0.40/0.50 at budget 0.08 give CLIP similarities
+  0.575/0.547/0.440
+- **Budget is the second lever** — budgets 0.04/0.06/0.08 at margin 0.30 give 0.634/0.603/0.575
+- Visual weight 15→8 has no measurable effect (the amplitude is set by the margin-driven hinge
+  equilibrium)
 
-## 环境要求
+## Requirements
 
-- Python >= 3.8，PyTorch >= 2.0.0，torchvision >= 0.15.0
-- CUDA（训练推荐）/ CPU（验证与评估可用）
-- DINOv2 权重：`./models/dinov2_vits14_pretrain.pth`（缺失时警告并随机初始化）
-- 依赖：torch、torchvision、timm、pillow、numpy、matplotlib（可视化报告）、tensorboard（可选）
+- Python >= 3.8, PyTorch >= 2.0.0, torchvision >= 0.15.0
+- CUDA (recommended for training) / CPU (sufficient for validation and evaluation)
+- DINOv2 weights at `./models/dinov2_vits14_pretrain.pth` (a warning is issued and random
+  initialisation is used when missing)
+- Dependencies: torch, torchvision, timm, pillow, numpy, matplotlib (visual reports),
+  tensorboard (training logs), and CLIP (image/text features — installed from source, it is not
+  on PyPI)
 
-## 安装
+## Installation
 
 ```bash
 git clone https://github.com/your-repo/PrivSteg.git
 cd PrivSteg
-pip install torch torchvision timm pillow numpy matplotlib tensorboard
+pip install -r requirements.txt
 ```
 
-仓库已 vendored `CLIP/` 包：从项目根运行时 `import clip` 直接命中，无需额外安装（也可 `pip install git+https://github.com/openai/CLIP.git`）。
+`requirements.txt` includes the CLIP source install
+(`clip @ git+https://github.com/openai/CLIP.git`): `models/content_recognizer.py` calls it
+through `import clip`, and the package is not published on PyPI, so it must be installed from
+GitHub. To install it on its own:
 
-## 数据准备
+```bash
+pip install git+https://github.com/openai/CLIP.git
+```
+
+## Data preparation
 
 ```
-dataset/                  # 训练数据集根目录（CLI --data-dir，默认 ./dataset1）
+dataset/                  # Dataset root (CLI --data-dir; defaults to ./dataset1)
 ├── train/
 │   ├── image1.jpg
 │   └── ...
@@ -174,35 +249,37 @@ dataset/                  # 训练数据集根目录（CLI --data-dir，默认 .
     └── ...
 ```
 
-支持 `.png`、`.jpg`、`.jpeg`、`.bmp`，递归扫描子目录。
+`.png`, `.jpg`, `.jpeg` and `.bmp` are supported; subdirectories are scanned recursively.
+ImageNet and MS COCO are the datasets used in the paper; both must be downloaded from their
+original sources and must not be redistributed.
 
-## 使用方法
+## Usage
 
-### 训练
+### Training
 
 ```bash
-# 从头训练（深挖配方已全部设为代码默认值；数据集默认 ./dataset1）
+# Train from scratch (the deep-escape recipe is the code default; data defaults to ./dataset1)
 python train.py new --name my_experiment
 
-# 常用参数（均与 Config 默认一致的可省略）
+# Common flags (all equal to the Config defaults and therefore optional)
 python train.py new --data-dir ./dataset --name my_experiment \
   --batch-size 35 --size 256 --message 30 \
   --epochs-phase1 150 --epochs-phase2 100 \
   --noise "jpeg+resize(0.8,1.2)+quant" --seed 42
 
-# 冒烟测试（本地 CPU 显式传 --batch-size 1）
+# Smoke test (pass --batch-size 1 explicitly on CPU)
 python train.py new --data-dir ./dataset --name smoke \
   --epochs-phase1 1 --epochs-phase2 0 --batch-size 1 --num-workers 0 --save-interval 1
 
-# 断点续训（携带绝对轮号）
+# Resume (carries absolute epoch numbers)
 python train.py continue --folder ./experiments/my_experiment
 
-# 热启动新实验（纯权重初始化，训练计划由本次 CLI 决定）
+# Warm-start a new experiment (pure weight initialisation; the schedule comes from this CLI)
 python train.py new --data-dir ./dataset --name resumed_exp \
   --continue-from-folder ./experiments/my_experiment
 ```
 
-### 单图验证（full 模式默认含 30 步逐图精修 + 色度投影 + 自动可视化报告）
+### Single-image validation (full mode: 30-step refinement + chroma projection + report)
 
 ```bash
 python val/validation_script.py \
@@ -213,27 +290,31 @@ python val/validation_script.py \
   -o output
 ```
 
-编码后自动执行逐图精修，后续解码/判别器/相似度/保存全部基于精修后图像；输出目录生成 `report.html`（自包含可视化报告：指标卡片、原图-编码图-残差对比、精修逃逸轨迹、消息比特核验）+ 4 张 PNG 面板。
+Refinement runs automatically after encoding, and decoding, discriminator scoring, similarity and
+saving all use the refined image. The output directory receives `report.html` (a self-contained
+report: metric cards, cover/encoded/residual comparison, refinement trajectory, message-bit
+verification) plus four PNG panels.
 
 ```bash
-# 关闭精修
+# Disable refinement
 python val/validation_script.py -c ... -i ./test.jpg -m "101..." -o output --refine-steps 0
 
-# 回落标准配方对照（深挖默认之外显式覆盖）
+# Fall back to the standard recipe for comparison
 python val/validation_script.py -c ... -i ./test.jpg -m "101..." -o output \
   --refine-budget 0.04 --refine-margin 0.30
 ```
 
-### 单图基线验证（网络直出，无精修）
+### Single-image baseline validation (network output only)
 
 ```bash
 python val/baseline_validation.py -c ./other/checkpoint.pth -i ./other/test.jpg \
   -m "101000100110100101100011100010" --device cpu -o other/baseline_output
 ```
 
-网络单次前向直接输出编码图与全指标，不生成 report.html；用作"网络单独 vs 网络+精修"的对照基线（amortization gap 分析）。
+A single forward pass produces the encoded image and every metric, with no `report.html`. Use it
+as the "network alone vs network + refinement" baseline for amortization-gap analysis.
 
-### 独立逐图精修（不训练网络）
+### Standalone per-image refinement (no training)
 
 ```bash
 python val/refine_encode.py -c ./experiments/my_experiment/checkpoints/checkpoint.pth \
@@ -241,49 +322,70 @@ python val/refine_encode.py -c ./experiments/my_experiment/checkpoints/checkpoin
   --steps 30 --margin-end 0.50 --prv-budget 0.08 -o other/refined
 ```
 
-用于训练前试探预算/margin 组合的逃逸天花板（`--steps 60` 默认），或对任意 checkpoint 的单张/多张图像直接优化隐私残差。
+Use it to probe the evasion ceiling of a budget/margin combination before committing to
+training (default `--steps 60`), or to optimise the privacy residual for any number of images
+against any checkpoint.
 
-### 批量定量评估（精修版 / 基线版）
+### Batch quantitative evaluation (refined / baseline)
 
 ```bash
-# 精修版（默认深挖配方，含逐图精修）
+# Refined (deep-escape recipe by default, per-image refinement included)
 python val/batch_eval.py -c ./other/checkpoint.pth --val-dir ./dataset1/val \
   --num-images 200 --refine-steps 30 -o other/batch_eval --device cpu
 
-# 基线版（网络直出，速度约 20~30 倍）
+# Baseline (network output only, ≈20–30× faster)
 python val/batch_baseline.py -c other/checkpoint.pth --num-images 200 -o other/batch_baseline --device cpu
 ```
 
-val 集采样 N 张逐一评估，输出基线/精修的 CLIP/DINO/bit_acc/PSNR/SSIM 统计（均值±标准差、分位数）、信道鲁棒性（JPEG/resize/quant 随机采样 k 次的解码率）、uint8 往返（模拟 PNG 8bit 量化）；生成 `results.json`（断点续跑）/ `summary.json` / `details.csv` / `report.html` 可视化报告。同 seed 同 val-dir 时两版评估同一批图像，可直接对照。
+Samples N images from the validation set and reports CLIP / DINOv2 / bit accuracy / PSNR / SSIM
+statistics (mean ± std, percentiles), channel robustness (decode rate over k random JPEG /
+resize / quant samples) and a uint8 round trip (in-memory simulation of 8-bit PNG
+quantization). Outputs `results.json` (resumable), `summary.json`, `details.csv` and a
+`report.html`. With the same seed and `--val-dir`, both variants evaluate the same images and can
+be compared directly.
 
-### CBIR 检索逃逸评估（以图搜图攻击测试，精修版 / 基线版）
+### CBIR retrieval-evasion evaluation (refined / baseline)
 
 ```bash
-# 精修版（查询图经逐图精修）
+# Refined (queries go through per-image refinement)
 python val/retrieval_eval.py -c ./other/checkpoint.pth --val-dir ./dataset1/val \
   --num-queries 100 --gallery-size 1000 --refine-steps 30 \
   --refine-margin 0.50 --refine-budget 0.08 \
   -o other/retrieval_eval --device cpu
 
-# 基线版（网络直出查询，与精修版共用图库特征缓存 gallery_feats.pt）
+# Baseline (queries are network outputs; shares gallery_feats.pt with the refined run)
 python val/retrieval_baseline.py -c other/checkpoint.pth --num-queries 100 \
   --gallery-size 1000 -o other/retrieval_baseline --device cpu
 ```
 
-从 val 集建图库（CLIP 特征磁盘缓存，`--extra-gallery-dir` 可从 train 集扩充干扰池），查询集为图库子集；编码图与精修图分别作为查询做余弦检索，报告 top-1/5/10 命中率、逃逸率、平均排名、MRR 与"原图相似度 vs 最强干扰相似度"竞争余量；含原图自查询自检（应 100% top-1）；生成可视化报告（排名分布/CDF、逐查询排名散点、逃逸机制散点、全指标对照表）。
+The gallery is built from the validation set (CLIP features cached to disk;
+`--extra-gallery-dir` enlarges the distractor pool from the training set) and the query set is a
+subset of the gallery. Encoded and refined images are used as queries against the full gallery by
+cosine similarity, reporting top-1/5/10 hit rates, evasion rate, mean rank, MRR and the
+competitive margin between "similarity to cover" and "similarity to the strongest distractor".
+A self-check queries each unmodified cover against itself and must return top-1 in 100% of
+cases. A visual report is generated (rank distribution / CDF, per-query rank scatter, evasion
+mechanism scatter, full metric table).
 
-实测参考（小规模演示、深挖配方）：基线 top-1 命中 100%（攻击者一击必中）、精修后逃逸率 66.7%，CLIP sim 从 0.93 压到 0.47、跌破最强干扰相似度。
+Reference measurement (small-scale demo, deep-escape recipe): baseline top-1 hit rate 100% (the
+attacker succeeds on every query); after refinement the evasion rate is 66.7%, with CLIP
+similarity driven from 0.93 to 0.47, below the strongest distractor similarity.
 
-### 全链路一键验证（推荐工作流）
+### End-to-end validation (recommended workflow)
 
 ```bash
 python val/run_full_validation.py -c ./experiments/full_run/checkpoints/checkpoint_best.pth \
   --val-dir ./dataset/test -o ./other/full_validation
 ```
 
-编排 val/ 下评估脚本：冒烟自检（校验特征链路与精修可用后才开始全量）→ 单图 full → 批量/检索的基线版与精修版 → 汇总三列对照表 `full_summary.json` / 英文 `full_summary.md`（网络直出/精修对照，可直接进论文）。快阶段先行失败早暴露、各阶段断点续跑；支持 `--stages` 阶段子集、`--report-only` 仅重出报告、`--dry-run` 只打印命令。
+Orchestrates the `val/` scripts: smoke self-check (the feature pipeline and refinement must work
+before the full run starts) → single-image full → batch/retrieval baseline and refined →
+summary tables `full_summary.json` and `full_summary.md` (network-output vs refined, ready for
+the paper). Fast stages run first so failures surface early, and every stage is resumable.
+Supports `--stages` (subset), `--report-only` (regenerate reports only) and `--dry-run` (print
+the commands).
 
-### 仅重出可视化报告（不加载模型）
+### Regenerating reports only (no model loaded)
 
 ```bash
 python val/batch_eval.py --report-only -o other/batch_eval
@@ -293,7 +395,7 @@ python val/retrieval_baseline.py --report-only -o other/retrieval_baseline
 python val/run_full_validation.py --report-only -o other/full_validation
 ```
 
-### 其他验证模式
+### Other validation modes
 
 ```bash
 python val/validation_script.py -c <checkpoint> -i ./encoded_image.png --mode decode
@@ -301,68 +403,92 @@ python val/validation_script.py -c <checkpoint> -i ./encoded_image.png --mode di
 python val/validation_script.py -i ./encoded_image.png --cover ./cover_image.png --mode similarity
 ```
 
-## 关键配置参数
+## Key configuration
 
-| 参数                       | 默认值               | 说明                                  |
-| ------------------------ | ----------------- | ----------------------------------- |
-| `image_size`             | 256               | 图像尺寸                                |
-| `message_length`         | 30                | 嵌入消息长度（bit）                         |
-| `batch_size`             | 35（A100 口径）     | 本地 CPU 冒烟显式传 `--batch-size 1`        |
-| `num_epochs_phase1/2`    | 150 / 100         | 两阶段训练轮数                             |
-| `msg_budget`             | 0.04              | 消息残差预算                              |
-| `prv_budget`             | 0.08              | 隐私残差预算（深挖配方默认；CLI `--prv-budget` 可调） |
-| `privacy_margin_end`     | 0.50              | CLIP 逃逸边界（CLI `--privacy-margin-end`；Sprint/Refine 段直接取该值） |
-| `dino_escape_margin_end` | 0.20              | DINO 逃逸边界（CLI `--dino-margin-end`）    |
-| `prv_lowres_size`        | 96                | 隐私残差低分辨率约束尺寸                        |
-| `dino_weight`            | 0.5               | DINOv2 逃逸损失权重                       |
-| `lambda_fft`             | 50.0              | FFT 高频能量惩罚（Sprint/Refine 段清零）         |
-| `phase2_sprint_epochs`   | 40                | Sprint 段轮数（CLI `--sprint-epochs`）     |
-| `phase2_refine_epochs`   | 30                | Refine 段轮数（CLI `--refine-epochs`）      |
-| `distill_inner_steps`    | 10                | 内环蒸馏教师优化步数（CLI `--distill-steps`）     |
-| `distill_weight`         | 25.0              | 蒸馏损失权重（CLI `--distill-weight`）         |
-| `prv_head_lr_mult`       | 5.0               | 隐私支路学习率倍增                            |
-| `privacy_noised_ratio`   | 0.3               | 隐私含噪分支权重（Sprint/Refine 段清零）          |
-| `use_clip_redirect`      | True              | 启用 CLIP/DINO 有向重定向                   |
-| `clip_redirect_target_sim` | 0.85            | CLIP 重定向目标相似度                        |
-| `clip_max_target_sim`    | 0.90              | CLIP 重定向相似度上限                        |
-| `refine_chroma_projection` | True            | 精修收敛后色度低频投影（val 脚本 `--refine-chroma-projection`） |
-| `noise_config`           | jpeg+resize(0.8,1.2)+quant | 噪声层配置                          |
-| `phase1_adv_*` / `phase2_adv` | 0.0          | 对抗权重（当前场景不依赖隐写分析对抗）                  |
-| `bit_accuracy_threshold` | 0.90              | 触发解码器恢复的比特准确率阈值                    |
-| 纹理掩码下限             | 0.15              | 纹理掩码分位数归一化下限                    |
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `image_size` | 256 | Image size |
+| `message_length` | 30 | Embedded message length (bits) |
+| `batch_size` | 35 (A100) | Pass `--batch-size 1` explicitly for a CPU smoke test |
+| `num_epochs_phase1/2` | 150 / 100 | Epochs per phase |
+| `msg_budget` | 0.04 | Message residual budget |
+| `prv_budget` | 0.08 | Privacy residual budget (deep-escape default; CLI `--prv-budget`) |
+| `privacy_margin_end` | 0.50 | CLIP escape margin (CLI `--privacy-margin-end`; Sprint/Refine use it directly) |
+| `dino_escape_margin_end` | 0.20 | DINOv2 escape margin (CLI `--dino-margin-end`) |
+| `prv_lowres_size` | 96 | Low-resolution constraint size for the privacy residual |
+| `dino_weight` | 0.5 | DINOv2 escape loss weight |
+| `lambda_fft` | 50.0 | FFT high-frequency penalty (zeroed in Sprint/Refine) |
+| `phase2_sprint_epochs` | 40 | Sprint stage length (CLI `--sprint-epochs`) |
+| `phase2_refine_epochs` | 30 | Refine stage length (CLI `--refine-epochs`) |
+| `distill_inner_steps` | 10 | Teacher optimisation steps in inner-loop distillation (CLI `--distill-steps`) |
+| `distill_weight` | 25.0 | Distillation loss weight (CLI `--distill-weight`) |
+| `prv_head_lr_mult` | 5.0 | Learning-rate multiplier for the privacy branch |
+| `privacy_noised_ratio` | 0.3 | Weight of the noised privacy branch (zeroed in Sprint/Refine) |
+| `use_clip_redirect` | True | Enable CLIP/DINOv2 directed redirection |
+| `clip_redirect_target_sim` | 0.85 | CLIP redirection target similarity |
+| `clip_max_target_sim` | 0.90 | CLIP redirection similarity ceiling |
+| `refine_chroma_projection` | True | Low-frequency chroma projection after refinement (`--refine-chroma-projection` in the val scripts) |
+| `noise_config` | jpeg+resize(0.8,1.2)+quant | Noise-layer configuration |
+| `phase1_adv_*` / `phase2_adv` | 0.0 | Adversarial weights (this setting does not rely on steganalysis resistance) |
+| `bit_accuracy_threshold` | 0.90 | Bit-accuracy threshold that triggers decoder recovery |
+| Texture-mask floor | 0.15 | Lower bound of the quantile-normalised texture mask |
 
-## 输出说明
+## Outputs
 
-训练会在 `experiments/<name>/` 下生成：
+Training writes into `experiments/<name>/`:
 
 ```
 experiments/my_experiment/
-├── config.json              # 训练配置
-├── train.log                # 训练日志
+├── config.json              # Training configuration
+├── train.log                # Training log
 ├── checkpoints/
-│   ├── checkpoint.pth       # 最新检查点
-│   ├── checkpoint_best.pth  # Phase 2 多准则最优
+│   ├── checkpoint.pth       # Latest checkpoint
+│   ├── checkpoint_best.pth  # Phase 2 multi-criteria best
 │   └── checkpoint_phase{N}_epoch{M}.pth
-└── tensorboard/             # TensorBoard 日志
+└── tensorboard/             # TensorBoard logs
 ```
 
-评估脚本在 `-o` 输出目录生成 `results.json`（断点续跑）/ `summary.json` / `details.csv`（批量）/ `eval_meta.json` / `gallery_feats.pt`（检索图库缓存）/ `report.html`（可视化）/ 独立 PNG 面板。
+Evaluation scripts write into the `-o` directory: `results.json` (resumable), `summary.json`,
+`details.csv` (batch), `eval_meta.json`, `gallery_feats.pt` (retrieval gallery cache),
+`report.html` and standalone PNG panels.
 
-## 技术原理
+## Technical notes
 
-### 三层分工：网络 / 蒸馏 / 部署精修
+### Three layers: network / distillation / deployment-time refinement
 
-网络是"摊销求解器"——用一次前向近似逐图优化问题，存在不可消除的摊销鸿沟（网络单独输出 CLIP sim ~0.85）。训练内蒸馏把教师的逐图最优方向蒸进权重（缩小鸿沟），部署精修在编码端对单图真正求解（CLIP sim 0.44~0.55）。精修发生在编码端（一次性成本，CPU 每图约 1 分钟、GPU 秒级），解码端零成本——这是编码慢/解码快问题的标准架构选择。
+The network is an *amortized solver*: one forward pass approximates the per-image optimisation
+problem, and an irreducible amortization gap remains (the network alone reaches CLIP similarity
+≈0.85). In-training distillation pushes the teacher's per-image optimal directions into the
+weights (narrowing the gap), and deployment-time refinement actually solves the per-image
+problem at the encoding end (CLIP similarity 0.44–0.55). Refinement sits on the encoding side —
+a one-off cost of roughly a minute per image on CPU and seconds on GPU — while decoding costs
+nothing extra, which is the standard architectural choice for the slow-encode / fast-decode
+setting.
 
-### 隐私逃逸机制
+### How evasion works
 
-1. **多特征空间逃逸**：CLIP（语义）+ DINOv2（细粒度纹理）双空间二次 Hinge 逃逸，margin 分别调度
-2. **有向重定向**：记忆库 hard-negative 重定向，把特征推向语义相近但不同的目标，防止逃逸后落入其他敏感区域
-3. **纹理掩码 + 96 低通约束**：扰动集中在纹理区且结构性消除高频条纹，逃逸与视觉质量不冲突
-4. **色度低频投影**：精修后剔除 8×8 网格低频色度（"发灰/蒙层"感知劣化主体，PSNR/SSIM 失明项），门控回退保证不劣化
-5. **消息锚硬保证**：精修只在比特 100% 正确的状态里选优，隐私逃逸不以牺牲解码为代价
+1. **Multi-space escape** — quadratic hinge escape in both CLIP (semantic) and DINOv2
+   (fine-grained texture) feature space, with separately scheduled margins
+2. **Directed redirection** — memory-bank hard-negative redirection pushes features towards
+   semantically nearby but distinct targets, preventing an escaped image from landing next to
+   another sensitive image
+3. **Texture mask + 96 low-pass constraint** — the perturbation stays in textured regions while
+   high-frequency stripes are removed structurally, so evasion and visual quality do not conflict
+4. **Low-frequency chroma projection** — after refinement, low-frequency chroma on an 8×8 grid
+   (the main perceptual artefact, invisible to PSNR and SSIM) is projected out, with a gate that
+   falls back whenever the result would degrade
+5. **Hard message anchor** — refinement only ever selects states with 100% bit accuracy, so
+   evasion is never paid for with decoding reliability
 
-### 详细文档
+### Scope
 
-- 完整技术细节（架构、损失、调度、蒸馏、评估工具链、超参数速查）：[TECHNICAL_DOC.md](TECHNICAL_DOC.md)
-- 论文写作素材（研究背景、相关工作综述、设计理念叙事、指标形式化、实验设计蓝图、参考文献）：[docs/PAPER_MATERIAL.md](docs/PAPER_MATERIAL.md)
+The evasion guarantee is calibrated against two frozen encoders (CLIP ViT-B/32 and DINOv2
+ViT-S/14) in a white-box setting, and it does not transfer to retrieval backbones outside that
+calibration. Adversarial steganalysis is outside the scope of this code release.
+
+## Documentation
+
+The repository ships code only. The published article is the citable record for the method,
+the evaluation protocol and all reported numbers.
+
+A Chinese translation of this README is available at [README.zh-CN.md](README.zh-CN.md).

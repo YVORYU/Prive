@@ -1,0 +1,36 @@
+# PrivSteg — runtime dependencies
+#
+#   pip install -r requirements.txt
+#
+# Python >= 3.8. The bounds below match the configuration used for the paper.
+# For byte-exact reproducibility, freeze your own working environment instead:
+#     pip freeze > requirements-lock.txt
+
+# ---- core deep-learning stack ------------------------------------------------
+torch>=2.0.0
+torchvision>=0.15.0
+
+# ---- DINOv2 backbone is loaded through timm ----------------------------------
+timm>=0.9.0
+
+# ---- image I/O and numerics --------------------------------------------------
+numpy>=1.21
+Pillow>=9.0
+
+# ---- visualisation reports (val/*.py; --report-only also needs this) ---------
+matplotlib>=3.5
+
+# ---- TensorBoard logging -----------------------------------------------------
+# trainer.py uses torch.utils.tensorboard.SummaryWriter, which needs the
+# standalone tensorboard package on top of torch.
+tensorboard>=2.10
+
+# ---- CLIP ViT-B/32 image and text features -----------------------------------
+# models/content_recognizer.py does `import clip`. The package is not published
+# on PyPI, so it is installed directly from source.
+clip @ git+https://github.com/openai/CLIP.git
+
+# ---- optional ----------------------------------------------------------------
+# Only needed to reproduce the cross-system comparison against TrustMark
+# (val/external_baseline.py imports it lazily). Uncomment to install.
+# trustmark
