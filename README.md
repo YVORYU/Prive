@@ -488,7 +488,8 @@ calibration. Adversarial steganalysis is outside the scope of this code release.
 
 ## Documentation
 
-The repository ships code only. The published article is the citable record for the method,
-the evaluation protocol and all reported numbers.
+The published article is the citable record for the method, the evaluation protocol and all
+reported numbers. The summary files behind its tables are in [`results/`](results/README.md), so
+the reported numbers can be checked without re-running the evaluation.
 
 A Chinese translation of this README is available at [README.zh-CN.md](README.zh-CN.md).

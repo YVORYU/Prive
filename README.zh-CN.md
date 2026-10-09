@@ -370,4 +370,4 @@ experiments/my_experiment/
 
 ### 详细文档
 
-本仓库只发布代码，方法与实验的权威记录以正式发表的论文为准。英文版 README 见 [README.md](README.md)。
+方法与实验的权威记录以正式发表的论文为准。论文各表对应的汇总文件在 [](results/README.md)，可不重跑评估直接核对数字。英文版 README 见 [README.md](README.md)。
