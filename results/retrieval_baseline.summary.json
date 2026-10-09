@@ -1,0 +1,12 @@
+{
+  "escape_rate": 0.13,
+  "mean_rank": 1.55,
+  "median_rank": 1.0,
+  "mrr": 0.9117619047619047,
+  "self_sanity_top1": 1.0,
+  "sim_original_mean": 0.7033349609375,
+  "sim_top1_distractor_mean": 0.60221435546875,
+  "top10_hit_rate": 0.99,
+  "top1_hit_rate": 0.87,
+  "top5_hit_rate": 0.97
+}

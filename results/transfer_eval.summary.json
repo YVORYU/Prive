@@ -1,0 +1,60 @@
+{
+  "backbones": [
+    {
+      "backbone": "resnet50",
+      "clip_sim_mean": 0.9467142933607101,
+      "clip_sim_median": 0.9557389616966248,
+      "evasion_rate": 0.0,
+      "margin_mean": 0.11364713728427887,
+      "mean_rank": 1.0,
+      "median_rank": 1.0,
+      "mrr": 1.0,
+      "n_queries": 100,
+      "self_check_top1": 1.0,
+      "sim_offdiag_mean": 0.5602674043178558,
+      "top10_hit_rate": 1.0,
+      "top1_hit_rate": 1.0,
+      "top5_hit_rate": 1.0
+    },
+    {
+      "backbone": "vit_b_16",
+      "clip_sim_mean": 0.8643134146928787,
+      "clip_sim_median": 0.8850669860839844,
+      "evasion_rate": 0.0,
+      "margin_mean": 0.31439893051981926,
+      "mean_rank": 1.0,
+      "median_rank": 1.0,
+      "mrr": 1.0,
+      "n_queries": 100,
+      "self_check_top1": 1.0,
+      "sim_offdiag_mean": 0.04185274775867583,
+      "top10_hit_rate": 1.0,
+      "top1_hit_rate": 1.0,
+      "top5_hit_rate": 1.0
+    },
+    {
+      "backbone": "clip",
+      "clip_sim_mean": 0.4052622064948082,
+      "clip_sim_median": 0.40535779297351837,
+      "evasion_rate": 0.89,
+      "margin_mean": -0.09513760834932328,
+      "mean_rank": 65.11,
+      "median_rank": 14.0,
+      "mrr": 0.19648027732556073,
+      "n_queries": 100,
+      "self_check_top1": 1.0,
+      "sim_offdiag_mean": 0.25271695719100534,
+      "top10_hit_rate": 0.41,
+      "top1_hit_rate": 0.11,
+      "top5_hit_rate": 0.25
+    }
+  ],
+  "meta": {
+    "cover_dir": "dataset\\test",
+    "device": "cpu",
+    "gallery_size": 1000,
+    "num_queries": 100,
+    "refined_dir": "other\\full_validation\\batch_eval\\images",
+    "seed": 42
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "conditions": [
+    {
+      "bit_acc_mean": null,
+      "condition": "clean (published file)",
+      "evasion_rate": 0.89,
+      "margin_mean": -0.09515687704086304,
+      "mean_rank": 65.09,
+      "median_rank": 14.0,
+      "mrr": 0.19633951335809005,
+      "n_queries": 100,
+      "self_check_top1": 1.0,
+      "sim_to_cover_max": 0.4264238774776459,
+      "sim_to_cover_mean": 0.40527447015047074,
+      "sim_to_cover_median": 0.40528905391693115,
+      "sim_to_cover_p95": 0.41296437829732896,
+      "sim_to_distractor_mean": 0.5004313471913338,
+      "top10_hit_rate": 0.41,
+      "top1_hit_rate": 0.11,
+      "top5_hit_rate": 0.25
+    },
+    {
+      "bit_acc_mean": null,
+      "condition": "after channel (k=8)",
+      "evasion_rate": 0.81,
+      "margin_mean": -0.0631737606972456,
+      "mean_rank": 33.185,
+      "median_rank": 7.0,
+      "mrr": 0.3084943085367995,
+      "n_queries": 100,
+      "self_check_top1": 1.0,
+      "sim_to_cover_max": 0.6591377221047878,
+      "sim_to_cover_mean": 0.5233898116648197,
+      "sim_to_cover_median": 0.518610430881381,
+      "sim_to_cover_p95": 0.6202229725196957,
+      "sim_to_distractor_mean": 0.5865635723620654,
+      "top10_hit_rate": 0.61,
+      "top1_hit_rate": 0.19,
+      "top5_hit_rate": 0.42
+    }
+  ],
+  "meta": {
+    "checkpoint": null,
+    "cover_dir": "dataset\\test",
+    "device": "cpu",
+    "gallery_size": 1000,
+    "noise_config": "jpeg+resize(0.8,1.2)+quant",
+    "num_queries": 100,
+    "num_samples": 8,
+    "refined_dir": "other\\full_validation\\batch_eval\\images",
+    "seed": 42
+  }
+}
